@@ -91,12 +91,26 @@ guest_memory_translate_read(const guest_memory_t *guest_memory,
     const uint64_t offset    = guest_address - guest_memory->guest_base;
     const uint64_t host_size = guest_memory->host_size;
 
+    // Unreachable for any region produced by `guest_memory_init`, which
+    // guarantees `guest_end == guest_base + host_size` -- so the containment
+    // check above already established `offset < host_size`. It guards a region
+    // assembled by hand, where `guest_end` and `host_size` disagree. Refusing
+    // is still reported rather than returned as a bare NULL, because a silent
+    // NULL here is indistinguishable from a genuine guest fault at the call
+    // site.
     if (offset >= guest_memory->host_size)
     {
+        POUND_LOG_ERROR(&thread_logger,
+                        "Rejecting read translation: offset 0x%llx is not below host_size=%llx; "
+                        "the region is inconsistent.",
+                        (unsigned long long)offset,
+                        (unsigned long long)guest_memory->host_size);
         return NULL;
     }
 
-    *max_readable_bytes                       = host_size - offset;
+    // Cast explicitly: `host_size` is a size_t widened to uint64_t above, so on
+    // a 32-bit target the unwidened expression would be a narrowing conversion.
+    *max_readable_bytes                       = (size_t)(host_size - offset);
     const uint8_t *POUND_RESTRICT host_base   = guest_memory->host_base;
     const uint8_t *POUND_RESTRICT host_offset = host_base + offset;
     return host_offset;
@@ -133,10 +147,15 @@ guest_memory_translate_write(const guest_memory_t *POUND_RESTRICT guest_memory,
 
     if (offset >= guest_memory->host_size)
     {
+        POUND_LOG_ERROR(&thread_logger,
+                        "Rejecting write translation: offset 0x%llx is not below host_size=%llu; "
+                        "the region is inconsistent.",
+                        (unsigned long long)offset,
+                        guest_memory->host_size);
         return NULL;
     }
 
-    *max_writable_bytes                 = host_size - offset;
+    *max_writable_bytes                 = (size_t)(host_size - offset);
     uint8_t *POUND_RESTRICT host_base   = guest_memory->host_base;
     uint8_t *POUND_RESTRICT host_offset = host_base + offset;
     return host_offset;
