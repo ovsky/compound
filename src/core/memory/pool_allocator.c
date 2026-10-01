@@ -121,6 +121,89 @@ poison_range(pool_allocator_t *POUND_RESTRICT pool, void *POUND_RESTRICT payload
     }
 }
 
+/// Splits the arena into block runs, one per size class.
+///
+/// Each class receives an equal share of the arena's *bytes*, not an equal
+/// number of blocks and not whatever happens to be left after the smaller
+/// classes are served.
+///
+/// The reason is starvation. Filling class 0 first means class 0 consumes the
+/// entire arena whenever its stride is small relative to it, every larger class
+/// then ends up with zero capacity, and the pool silently cannot serve anything
+/// except its smallest allocation. A byte-equal split makes that structurally
+/// impossible: a class either has at least one block from its share or its share
+/// was smaller than one stride, which can only happen for a pool configured with
+/// more classes than the arena can hold.
+///
+/// Block counts therefore fall out of the geometry rather than being chosen: a
+/// small class gets many blocks over its share, a large class gets few. That is
+/// the right shape, because arena cost per object is the stride.
+///
+/// The shares come from one integer division rather than from accumulating
+/// remainders, so they sum to exactly `arena_size` and the committed bytes can
+/// never exceed it. The bound check inside the loop is therefore an invariant
+/// assertion, not a recoverable condition.
+///
+/// Called by `pool_allocator_init` and again by `pool_allocator_reset`, which is
+/// why it lives here rather than inline in either: a reset that carved
+/// differently from the initialiser would hand out blocks the initialiser never
+/// promised.
+static void
+carve_arena(pool_allocator_t *POUND_RESTRICT pool)
+{
+    const size_t classes     = pool->class_count;
+    const size_t whole_share = pool->arena_size / classes;
+    const size_t remainder   = pool->arena_size % classes;
+
+    pool->bump = 0U;
+
+    for (size_t i = 0U; i < classes; ++i)
+    {
+        pool_class_t *const pool_class = &pool->classes[i];
+
+        // Classes with a lower index receive the leftover bytes, which is what
+        // keeps the shares summing to the arena when it does not divide evenly
+        // by the class count.
+        size_t share = whole_share;
+
+        if (i < remainder)
+        {
+            share += 1U;
+        }
+
+        while (share >= pool_class->stride)
+        {
+            if (POUND_UNLIKELY((pool->arena_size - pool->bump) < pool_class->stride))
+            {
+                // Unreachable: the shares sum to `arena_size`, so the committed
+                // total can never exceed it. Reported rather than asserted so a
+                // future change to the share arithmetic surfaces as a logged
+                // defect instead of an out-of-bounds write.
+                POUND_LOG_ERROR(&thread_logger,
+                                "Carving invariant violated at class %zu: offset %zu + stride %zu "
+                                "exceeds the %zu-byte arena.",
+                                i,
+                                pool->bump,
+                                pool_class->stride,
+                                pool->arena_size);
+                return;
+            }
+
+            pool_block_t *const block = (pool_block_t *)(void *)(pool->arena + pool->bump);
+
+            block->magic       = POOL_BLOCK_MAGIC_FREE;
+            block->class_index = (uint32_t)i;
+            block->next        = pool_class->free_head;
+
+            pool_class->free_head = block;
+            pool_class->capacity++;
+
+            pool->bump += pool_class->stride;
+            share -= pool_class->stride;
+        }
+    }
+}
+
 error_t
 pool_allocator_init(pool_allocator_t *POUND_RESTRICT pool,
                     void *POUND_RESTRICT           arena,
@@ -318,32 +401,17 @@ pool_allocator_init(pool_allocator_t *POUND_RESTRICT pool,
         payload = next;
     }
 
-    // Carve. A class that cannot fit even one block simply ends up with no
-    // capacity, which `alloc` reports as a failure rather than as corruption.
-    for (size_t i = 0U; i < pool->class_count; ++i)
-    {
-        pool_class_t *const pool_class = &pool->classes[i];
-
-        while ((pool->arena_size - pool->bump) >= pool_class->stride)
-        {
-            pool_block_t *const block = (pool_block_t *)(void *)(pool->arena + pool->bump);
-
-            block->magic       = POOL_BLOCK_MAGIC_FREE;
-            block->class_index = (uint32_t)i;
-            block->next        = pool_class->free_head;
-
-            pool_class->free_head = block;
-            pool_class->capacity++;
-
-            pool->bump += pool_class->stride;
-        }
-    }
+    carve_arena(pool);
 
     if (POUND_UNLIKELY(0U == pool->classes[0].capacity))
     {
         POUND_LOG_ERROR(&thread_logger,
-                        "Aborting function: a %zu-byte arena cannot hold one %zu-byte block.",
+                        "Aborting function: a %zu-byte arena cannot back %zu size classes; "
+                        "the smallest class's share is %zu bytes but its stride is %zu. "
+                        "Lower max_payload to remove classes, or grow the arena.",
                         arena_size,
+                        pool->class_count,
+                        pool->arena_size / pool->class_count,
                         pool->classes[0].stride);
         return POUND_ERROR_ALLOCATION_FAILED;
     }
@@ -378,7 +446,6 @@ pool_allocator_reset(pool_allocator_t *POUND_RESTRICT pool)
 
     mutex_lock(&pool->lock);
 
-    pool->bump              = 0U;
     pool->bytes_in_use      = 0U;
     pool->peak_bytes_in_use = 0U;
     pool->total_requests    = 0U;
@@ -387,33 +454,24 @@ pool_allocator_reset(pool_allocator_t *POUND_RESTRICT pool)
     pool->total_allocations = 0U;
     pool->total_frees       = 0U;
 
-    // Re-carve without re-deriving the class table: the sizes are unchanged, so
-    // only the free lists and per-class counters need rebuilding.
+    // Clear the per-class state, then carve through the same helper the
+    // initialiser used. Re-deriving the class table is deliberately unnecessary:
+    // the configured size range has not changed, so only the free lists and the
+    // per-class counters need rebuilding, and sharing the carve keeps a reset
+    // from handing out a layout the initialiser never promised.
     for (size_t i = 0U; i < pool->class_count; ++i)
     {
         pool_class_t *const pool_class = &pool->classes[i];
 
-        pool_class->free_head  = NULL;
-        pool_class->used       = 0U;
-        pool_class->peak_used  = 0U;
-        pool_class->capacity   = 0U;
+        pool_class->free_head   = NULL;
+        pool_class->used        = 0U;
+        pool_class->peak_used   = 0U;
+        pool_class->capacity    = 0U;
         pool_class->allocations = 0U;
-        pool_class->frees      = 0U;
-
-        while ((pool->arena_size - pool->bump) >= pool_class->stride)
-        {
-            pool_block_t *const block = (pool_block_t *)(void *)(pool->arena + pool->bump);
-
-            block->magic       = POOL_BLOCK_MAGIC_FREE;
-            block->class_index = (uint32_t)i;
-            block->next        = pool_class->free_head;
-
-            pool_class->free_head = block;
-            pool_class->capacity++;
-
-            pool->bump += pool_class->stride;
-        }
+        pool_class->frees       = 0U;
     }
+
+    carve_arena(pool);
 
     mutex_unlock(&pool->lock);
 }

@@ -33,6 +33,25 @@
 //! with is refused with `POUND_ERROR_MEMORY_ALIGNMENT` and logged, never
 //! silently rounded down to a misaligned address.
 //!
+//! # Arena distribution
+//!
+//! The arena is split so that every class receives an equal share of the
+//! arena's *bytes*. A class's block count then falls out of the geometry -- many
+//! for a small stride, few for a large one -- rather than being chosen.
+//!
+//! The obvious alternative, carving smallest-class-first until the arena is
+//! gone, is wrong in a way that is easy to miss: the smallest class consumes the
+//! entire arena, every larger class ends up with zero capacity, and the pool
+//! then silently refuses every allocation above its smallest size while still
+//! passing every alignment and accounting check. Byte-equal shares make that
+//! structurally impossible.
+//!
+//! The cost is that a class whose stride exceeds its share has no capacity. That
+//! is a property of the configured size range rather than of the request, so
+//! `pool_allocator_init` rejects an arena too small to back the class table at
+//! all, and a class that simply does not fit reports exhaustion. Narrowing
+//! `max_payload` removes classes, and is the remedy for the former.
+//!
 //! # Thread safety
 //!
 //! Every public entry point takes the pool's mutex, including the read-only
@@ -258,8 +277,8 @@ typedef struct
 /// `arena` must be non-NULL, `arena_size` non-zero, and the address of
 /// `arena` a multiple of the configured alignment. Returns `POUND_SUCCESS`, or
 /// `POUND_ERROR_INVALID_ARGUMENT` / `POUND_ERROR_MEMORY_ALIGNMENT` for the
-/// above, or `POUND_ERROR_ALLOCATION_FAILED` when the arena cannot fit a
-/// single block of the smallest class.
+/// above, or `POUND_ERROR_ALLOCATION_FAILED` when the arena is too small to
+/// back the configured class table -- see "Arena distribution" above.
 error_t pool_allocator_init(pool_allocator_t *POUND_RESTRICT pool,
                             void *POUND_RESTRICT           arena,
                             size_t                         arena_size,
