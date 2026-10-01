@@ -286,7 +286,11 @@ host_allocate(memory_allocator_t *POUND_RESTRICT allocator,
         return NULL;
     }
 
-    const size_t              usable_size = mi_malloc_usable_size(pointer);
+    // `mi_usable_size`, not `mi_malloc_usable_size`: the latter is declared in
+    // mimalloc.h but only *defined* in src/alloc-override.c, which is compiled
+    // solely under `MI_MALLOC_OVERRIDE && !_DLL`. In a shared-library build the
+    // symbol is absent and the link fails.
+    const size_t              usable_size = mi_usable_size(pointer);
     const memory_bucket_type_t bucket      = tls_current_bucket_index;
 
     account_allocate(allocator, bucket, usable_size);
@@ -301,7 +305,7 @@ host_free(memory_allocator_t *POUND_RESTRICT allocator, void *pointer)
         return;
     }
 
-    const size_t              usable_size = mi_malloc_usable_size(pointer);
+    const size_t usable_size = mi_usable_size(pointer);
     const memory_bucket_type_t bucket      = tls_current_bucket_index;
 
     account_free(allocator, bucket, usable_size);
