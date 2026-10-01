@@ -101,14 +101,37 @@ ctest  --preset debug-windows
 ```
 
 Artefacts land in `build/debug/bin/windows/`: `Pound.exe`, `libPoundGui.dll`,
-`imgui.dll`, `SDL3.dll` and `mimalloc.dll`.
+`PoundTests.exe`, `libimgui.dll` (or `imgui.dll`, see below), `SDL3.dll`,
+`mimalloc-secure-debug.dll` and `mimalloc-redirect.dll`.
 
 `libPoundGui.dll` must sit next to `Pound.exe`: the GUI plugin is loaded by
 absolute path next to the executable, not through the import table.
 
-Only `PoundGui` carries the `lib` prefix on Windows. `imgui` and SDL keep
-CMake's default naming (`imgui.dll`, `SDL3.dll`), so changing the global shared
-library prefix would break SDL3's own runtime loader.
+### Shared library prefixes on Windows
+
+`PoundGui` sets `PREFIX "lib"` explicitly, because under clang-cl — the
+toolchain the Windows presets use — CMake's
+`CMAKE_SHARED_LIBRARY_PREFIX` is empty and every shared library would otherwise
+land as `PoundGui.dll`.
+
+No *global* override is applied, deliberately. `CMAKE_SHARED_LIBRARY_PREFIX` is
+left alone so that SDL3's own `PREFIX ""` and mimalloc's `PREFIX ""` keep
+working; forcing the prefix to `lib` would rename `SDL3.dll` and break the
+runtime loader SDL uses to find its own dynapi.
+
+That means the unprefixed names of the third-party libraries are whatever the
+toolchain's default is:
+
+| Toolchain | `PoundGui` | `imgui` | SDL | mimalloc |
+| --- | --- | --- | --- | --- |
+| clang-cl (presets, CI) | `libPoundGui.dll` | `imgui.dll` | `SDL3.dll` | `mimalloc-secure-debug.dll` |
+| clang + MinGW headers | `libPoundGui.dll` | `libimgui.dll` | `SDL3.dll` | `mimalloc-secure-debug.dll` |
+
+The MinGW row is why `libimgui.dll` appears in local builds: clang's MinGW
+platform module defaults `CMAKE_SHARED_LIBRARY_PREFIX` to `lib`, and nothing in
+Pound clears it for `imgui`. Both spellings work — the import entry is written
+at link time — but the names differ, so stage the tree rather than picking
+files by hand.
 
 Sanitizers are not enabled on Windows — they would require shipping the ASan
 runtime DLL alongside the release, which is not worth the fragility.
@@ -322,6 +345,53 @@ Layout:
 | Android | — | `lib/<abi>/` |
 
 On Android the layout is flat because that is what an APK packages.
+
+### Runtime dependencies of a staged build
+
+`cmake --install` stages `Pound`, `libPoundGui`, `imgui`, `mimalloc`,
+`mimalloc-redirect`, `lua51` and the SDL runtime. Two things are deliberately
+*not* staged and have to come from the environment:
+
+- **The Visual C++ runtime.** `CMAKE_MSVC_RUNTIME_LIBRARY` is pinned to
+  `MultiThreaded[Debug]DLL` at the top of the top-level `CMakeLists.txt`, so a
+  Windows build links `/MD` (or `/MDd`) and therefore needs
+  `msvcp140.dll` / `vcruntime140.dll` at run time. That is not an oversight:
+  mimalloc's Windows redirection interposes on the allocator inside
+  `ucrtbase.dll`, so a statically linked CRT would leave it nothing to hook and
+  the override would silently never engage (requirement 1 in
+  `extern/mimalloc/mimalloc/bin/readme.md`). Install the redistributable, or
+  drop the two DLLs next to `Pound.exe`, or configure with
+  `-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded` if you accept losing the
+  redirect.
+
+- **The `c++_static`/`libc++` runtime on Android** comes from the NDK and is
+  linked in; nothing extra is needed there.
+
+### mimalloc's Windows redirect currently does not engage
+
+Pound links `mimalloc.dll`, and `/INCLUDE:mi_version` in `src/main.c`'s target
+keeps that DLL mapped, but `mimalloc-redirect.dll` has to be initialised
+*before* `ucrtbase.dll` in order to win. The Windows loader walks the import
+graph depth-first, and `SDL3.dll` reaches `ucrtbase` transitively through
+`SHELL32` and the `api-ms-win-crt-*` forwarders, so the SDL chain is initialised
+first. At startup you will see:
+
+```text
+mimalloc-redirect: warning: standard malloc is _not_ redirected! -- using regular malloc/free.
+```
+
+That is upstream's own diagnostic, not a Pound code path failing. It is not
+silently ignored: allocations made through `memory_subsystem_allocate` still go
+to mimalloc explicitly and are still counted per bucket, so the memory tracker
+reports Pound's own heap accurately. What is *not* intercepted is plain
+`malloc`/`free` issued from inside third-party DLLs such as SDL3 and cimgui.
+
+mimalloc's own documentation is candid that this cannot always be fixed from the
+build system — see "We cannot always re-link an executable with mimalloc.dll,
+and similarly, we cannot always ensure that the DLL comes first in the import
+table" in `extern/mimalloc/mimalloc/bin/readme.md` — and it offers `minject` as
+a post-link patch for exactly this case. Adopting `minject` is a packaging
+decision that has not been made here.
 
 ---
 

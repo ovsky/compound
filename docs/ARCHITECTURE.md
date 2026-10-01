@@ -160,6 +160,51 @@ when the source's mtime changes.
 returning `true` (which is `1`, and therefore
 `GUI_PLUGIN_ERROR_INVALID_ARGUMENT` in that enum) was a real bug.
 
+### Three ABI details the plugin boundary depends on
+
+These are not stylistic; each one produced an image that could be built but not
+actually loaded.
+
+**`PoundGui` links `PoundCore`.** The plugin uses `thread_logger`,
+`memory_subsystem_*` and `safe_math_*`, which live in the core OBJECT library.
+Without an explicit `PoundCore` on its link line those symbols were unresolved
+in the DLL. Windows happened to paper over it — `WINDOWS_EXPORT_ALL_SYMBOLS` on
+`Pound.exe` published the core out of the host executable, and the DLL picked
+them up at load time from the already-mapped host image — but that is a PE
+loader accident with no ELF equivalent, so the same code would have failed to
+link for Android or any other platform. Linking `PoundCore` into `PoundGui`
+embeds its own copy of the core objects in the DLL.
+
+On Android `PoundGui` is `STATIC`, and a static archive consumes no OBJECT
+library objects, so `libmain.so` still ends up with exactly one core.
+
+**`gui_plugin_error_to_string` is `POUND_EXPORT`.** It is the only
+host-facing function that is not behind the vtable, and `src/main.c` calls it
+to turn a `gui_plugin_error_t` into log text. Left unannotated it was absent
+from `libPoundGui.dll`'s export table — the DLL exported 35 symbols and every
+one of them resolved, and this one did not.
+
+**`IMGUI_IMPL_API` is `POUND_IMGUI_IMPL_API`.** `cimgui.h` defines `CIMGUI_API`
+as `__declspec(dllexport)` and `imgui.h` leaves `IMGUI_API` empty, falling back
+to it only when `IMGUI_IMPL_API` is undefined. That exports the ImGui core and
+none of the backends: `libimgui.dll` exported 1581 core symbols and no
+`ImGui_ImplSDL3_*` or `ImGui_ImplOpenGL3_*` at all, which is what the GUI needs
+in order to pump input and submit draw data. `POUND_IMGUI_IMPL_API` expands to
+`extern "C" __declspec(dllexport)` on Windows and `extern "C"` elsewhere.
+
+### The plugin installs its own log sink
+
+`gui_plugin_exports_get` is the plugin's entry point, and it is also where a
+plugin gets its logger. `thread_logger` is a strong per-thread global that
+defaults to `{ 0 }`, and `pound_log_message` drops every record unless
+`logger->log` is set *and* `log_level <= logger->min_level`. A plugin loaded
+via `dlopen` has its own copy of that global, initialised to zero, so every
+`POUND_LOG_*` from inside the GUI was discarded with no diagnostic.
+
+`gui_plugin_exports_get` therefore calls `pound_logger_init_default` on its own
+`thread_logger` whenever the caller passes `log == NULL`. Passing a logger
+still takes precedence, so a host that wants full control keeps it.
+
 ### Android
 
 `POUND_PLATFORM_SUPPORTS_HOT_RELOAD` is `0` on Android:
