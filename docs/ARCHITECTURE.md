@@ -196,8 +196,17 @@ accounting array with `bucket & MEMORY_BUCKET_COUNT`. Because `COUNT` is a power
 of two, that collapsed `GUEST_MEMORY` (2) onto `NONE` (0) and
 `JIT_RECOMPILER` (3) onto `UI` (1), and let `MEMORY_BUCKET_COUNT` itself index
 one past the end of the array. Every per-bucket total except three was wrong.
-It is now a clamp to `[0, MEMORY_BUCKET_COUNT - 1]`, and an out-of-range query
-returns zero with a warning rather than a plausible wrong number.
+It is now a clamp, and an out-of-range query returns zero with a warning rather
+than a plausible wrong number.
+
+The clamp is one-sided, and that is forced by the type rather than chosen.
+`memory_bucket_type_t` declares no negative enumerator, so its underlying type is
+unsigned; a caller that casts a negative `int` produces a value far *above* the
+range, not below it, and there is no sign left for the implementation to
+inspect. Every out-of-range value therefore clamps to `MEMORY_BUCKET_COUNT - 1`,
+which keeps the index inside `memory_used_by_bucket[]` regardless. The earlier
+`bucket < MEMORY_BUCKET_NONE ? MEMORY_BUCKET_NONE : ...` branch was unreachable
+dead code that suggested a guarantee the type could not deliver.
 
 **`MEMORY_BUCKET_TOTAL` is a sentinel, not an index.** It is `-1` and is
 resolved before any array access; any other negative value is treated as the
