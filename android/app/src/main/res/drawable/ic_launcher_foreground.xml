@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Adaptive-icon foreground: a stylised "P" inside a rounded frame.
+
+    The 108x108dp canvas exceeds the 72x72dp safe zone the launcher may mask to,
+    so every path stays within the central 66x66dp area to survive an aggressive
+    circular or squircle mask without clipping.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Rounded frame. -->
+    <path
+        android:fillColor="#3A3A46"
+        android:pathData="M34,26 L74,26 A8,8 0 0 1 82,34 L82,74 A8,8 0 0 1 74,82 L34,82 A8,8 0 0 1 26,74 L26,34 A8,8 0 0 1 34,26 Z" />
+
+    <!-- Vertical stem of the P. -->
+    <path
+        android:fillColor="#E8E8F0"
+        android:pathData="M40,36 L52,36 L52,72 L40,72 Z" />
+
+    <!-- Bowl of the P, joined to the stem. -->
+    <path
+        android:fillColor="#E8E8F0"
+        android:pathData="M52,36 L64,36 A10,10 0 0 1 64,56 L52,56 L52,48 L64,48 A2,2 0 0 0 64,44 L52,44 Z" />
+
+</vector>

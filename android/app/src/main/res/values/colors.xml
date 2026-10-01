@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        No colour resources are defined here: the emulator draws every pixel of
+        its own surface through OpenGL, and the theme below uses platform
+        defaults. The adaptive icon's background colour lives in
+        values/ic_launcher_background.xml instead, where AAPT expects it.
+    -->
+</resources>
