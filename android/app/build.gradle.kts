@@ -17,6 +17,16 @@ plugins {
 val poundSdlJavaDir: Directory =
     rootProject.file("../extern/sdl/sdl/android-project/app/src/main/java")
 
+// Read once so `signingConfigs` and `buildTypes` agree, and so an unsigned
+// local build can be told apart from a misconfigured CI one.
+val poundKeyStorePath: String? = providers.environmentVariable("POUND_KEYSTORE_PATH").orNull
+    ?.takeIf { it.isNotBlank() && file(it).exists() }
+
+// The single ABI Pound builds for. Named once because the ABI list, the JNI
+// staging hook and cmake/toolchains/android-arm64.cmake all have to agree, and a
+// disagreement shows up as an APK with no native image rather than as an error.
+val poundAbis = listOf("arm64-v8a")
+
 android {
     namespace = "dev.pound.emulator"
     compileSdk = 35
@@ -35,12 +45,12 @@ android {
                 // c++_static keeps libc++ inside libmain.so, so the APK ships a
                 // single native image instead of also needing libc++_shared.so.
                 arguments += listOf("-DANDROID_STL=c++_static")
-                abiFilters += listOf("arm64-v8a")
+                abiFilters += poundAbis
             }
         }
 
         ndk {
-            abiFilters += listOf("arm64-v8a")
+            abiFilters += poundAbis
         }
     }
 
@@ -51,12 +61,11 @@ android {
     }
 
     signingConfigs {
-        // Only consulted when the matching environment variables are present, so
-        // an unsigned CI run never fails on missing credentials.
-        create("poundRelease") {
-            val storePath = providers.environmentVariable("POUND_KEYSTORE_PATH").orNull
-            if (storePath != null) {
-                storeFile = file(storePath)
+        // Only populated when a keystore is actually available, so an unsigned
+        // CI or local run never fails on missing credentials.
+        if (poundKeyStorePath != null) {
+            create("poundRelease") {
+                storeFile = file(poundKeyStorePath)
                 storePassword = providers.environmentVariable("POUND_KEYSTORE_PASSWORD").orNull
                 keyAlias = providers.environmentVariable("POUND_KEY_ALIAS").orNull
                 keyPassword = providers.environmentVariable("POUND_KEY_PASSWORD").orNull
@@ -72,7 +81,11 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = signingConfigs.getByName("poundRelease")
+            // No keystore means an unsigned release APK, which is what a local
+            // build should produce. Assigning a signing config with a null
+            // storeFile would instead fail the build with a message about
+            // credentials that says nothing about the real cause.
+            signingConfig = signingConfigs.findByName("poundRelease")
         }
         debug {
             isMinifyEnabled = false
@@ -123,9 +136,10 @@ androidComponents {
 
         jniMergeTasks.configureEach { dependsOn(nativeBuildTask) }
 
-        // Collect whatever the native build produced. The layout under .cxx is
-        // an AGP implementation detail, so it is discovered rather than assumed;
-        // what matters is that exactly one libmain.so exists.
+        // Collect whatever the native build produced. The layout under .cxx is an
+        // AGP implementation detail, so it is discovered rather than assumed, and
+        // the collection is scoped to the configured ABIs: a leftover image from
+        // an ABI that is no longer built would otherwise be packaged silently.
         jniMergeTasks.configureEach {
             doLast {
                 val nativeRoot = layout.projectDirectory.dir(".cxx").asFile
@@ -139,6 +153,12 @@ androidComponents {
                     }
                 }
 
+                // The ABI directory is a whole path segment, so compare segments
+                // rather than substrings ("x86_64" is not a prefix of "arm64-v8a",
+                // but "64" would match both).
+                fun abiOf(candidate: File): String? =
+                    candidate.path.split('/', '\\').firstOrNull { poundAbis.contains(it) }
+
                 val mainImages = staged.filter { it.name == "libmain.so" }
 
                 if (mainImages.isEmpty()) {
@@ -148,28 +168,46 @@ androidComponents {
                     )
                 }
 
-                if (mainImages.size > 1) {
+                val unscoped = mainImages.filter { abiOf(it) == null }
+
+                if (unscoped.isNotEmpty()) {
                     throw GradleException(
-                        "Expected exactly one libmain.so under $nativeRoot but found " +
-                            "${mainImages.size}: ${mainImages.joinToString { it.path }}. " +
-                            "A stale previous native build is the usual cause; run `./gradlew clean`."
+                        "Found libmain.so outside any configured ABI directory " +
+                            "(${poundAbis.joinToString()}):\n" +
+                            unscoped.joinToString("\n") { "  ${it.path}" } +
+                            "\nA stale build for a removed ABI is the usual cause; run `./gradlew clean`."
                     )
                 }
 
-                val abiDir = layout.projectDirectory.dir("src/main/jniLibs/arm64-v8a").asFile
-                abiDir.mkdirs()
+                val inScope = staged.filter { abiOf(it) != null }
 
-                // Remove images from earlier builds so a configuration change
-                // cannot leave an orphan behind in the packaged APK.
-                abiDir.listFiles { f -> f.isFile && f.name.endsWith(".so") }
-                    ?.forEach { it.delete() }
+                // AGP keeps several copies of the same shared object under .cxx --
+                // the raw CMake tree, its stripped intermediate, and the object
+                // directory -- and they legitimately differ in size, so the newest
+                // one is packaged rather than asserting they are byte-identical.
+                val packagedByAbi = inScope
+                    .groupBy { abiOf(it)!! }
+                    .mapValues { (_, candidates) ->
+                        candidates.groupBy { it.name }
+                            .map { (_, sameName) -> sameName.maxBy { it.lastModified() } }
+                    }
 
-                staged.forEach { source ->
-                    val target = File(abiDir, source.name)
-                    source.copyTo(target, overwrite = true)
-                    logger.lifecycle(
-                        "Packaging native image: arm64-v8a/${target.name} (${target.length()} bytes)"
-                    )
+                packagedByAbi.forEach { (abi, images) ->
+                    val abiDir = layout.projectDirectory.dir("src/main/jniLibs/$abi").asFile
+                    abiDir.mkdirs()
+
+                    // Remove images from earlier builds so a configuration change
+                    // cannot leave an orphan behind in the packaged APK.
+                    abiDir.listFiles { f -> f.isFile && f.name.endsWith(".so") }
+                        ?.forEach { it.delete() }
+
+                    images.forEach { source ->
+                        val target = File(abiDir, source.name)
+                        source.copyTo(target, overwrite = true)
+                        logger.lifecycle(
+                            "Packaging native image: $abi/${target.name} (${target.length()} bytes)"
+                        )
+                    }
                 }
             }
         }
