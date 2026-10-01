@@ -22,6 +22,9 @@ set(POUND_TEST_SUITES
         guest_memory
         guest_state
         memory
+        pool_allocator
+        mutex
+        slab_allocator
         )
 
 set(POUND_TEST_SOURCES
@@ -31,6 +34,8 @@ set(POUND_TEST_SOURCES
         test_guest_memory.c
         test_guest_state.c
         test_memory.c
+        test_pool_allocator.c
+        test_slab_allocator.c
         )
 
 add_executable(PoundTests ${POUND_TEST_SOURCES})

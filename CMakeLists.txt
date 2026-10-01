@@ -128,6 +128,14 @@ message(STATUS "[Pound] Compiler:    ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_V
 message(STATUS "[Pound] Binaries:    ${POUND_BINARIES_DIRECTORY}")
 message(STATUS "[Pound] Libraries:   ${POUND_LIBRARIES_DIRECTORY}")
 message(STATUS "[Pound] Tests:       ${POUND_BUILD_TESTS}")
+
+# `src/core/sync/mutex.c` maps onto pthread on POSIX. Modern glibc folds
+# libpthread into libc, but older toolchains and musl-based Android NDKs do not,
+# so the flag has to be requested rather than assumed. Failing here is better
+# than an undefined-reference at link time on one CI lane only.
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+message(STATUS "[Pound] Threads:      ${CMAKE_THREAD_LIBS_INIT} (${Threads_FOUND})")
 message(STATUS "[Pound] Sanitizers:  ${POUND_SANITIZERS}")
 message(STATUS "==================================================================")
 
@@ -321,14 +329,18 @@ endif ()
 
 message(STATUS "[PoundCore] Configuring Pound Core Library...")
 add_library(PoundCore OBJECT
+        src/core/errors.c
         src/core/memory/memory.c
         src/core/memory/guest_memory.c
+        src/core/memory/pool_allocator.c
+        src/core/memory/slab_allocator.c
+        src/core/sync/mutex.c
         src/core/guest_state.c
         src/core/log.c
         src/core/safe_math.c
 )
 target_include_directories(PoundCore PUBLIC src/core)
-target_link_libraries(PoundCore PRIVATE ${POUND_MIMALLOC_TARGET})
+target_link_libraries(PoundCore PRIVATE ${POUND_MIMALLOC_TARGET} Threads::Threads)
 set_target_properties(PoundCore PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_compiler_flags(PoundCore)
 add_linker_flags(PoundCore)
