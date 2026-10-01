@@ -184,12 +184,17 @@ memory_subsystem_set_bucket(const memory_bucket_type_t bucket)
 
     if (POUND_UNLIKELY(false == memory_bucket_is_valid(bucket)))
     {
+        // `memory_bucket_type_t` declares no negative enumerator, so its
+        // underlying type is unsigned and there is no sign left to inspect by
+        // the time a value reaches here: casting a negative int to it yields a
+        // value far *above* the range, not below it. Every out-of-range bucket
+        // therefore clamps to the last real bucket, which keeps the index
+        // inside `memory_used_by_bucket[]` either way.
         POUND_LOG_WARN(&thread_logger,
                        "Clamping out-of-range bucket %d into [0, %d].",
                        (int)bucket,
                        (int)MEMORY_BUCKET_COUNT - 1);
-        tls_current_bucket_index
-            = (bucket < MEMORY_BUCKET_NONE) ? MEMORY_BUCKET_NONE : (memory_bucket_type_t)(MEMORY_BUCKET_COUNT - 1);
+        tls_current_bucket_index = (memory_bucket_type_t)(MEMORY_BUCKET_COUNT - 1);
     }
     else
     {

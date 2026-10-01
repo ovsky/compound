@@ -93,9 +93,16 @@ POUND_TEST(memory, out_of_range_buckets_are_clamped_not_masked)
     (void)memory_subsystem_set_bucket((memory_bucket_type_t)9999);
     POUND_CHECK_EQ_I64(memory_subsystem_get_bucket(), MEMORY_BUCKET_COUNT - 1);
 
-    // Below the range: clamp to the first real bucket.
+    // "Below the range" is indistinguishable from "far above the range":
+    // `memory_bucket_type_t` declares no negative enumerator, so its underlying
+    // type is unsigned and casting -1 yields UINT_MAX rather than a negative
+    // value. Clamping to the last real bucket is the only in-bounds outcome, so
+    // it is the one asserted here.
     (void)memory_subsystem_set_bucket((memory_bucket_type_t)-1);
-    POUND_CHECK_EQ_I64(memory_subsystem_get_bucket(), MEMORY_BUCKET_NONE);
+    POUND_CHECK_EQ_I64(memory_subsystem_get_bucket(), MEMORY_BUCKET_COUNT - 1);
+
+    // Each clamp is reported rather than applied silently.
+    POUND_CHECK_EQ_U64(pound_test_log_count_at(LOG_LEVEL_WARN), 2U);
 
     (void)memory_subsystem_set_bucket(MEMORY_BUCKET_NONE);
 }

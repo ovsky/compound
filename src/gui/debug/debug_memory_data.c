@@ -1,9 +1,21 @@
+// `platform.h` deliberately includes no libc headers, so it is safe to pull in
+// first and let the glibc feature-test macros below take effect before the
+// first libc header (`<stdio.h>`, via cimgui.h) enters the translation unit.
+#include "platform.h"
+
+#if POUND_PLATFORM_LINUX && !POUND_PLATFORM_APPLE
+#define __USE_XOPEN_EXTENDED 1
+#define _GNU_SOURCE 1
+#endif
+
 #include "debug_memory.h"
 #include "log.h"
 #include "mimalloc-stats.h"
-#include "platform.h"
 #include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define CIMGUI_DEFINE_ENUMS_AND_STRUCTS
 #include "cimgui.h"
@@ -15,7 +27,6 @@
 
 #elif POUND_PLATFORM_POSIX
 
-#define __USE_XOPEN_EXTENDED
 #include <unistd.h>
 
 #endif // POUND_PLATFORM_WINDOWS
@@ -508,7 +519,8 @@ debug_memory_gui_box_init(debug_memory_gui_box_t *box,
 {
     if (POUND_UNLIKELY(NULL == box))
     {
-        POUND_LOG_ERROR(&thread_logger, "Aborting function: box is NULL");
+        POUND_LOG_ERROR(&thread_logger, "Aborting function: box is NULL.");
+        return;
     }
 
     box->position   = position;

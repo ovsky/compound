@@ -36,7 +36,13 @@ set(POUND_TEST_SOURCES
 add_executable(PoundTests ${POUND_TEST_SOURCES})
 
 target_include_directories(PoundTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(PoundTests PRIVATE PoundCore)
+
+# The allocator is named explicitly rather than inherited. `PoundCore` is an
+# OBJECT library and therefore has no link step of its own, so its PRIVATE
+# mimalloc dependency does not reach consumers through
+# INTERFACE_LINK_LIBRARIES. Without this the test binary would fail to resolve
+# `mi_malloc_aligned`, `mi_malloc_usable_size`, `mi_free` and `mi_stats_get`.
+target_link_libraries(PoundTests PRIVATE PoundCore ${POUND_MIMALLOC_TARGET})
 
 add_compiler_flags(PoundTests)
 add_linker_flags(PoundTests)
@@ -71,4 +77,8 @@ if (CMAKE_CROSSCOMPILING)
     endif ()
 endif ()
 
-message(STATUS "[PoundTests] Registered ${PROJECT_NAME} unit test suite.")
+list(LENGTH POUND_TEST_SUITES POUND_TEST_SUITE_COUNT)
+math(EXPR POUND_TEST_ENTRY_COUNT "${POUND_TEST_SUITE_COUNT} + 1")
+message(STATUS
+        "[PoundTests] Registered ${POUND_TEST_ENTRY_COUNT} CTest entries covering "
+        "${POUND_TEST_SUITE_COUNT} suites: PoundTests plus one filtered entry per suite.")
