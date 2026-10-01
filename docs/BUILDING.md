@@ -100,9 +100,15 @@ cmake --build --preset debug-windows --parallel
 ctest  --preset debug-windows
 ```
 
-Artefacts land in `build/debug/bin/windows/`. `libPoundGui.dll` and
-`libimgui.dll` must sit next to `Pound.exe`: the GUI plugin is loaded by path at
-runtime, not through the import table.
+Artefacts land in `build/debug/bin/windows/`: `Pound.exe`, `libPoundGui.dll`,
+`imgui.dll`, `SDL3.dll` and `mimalloc.dll`.
+
+`libPoundGui.dll` must sit next to `Pound.exe`: the GUI plugin is loaded by
+absolute path next to the executable, not through the import table.
+
+Only `PoundGui` carries the `lib` prefix on Windows. `imgui` and SDL keep
+CMake's default naming (`imgui.dll`, `SDL3.dll`), so changing the global shared
+library prefix would break SDL3's own runtime loader.
 
 Sanitizers are not enabled on Windows — they would require shipping the ASan
 runtime DLL alongside the release, which is not worth the fragility.

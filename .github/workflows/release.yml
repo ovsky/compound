@@ -4,7 +4,7 @@ name: Release
 # Tag-triggered distribution packages.
 #
 # Produces, from one `v*` tag:
-#   Windows  zip  : Pound.exe + libPoundGui.dll + libimgui.dll + mimalloc.dll + lua51.dll
+#   Windows  zip  : Pound.exe + libPoundGui.dll + imgui.dll + SDL3.dll + mimalloc.dll + lua51.dll
 #   Linux    tgz  : Pound + libPoundGui.so + libimgui.so + libmimalloc.so + libluajit.so
 #   macOS    tgz  : Pound + libPoundGui.dylib + libimgui.dylib + libmimalloc.dylib
 #
