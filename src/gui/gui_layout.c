@@ -5,6 +5,7 @@
 
 static bool is_region_valid(gui_layout_region_t dock);
 static bool is_dimensions_valid(float width, float height);
+static bool is_rectangle_valid(const gui_layout_rectangle_t *rectangle);
 
 gui_plugin_error_t
 gui_layout_add_panel(gui_layout_t *layout, const gui_layout_region_t region, const float fraction)
@@ -116,13 +117,6 @@ gui_layout_compute(gui_layout_t           *layout,
         return GUI_PLUGIN_SUCCESS;
     }
 
-    if (POUND_UNLIKELY((layout->panel_count < 1)
-                       || (layout->panel_count > GUI_LAYOUT_PANEL_CAPACITY)))
-    {
-        POUND_LOG_ERROR(
-            &thread_logger, "Aborting function: panel_count %d is corrupted.", layout->panel_count);
-        return GUI_PLUGIN_ERROR_INVALID_ARGUMENT;
-    }
     float left_fraction   = 0.0F;
     float right_fraction  = 0.0F;
     float top_fraction    = 0.0F;
@@ -305,6 +299,21 @@ gui_layout_compute(gui_layout_t           *layout,
         *rectangle_cursor++ = rectangle;
     }
 
+    // The centre viewport is the single most important output: panels are
+    // positioned relative to it. Validate it explicitly rather than letting a
+    // NaN escape into ImGui.
+    if (POUND_UNLIKELY(false == is_rectangle_valid(&viewport)))
+    {
+        POUND_LOG_ERROR(&thread_logger,
+                        "Aborting function: computed viewport (%f, %f, %f, %f) is invalid.",
+                        viewport.x,
+                        viewport.y,
+                        viewport.width,
+                        viewport.height);
+        layout->is_computed = false;
+        return GUI_PLUGIN_ERROR_INVALID_ARGUMENT;
+    }
+
     layout->is_computed = true;
     *out_viewport       = viewport;
     return GUI_PLUGIN_SUCCESS;
@@ -317,26 +326,29 @@ is_region_valid(const gui_layout_region_t dock)
     return valid;
 }
 
-bool
+static bool
 is_dimensions_valid(const float width, const float height)
 {
     const bool valid = isfinite(width) && isfinite(height) && (width >= 0.0F) && (height >= 0.0F);
     return valid;
 }
 
-bool
+static bool
 is_rectangle_valid(const gui_layout_rectangle_t *rectangle)
 {
-    const bool is_x_finite      = isfinite(rectangle->x);
-    const bool is_y_finite      = isfinite(rectangle->y);
-    const bool is_width_finite  = isfinite(rectangle->width);
-    const bool is_height_finite = isfinite(rectangle->height);
-    const bool is_x_valid       = is_x_finite && (rectangle->x >= 0.0F);
-    const bool is_y_valid       = is_y_finite && (rectangle->y >= 0.0F);
-    const bool is_width_valid   = is_width_finite && (rectangle->width >= 0.0F);
-    const bool is_height_valid  = is_height_finite && (rectangle->height >= 0.0F);
+    if (POUND_UNLIKELY(NULL == rectangle))
+    {
+        return false;
+    }
 
-    const bool valid = is_x_valid && is_y_valid && is_width_valid && is_height_valid;
+    if (POUND_UNLIKELY(false == isfinite(rectangle->x) || false == isfinite(rectangle->y)
+                       || false == isfinite(rectangle->width) || false == isfinite(rectangle->height)))
+    {
+        return false;
+    }
+
+    const bool valid = (rectangle->x >= 0.0F) && (rectangle->y >= 0.0F)
+                       && (rectangle->width >= 0.0F) && (rectangle->height >= 0.0F);
     return valid;
 }
 

@@ -70,7 +70,7 @@ gui_plugin_exports_get(gui_plugin_exports_t *out)
     out->destroy      = gui_destroy;
     out->render_frame = gui_render_frame;
     out->save         = gui_save;
-    return true;
+    return GUI_PLUGIN_SUCCESS;
 }
 
 const char *
@@ -115,16 +115,16 @@ gui_create(const void *POUND_RESTRICT saved_data, size_t saved_size, void **out)
     const size_t                memory_alignment = 8U;
     gui_state_t *POUND_RESTRICT gui_state
         = memory_subsystem_allocate(memory_alignment, sizeof(gui_state_t));
-    (void)memset(gui_state, 0, sizeof(gui_state_t));
 
-    if (NULL == gui_state)
+    if (POUND_UNLIKELY(NULL == gui_state))
     {
         POUND_LOG_ERROR(&thread_logger,
-                        "Aborting function: calloc failed for gui_state_t (%zu bytes).",
+                        "Aborting function: failed to allocate gui_state_t (%zu bytes).",
                         sizeof(gui_state_t));
         return GUI_PLUGIN_ERROR_ALLOCATION_FAILED;
     }
 
+    memset(gui_state, 0, sizeof(gui_state_t));
     gui_state->debug_memory_tracker.first_time_run = true;
 
     gui_panel_register(gui_state,
@@ -219,11 +219,18 @@ gui_render_frame(void *gui_state)
 
     if (POUND_UNLIKELY(panel_count < 0))
     {
+        POUND_LOG_WARN(&thread_logger,
+                       "panel_count %d is negative, treating as 0.",
+                       panel_count);
         panel_count = 0;
     }
 
-    if (POUND_UNLIKELY(panel_count > 0))
+    if (POUND_UNLIKELY(panel_count > GUI_PANEL_CAPACITY))
     {
+        POUND_LOG_WARN(&thread_logger,
+                       "panel_count %d exceeds capacity %d, clamping.",
+                       panel_count,
+                       GUI_PANEL_CAPACITY);
         panel_count = GUI_PANEL_CAPACITY;
     }
 
@@ -459,16 +466,16 @@ gui_panel_register(gui_state_t *POUND_RESTRICT state,
     ++state->panel_count;
 }
 
-void
+static void
 gui_panel_render_memory_tracker(void *context)
 {
     debug_memory_render(context);
 }
 
-void
+static void
 gui_panel_render_hot_reload_guide(void *context)
 {
-    (void)context;
+    POUND_UNUSED(context);
     const ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoCollapse;
 
     if (igBegin("Hot Reloading Guide", NULL, window_flags))
@@ -479,10 +486,10 @@ gui_panel_render_hot_reload_guide(void *context)
     igEnd();
 }
 
-void
+static void
 gui_panel_render_imgui_demo(void *context)
 {
-    (void)context;
+    POUND_UNUSED(context);
     igShowDemoWindow(NULL);
 }
 

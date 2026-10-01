@@ -18,7 +18,12 @@
 
 static uint32_t hot_counter = 0;
 
-typedef bool (*get_exports_function_t)(gui_plugin_exports_t *);
+/// Signature of the plugin's single exported entry point.
+///
+/// This must mirror the `POUND_EXPORT gui_plugin_error_t gui_plugin_exports_get(...)`
+/// declaration in `gui.h` exactly. Modelling it as `bool` made a successful
+/// load indistinguishable from `GUI_PLUGIN_ERROR_INVALID_ARGUMENT`.
+typedef gui_plugin_error_t (*get_exports_function_t)(gui_plugin_exports_t *out);
 
 static void *shared_library_load(const char *path);
 static void  shared_library_unload(void *module);
@@ -49,16 +54,16 @@ gui_plugin_load_module(gui_plugin_t *POUND_RESTRICT plugin, const char *POUND_RE
         return false;
     }
 
-    if (strlen(source_path) >= MAX_PATH)
+    if (strlen(source_path) >= POUND_PATH_MAX)
     {
         POUND_LOG_ERROR(
-            &thread_logger, "Aborting function: source_path exceeds MAX_PATH (%d).", MAX_PATH);
+            &thread_logger, "Aborting function: source_path exceeds POUND_PATH_MAX (%d).", POUND_PATH_MAX);
         return false;
     }
 
     memset(plugin, 0, sizeof(*plugin));
     ++hot_counter;
-    char loaded_path[MAX_PATH];
+    char loaded_path[POUND_PATH_MAX];
 
     if (false
         == shared_library_create_loaded_path(
@@ -152,12 +157,14 @@ gui_plugin_load_module(gui_plugin_t *POUND_RESTRICT plugin, const char *POUND_RE
         return false;
     }
 
-    gui_plugin_exports_t exports = { 0 };
+    gui_plugin_exports_t   exports     = { 0 };
+    const gui_plugin_error_t get_error = get_exports(&exports);
 
-    if (false == get_exports(&exports))
+    if (GUI_PLUGIN_SUCCESS != get_error)
     {
         POUND_LOG_ERROR(&thread_logger,
-                        "Aborting function: gui_plugin_exports_get() returned false for '%s'.",
+                        "Aborting function: gui_plugin_exports_get() returned %s for '%s'.",
+                        gui_plugin_error_to_string(get_error),
                         loaded_path);
         shared_library_unload(module);
 
@@ -293,10 +300,10 @@ file_modified_time(const char *path)
         return 0;
     }
 
-    if (strlen(path) >= MAX_PATH)
+    if (strlen(path) >= POUND_PATH_MAX)
     {
         POUND_LOG_ERROR(
-            &thread_logger, "Path length exceeds MAX_PATH (%d), returning 0.", MAX_PATH);
+            &thread_logger, "Path length exceeds POUND_PATH_MAX (%d), returning 0.", POUND_PATH_MAX);
         return 0;
     }
 
@@ -368,17 +375,17 @@ copy_file(const char *source, const char *destination)
         return false;
     }
 
-    if (strlen(source) >= MAX_PATH)
+    if (strlen(source) >= POUND_PATH_MAX)
     {
         POUND_LOG_ERROR(
-            &thread_logger, "Aborting function: source path exceeds MAX_PATH (%d).", MAX_PATH);
+            &thread_logger, "Aborting function: source path exceeds POUND_PATH_MAX (%d).", POUND_PATH_MAX);
         return false;
     }
 
-    if (strlen(destination) >= MAX_PATH)
+    if (strlen(destination) >= POUND_PATH_MAX)
     {
         POUND_LOG_ERROR(
-            &thread_logger, "Aborting function: destination path exceeds MAX_PATH (%d).", MAX_PATH);
+            &thread_logger, "Aborting function: destination path exceeds POUND_PATH_MAX (%d).", POUND_PATH_MAX);
         return false;
     }
 
@@ -401,8 +408,9 @@ copy_file(const char *source, const char *destination)
 
         if (fclose(in) != 0)
         {
-            POUND_LOG_WARN(
-                &thread_logger, "fclose(/proc/self/maps) also failed because %s.", strerror(errno));
+            POUND_LOG_WARN(&thread_logger,
+                           "fclose(source) also failed because %s.",
+                           strerror(errno));
         }
 
         return false;
@@ -452,8 +460,10 @@ copy_file(const char *source, const char *destination)
 
     if (fclose(in) != 0)
     {
-        POUND_LOG_WARN(
-            &thread_logger, "fclose(source) failed for '%s' becasue %s.", source, strerror(errno));
+        POUND_LOG_WARN(&thread_logger,
+                       "fclose(source) failed for '%s' because %s.",
+                       source,
+                       strerror(errno));
         ok = false;
     }
 
@@ -493,7 +503,7 @@ copy_file(const char *source, const char *destination)
     return ok;
 }
 
-void *
+static void *
 shared_library_load(const char *path)
 {
     if (NULL == path)
@@ -539,7 +549,7 @@ shared_library_load(const char *path)
     return handle;
 }
 
-void
+static void
 shared_library_unload(void *module)
 {
     if (NULL == module)
@@ -571,7 +581,7 @@ shared_library_unload(void *module)
 #endif // POUND_PLATFORM_WINDOWS
 }
 
-bool
+static bool
 shared_library_get_symbol(void *module, const char *name, void **out)
 {
     if (NULL == module)
@@ -646,7 +656,7 @@ shared_library_get_symbol(void *module, const char *name, void **out)
     return true;
 }
 
-bool
+static bool
 shared_library_create_loaded_path(const char    *source,
                                   char          *destination,
                                   const size_t   capacity,
@@ -693,10 +703,12 @@ shared_library_create_loaded_path(const char    *source,
 
     const size_t source_length = strlen(source);
 
-    if (source_length >= MAX_PATH)
+    if (source_length >= POUND_PATH_MAX)
     {
-        POUND_LOG_ERROR(
-            &thread_logger, "Aborting function: source exceeds MAX_PATH (%d).", source_length);
+        POUND_LOG_ERROR(&thread_logger,
+                        "Aborting function: source length %zu exceeds POUND_PATH_MAX (%d).",
+                        source_length,
+                        POUND_PATH_MAX);
         return false;
     }
 
