@@ -3,8 +3,20 @@
 #include "memory/memory.h"
 
 #include <SDL3/SDL.h>
+
+// SDL's Android entry point is invoked from Java: SDLActivity dlopen()s
+// libmain.so and calls the exported `SDL_main` through JNI. SDL_main.h is
+// deliberately not pulled in by SDL.h, and it is what performs the
+// `main` -> `SDL_main` renaming for that platform.
+#if POUND_PLATFORM_ANDROID
+#include <SDL3/SDL_main.h>
+#endif
+
 #include <mimalloc-override.h>
+#include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 // This is required to perform hot reloading using Windows DLLs.
 #if POUND_PLATFORM_WINDOWS
@@ -21,6 +33,9 @@
 
 #define GUI_FREEZE_REASON_SIZE 256
 
+/// Milliseconds between hot-reload polls of the plugin's mtime.
+#define GUI_RELOAD_POLL_INTERVAL_MS 150U
+
 typedef struct
 {
     SDL_Window   *window;
@@ -30,13 +45,10 @@ typedef struct
     bool          gui_reload_request;
     bool          gui_frozen;
     char          gui_frozen_reason[GUI_FREEZE_REASON_SIZE];
-    char          pad[5];
-    char          gui_source_path[MAX_PATH];
+    char          gui_source_path[POUND_PATH_MAX];
     uint64_t      gui_source_time;
     uint64_t      gui_pending_time;
     uint64_t      gui_pending_since;
-    uint64_t      gui_last_reload_attempt;
-    uint64_t      gui_next_retry_ticks;
     gui_plugin_t  gui;
 } app_t;
 
@@ -49,10 +61,17 @@ static void app_gui_freeze(app_t *app, const char *reason);
 static void app_gui_unfreeze(app_t *app);
 static bool app_hot_reload_init(app_t *app);
 static bool app_hot_reload_shutdown(app_t *app);
+static bool app_gui_bind_static(app_t *app);
 static void app_poll_events(app_t *app);
 static void app_render_frame(app_t *app);
 static void app_render_frozen_overlay(app_t *app);
 static void app_memory_churn(void);
+static bool app_memory_churn_requested(void);
+static void app_frame_limit(uint64_t frame_start_ms);
+
+// -----------------------------------------------------------------------------
+// Entry point
+// -----------------------------------------------------------------------------
 
 int
 main(void)
@@ -120,13 +139,29 @@ main(void)
         POUND_LOG_WARN(&thread_logger, "Window was shown but remains hidden, continuing anyway.");
     }
 
-    POUND_LOG_INFO(&thread_logger, "Starting main loop.");
+    POUND_LOG_INFO(&thread_logger, "Starting main loop on %s.", POUND_PLATFORM_NAME);
+
+    // Diagnostic only: see app_memory_churn_requested().
+    const bool run_memory_selftest = app_memory_churn_requested();
+
+    if (run_memory_selftest)
+    {
+        POUND_LOG_INFO(&thread_logger, "Memory tracker self-test enabled (--selftest-memory).");
+    }
 
     while (app.running)
     {
+        const uint64_t frame_start = SDL_GetTicks();
+
         app_poll_events(&app);
-        app_memory_churn();
+
+        if (run_memory_selftest)
+        {
+            app_memory_churn();
+        }
+
         app_render_frame(&app);
+        app_frame_limit(frame_start);
     }
 
     app_gui_shutdown(&app);
@@ -136,6 +171,10 @@ main(void)
 
     return EXIT_SUCCESS;
 }
+
+// -----------------------------------------------------------------------------
+// Video
+// -----------------------------------------------------------------------------
 
 static bool
 app_video_init(app_t *app)
@@ -162,7 +201,6 @@ app_video_init(app_t *app)
     }
 
     POUND_LOG_DEBUG(&thread_logger, "Configuring video subsystem...");
-    SDL_SetHint(SDL_HINT_APP_NAME, "Pound Emulator");
 
     if (!SDL_SetHint(SDL_HINT_APP_NAME, "Pound Emulator"))
     {
@@ -193,7 +231,7 @@ app_video_init(app_t *app)
         { .attr = SDL_GL_STENCIL_SIZE, .value = 8, .name = "SDL_GL_STENCIL_SIZE" },
     };
 
-    for (size_t i = 0; i < sizeof(gl_attributes) / sizeof(gl_attributes[0]); ++i)
+    for (size_t i = 0; i < (sizeof(gl_attributes) / sizeof(gl_attributes[0])); ++i)
     {
         if (!SDL_GL_SetAttribute(gl_attributes[i].attr, gl_attributes[i].value))
         {
@@ -246,7 +284,8 @@ app_video_init(app_t *app)
     if (false == SDL_GL_SetSwapInterval(1))
     {
         POUND_LOG_WARN(&thread_logger,
-                       "Aborting function: failed to set swap interval because %s.",
+                       "Failed to set swap interval because %s. "
+                       "Frames will be paced by app_frame_limit instead.",
                        SDL_GetError());
     }
 
@@ -254,7 +293,7 @@ app_video_init(app_t *app)
     return true;
 }
 
-bool
+static bool
 app_video_shutdown(app_t *app)
 {
     if (NULL == app)
@@ -263,28 +302,52 @@ app_video_shutdown(app_t *app)
         return false;
     }
 
-    if (NULL == app->gl_context)
+    bool ok = true;
+
+    // Tear the context down before the window: a live context still references
+    // the window, and destroying the window first leaves a dangling context.
+    if (app->gl_context != NULL)
     {
-        POUND_LOG_ERROR(&thread_logger, "Aborting function: OpenGL context is NULL.");
-        return false;
+        if (false == SDL_GL_MakeCurrent(app->window, app->gl_context))
+        {
+            POUND_LOG_WARN(&thread_logger,
+                           "SDL_GL_MakeCurrent(window, NULL) failed because %s.",
+                           SDL_GetError());
+            ok = false;
+        }
+
+        if (false == SDL_GL_DestroyContext(app->gl_context))
+        {
+            POUND_LOG_ERROR(&thread_logger,
+                            "SDL_GL_DestroyContext failed because %s.",
+                            SDL_GetError());
+            ok = false;
+        }
+
+        app->gl_context = NULL;
     }
 
-    SDL_GL_MakeCurrent(app->window, NULL);
-    SDL_GL_DestroyContext(app->gl_context);
-    app->gl_context = NULL;
-
-    if (NULL == app->window)
+    if (app->window != NULL)
     {
-        POUND_LOG_ERROR(&thread_logger, "Aborting function: SDL window is NULL.");
-        return false;
+        if (false == SDL_DestroyWindow(app->window))
+        {
+            POUND_LOG_ERROR(&thread_logger,
+                            "SDL_DestroyWindow failed because %s.",
+                            SDL_GetError());
+            ok = false;
+        }
+
+        app->window = NULL;
     }
 
-    SDL_DestroyWindow(app->window);
-    app->window = NULL;
-    return true;
+    return ok;
 }
 
-bool
+// -----------------------------------------------------------------------------
+// ImGui
+// -----------------------------------------------------------------------------
+
+static bool
 app_gui_init(app_t *app)
 {
     if (NULL == app)
@@ -326,7 +389,7 @@ app_gui_init(app_t *app)
     if (false == ImGui_ImplOpenGL3_Init("#version 330"))
     {
         POUND_LOG_ERROR(&thread_logger, "Aborting function: failed to initialize OpenGL3 backend.");
-        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplSDL3_Shutdown();
         igDestroyContext(app->imgui_context);
         app->imgui_context = NULL;
         return false;
@@ -351,7 +414,7 @@ app_gui_init(app_t *app)
     return true;
 }
 
-bool
+static bool
 app_gui_shutdown(app_t *app)
 {
     if (NULL == app)
@@ -360,21 +423,27 @@ app_gui_shutdown(app_t *app)
         return false;
     }
 
+    // Unload the plugin even when ImGui never came up: on the failure path the
+    // module may already be mapped and would otherwise leak its image.
+    gui_plugin_destroy(&app->gui);
+
     if (NULL == app->imgui_context)
     {
-        POUND_LOG_ERROR(&thread_logger, "Aborting function: ImGui context is NULL.");
         return false;
     }
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     igDestroyContext(app->imgui_context);
-    gui_plugin_destroy(&app->gui);
     app->imgui_context = NULL;
     return true;
 }
 
-bool
+// -----------------------------------------------------------------------------
+// GUI plugin lifecycle
+// -----------------------------------------------------------------------------
+
+static bool
 app_gui_update(app_t *app, const bool force)
 {
     if (POUND_UNLIKELY(NULL == app))
@@ -382,6 +451,19 @@ app_gui_update(app_t *app, const bool force)
         POUND_LOG_ERROR(&thread_logger, "Aborting function: app context is NULL.");
         return false;
     }
+
+#if !POUND_PLATFORM_SUPPORTS_HOT_RELOAD
+
+    // There is no reload mechanism on this platform, so a GUI that app_gui_bind_static()
+    // already resolved stays valid for the lifetime of the process. Bailing out here
+    // also keeps app->gui_source_path permanently empty, which is what stops the
+    // reload path below from trying to dlopen a file that does not exist.
+    if (true == app->gui.loaded)
+    {
+        return true;
+    }
+
+#endif
 
     if (POUND_UNLIKELY(0 == app->gui_source_path[0]))
     {
@@ -419,7 +501,7 @@ app_gui_update(app_t *app, const bool force)
             return app->gui.loaded;
         }
 
-        if (SDL_GetTicks() - app->gui_pending_since < 150)
+        if ((SDL_GetTicks() - app->gui_pending_since) < GUI_RELOAD_POLL_INTERVAL_MS)
         {
             return app->gui.loaded;
         }
@@ -434,26 +516,26 @@ app_gui_update(app_t *app, const bool force)
 
     if (app->gui.loaded && app->gui.gui_context && app->gui.exports.save)
     {
-        gui_plugin_error_t error
+        const gui_plugin_error_t error
             = app->gui.exports.save(app->gui.gui_context, NULL, 0, &hot_reloaded_code_size);
 
         if (GUI_PLUGIN_SUCCESS == error && hot_reloaded_code_size > 0)
         {
             const size_t memory_alignment = 8U;
-            hot_reloaded_code = memory_subsystem_allocate(memory_alignment, hot_reloaded_code_size);
+            hot_reloaded_code            = memory_subsystem_allocate(memory_alignment,
+                                                             hot_reloaded_code_size);
 
             if (hot_reloaded_code != NULL)
             {
-                error = app->gui.exports.save(app->gui.gui_context,
-                                              hot_reloaded_code,
-                                              hot_reloaded_code_size,
-                                              &hot_reloaded_code_size);
+                const gui_plugin_error_t write_error = app->gui.exports.save(
+                    app->gui.gui_context, hot_reloaded_code, hot_reloaded_code_size,
+                    &hot_reloaded_code_size);
 
-                if (GUI_PLUGIN_SUCCESS != error)
+                if (GUI_PLUGIN_SUCCESS != write_error)
                 {
                     POUND_LOG_ERROR(&thread_logger,
                                     "Failed to save GUI state because %s.",
-                                    gui_plugin_error_to_string(error));
+                                    gui_plugin_error_to_string(write_error));
                     memory_subsystem_free(hot_reloaded_code);
                     hot_reloaded_code      = NULL;
                     hot_reloaded_code_size = 0;
@@ -475,10 +557,12 @@ app_gui_update(app_t *app, const bool force)
         }
         else
         {
+            // The plugin reported success with a zero-byte state: nothing to carry over.
+            POUND_LOG_DEBUG(&thread_logger, "GUI plugin reported an empty state blob.");
         }
     }
 
-    // Save ImgGui layout.
+    // Save ImGui layout.
 
     char       *ini_copy = NULL;
     const char *ini      = igSaveIniSettingsToMemory(NULL);
@@ -492,7 +576,13 @@ app_gui_update(app_t *app, const bool force)
         if (ini_copy != NULL)
         {
             memcpy(ini_copy, ini, ini_length);
-            ini_copy[ini_length] = 0;
+            ini_copy[ini_length] = '\0';
+        }
+        else
+        {
+            POUND_LOG_WARN(&thread_logger,
+                           "Failed to allocate %zu bytes to preserve ImGui layout.",
+                           ini_length + 1);
         }
     }
 
@@ -547,7 +637,7 @@ app_gui_update(app_t *app, const bool force)
     return ok;
 }
 
-void
+static void
 app_gui_freeze(app_t *app, const char *reason)
 {
     if (NULL == app)
@@ -591,7 +681,7 @@ app_gui_freeze(app_t *app, const char *reason)
     }
 }
 
-void
+static void
 app_gui_unfreeze(app_t *app)
 {
     if (NULL == app)
@@ -609,7 +699,11 @@ app_gui_unfreeze(app_t *app)
     app->gui_frozen_reason[0] = '\0';
 }
 
-bool
+// -----------------------------------------------------------------------------
+// Hot reload
+// -----------------------------------------------------------------------------
+
+static bool
 app_hot_reload_init(app_t *app)
 {
     if (NULL == app)
@@ -617,6 +711,21 @@ app_hot_reload_init(app_t *app)
         POUND_LOG_ERROR(&thread_logger, "Aborting function: app context is NULL.");
         return false;
     }
+
+#if !POUND_PLATFORM_SUPPORTS_HOT_RELOAD
+
+    // Android ships PoundGui as a static library: SDL_GetBasePath() resolves
+    // inside the read-only APK, so there is nowhere writable to copy a freshly
+    // linked image to and no way to dlopen an arbitrary path. The same
+    // `gui_plugin_exports_t` vtable the loader would have populated is resolved
+    // directly instead, which keeps every downstream call site identical.
+    POUND_LOG_INFO(&thread_logger,
+                   "Hot reloading is unavailable on %s; binding the statically linked GUI.",
+                   POUND_PLATFORM_NAME);
+
+    return app_gui_bind_static(app);
+
+#else
 
     const char *base = SDL_GetBasePath();
 
@@ -629,17 +738,26 @@ app_hot_reload_init(app_t *app)
     const char  *separator   = "";
     const size_t base_length = strlen(base);
 
-    if (base_length > 0 && base[base_length - 1] != '/' && base[base_length - 1] != '\\')
+    if ((base_length > 0) && (base[base_length - 1] != '/') && (base[base_length - 1] != '\\'))
     {
         separator = "/";
     }
 
-    snprintf(app->gui_source_path,
-             sizeof(app->gui_source_path),
-             "%s%s%s",
-             base,
-             separator,
-             GUI_PLUGIN_NAME);
+    const int written = snprintf(app->gui_source_path,
+                                 sizeof(app->gui_source_path),
+                                 "%s%s%s",
+                                 base,
+                                 separator,
+                                 GUI_PLUGIN_NAME);
+
+    if ((written < 0) || ((size_t)written >= sizeof(app->gui_source_path)))
+    {
+        app->gui_source_path[0] = '\0';
+        POUND_LOG_ERROR(&thread_logger,
+                        "Aborting function: GUI plugin path exceeded %zu bytes.",
+                        sizeof(app->gui_source_path));
+        return false;
+    }
 
     app->gui_source_time   = file_modified_time(app->gui_source_path);
     app->gui_pending_time  = 0;
@@ -647,9 +765,74 @@ app_hot_reload_init(app_t *app)
     POUND_LOG_INFO(&thread_logger, "Found GUI plugin at %s", app->gui_source_path);
     POUND_LOG_DEBUG(&thread_logger, "Hot reloading is enabled.");
     return true;
+
+#endif // !POUND_PLATFORM_SUPPORTS_HOT_RELOAD
 }
 
-bool
+/// Binds the statically linked GUI into `app->gui`.
+///
+/// The plugin contract is identical to the hot-reload path; only the mechanism
+/// that obtains the vtable differs. `module` stays NULL so
+/// `gui_plugin_destroy` skips the `dlclose`, and `loaded_path` stays empty so
+/// nothing is unlinked from disk.
+static bool
+app_gui_bind_static(app_t *app)
+{
+    if (NULL == app)
+    {
+        POUND_LOG_ERROR(&thread_logger, "Aborting function: app context is NULL.");
+        return false;
+    }
+
+    if (true == app->gui.loaded)
+    {
+        return true;
+    }
+
+    gui_plugin_exports_t exports = { 0 };
+
+    const gui_plugin_error_t error = gui_plugin_exports_get(&exports);
+
+    if (GUI_PLUGIN_SUCCESS != error)
+    {
+        POUND_LOG_ERROR(&thread_logger,
+                        "Aborting function: gui_plugin_exports_get() returned %s.",
+                        gui_plugin_error_to_string(error));
+        return false;
+    }
+
+    if ((NULL == exports.create) || (NULL == exports.destroy) || (NULL == exports.render_frame)
+        || (NULL == exports.save))
+    {
+        POUND_LOG_ERROR(&thread_logger,
+                        "Aborting function: the statically linked GUI exported an incomplete "
+                        "callback table.");
+        return false;
+    }
+
+    void                    *gui_context = NULL;
+    const gui_plugin_error_t create_error
+        = exports.create(NULL, 0U, &gui_context);
+
+    if ((GUI_PLUGIN_SUCCESS != create_error) || (NULL == gui_context))
+    {
+        POUND_LOG_ERROR(&thread_logger,
+                        "Aborting function: creating the GUI context failed because %s.",
+                        gui_plugin_error_to_string(create_error));
+        return false;
+    }
+
+    app->gui.exports     = exports;
+    app->gui.module      = NULL;
+    app->gui.gui_context = gui_context;
+    app->gui.loaded      = true;
+    app->gui.loaded_path[0] = '\0';
+
+    POUND_LOG_INFO(&thread_logger, "Bound the statically linked GUI at %s.", POUND_PLATFORM_NAME);
+    return true;
+}
+
+static bool
 app_hot_reload_shutdown(app_t *app)
 {
     if (NULL == app)
@@ -659,22 +842,23 @@ app_hot_reload_shutdown(app_t *app)
     }
 
     gui_plugin_destroy(&app->gui);
-    memset(&app->gui, 0, sizeof(app->gui));
 
-    app->gui_reload_request      = false;
-    app->gui_frozen              = false;
-    app->gui_source_time         = 0;
-    app->gui_pending_time        = 0;
-    app->gui_pending_since       = 0;
-    app->gui_last_reload_attempt = 0;
-    app->gui_next_retry_ticks    = 0;
-    app->gui_source_path[0]      = '\0';
-    app->gui_frozen_reason[0]    = '\0';
+    app->gui_reload_request   = false;
+    app->gui_frozen           = false;
+    app->gui_source_time      = 0;
+    app->gui_pending_time     = 0;
+    app->gui_pending_since    = 0;
+    app->gui_source_path[0]   = '\0';
+    app->gui_frozen_reason[0] = '\0';
 
     return true;
 }
 
-void
+// -----------------------------------------------------------------------------
+// Frame
+// -----------------------------------------------------------------------------
+
+static void
 app_poll_events(app_t *app)
 {
     if (NULL == app)
@@ -728,7 +912,7 @@ app_poll_events(app_t *app)
     }
 }
 
-void
+static void
 app_render_frame(app_t *app)
 {
     if (POUND_UNLIKELY(NULL == app))
@@ -788,7 +972,7 @@ app_render_frame(app_t *app)
     SDL_GL_SwapWindow(app->window);
 }
 
-void
+static void
 app_render_frozen_overlay(app_t *app)
 {
     if (NULL == app)
@@ -842,6 +1026,41 @@ app_render_frozen_overlay(app_t *app)
 
     igEnd();
 }
+
+// -----------------------------------------------------------------------------
+// Frame pacing
+// -----------------------------------------------------------------------------
+
+static void
+app_frame_limit(const uint64_t frame_start_ms)
+{
+    // Desktop targets are paced by the vsync established in app_video_init.
+    // Android ignores SDL_GL_SetSwapInterval, so without this the loop would
+    // spin at whatever rate the GPU drains, which is both a battery hazard and
+    // a source of input latency on 120 Hz panels.
+#if POUND_PLATFORM_ANDROID
+
+    /// Upper bound on the main loop period. `SDL_Delay` is skipped entirely when
+    /// a frame already overran this budget, so a slow frame degrades into a
+    /// dropped frame rather than an unbounded catch-up burst.
+    const uint64_t frame_budget_ms = 250U;
+    const uint64_t elapsed         = SDL_GetTicks() - frame_start_ms;
+
+    if (elapsed < frame_budget_ms)
+    {
+        SDL_Delay(frame_budget_ms - elapsed);
+    }
+
+#else
+
+    POUND_UNUSED(frame_start_ms);
+
+#endif
+}
+
+// -----------------------------------------------------------------------------
+// Memory self-test
+// -----------------------------------------------------------------------------
 
 // Slowly allocate and deallocate memory over 10 seconds.
 // This is meant to test the GUI memory debug tracker.
@@ -910,6 +1129,42 @@ app_memory_churn(void)
         blocks[count] = NULL;
         ++step;
     }
+}
+
+/// The churn loop is a diagnostic for the memory tracker, not emulator work.
+/// Running it unconditionally would burn 32 MiB of bandwidth per cycle in
+/// release builds, so it is opt-in via `--selftest-memory` or
+/// `POUND_SELFTEST_MEMORY=1`.
+static bool
+app_memory_churn_requested(void)
+{
+    static int cached = -1;
+
+    if (cached < 0)
+    {
+        cached = 0;
+
+        for (int i = 1; i < SDL_GetNumArgv(); ++i)
+        {
+            if (0 == SDL_strcmp(SDL_GetArgv(i), "--selftest-memory"))
+            {
+                cached = 1;
+                break;
+            }
+        }
+
+        if (0 == cached)
+        {
+            const char *env = SDL_getenv("POUND_SELFTEST_MEMORY");
+
+            if ((env != NULL) && (0 != SDL_strcmp(env, "0")))
+            {
+                cached = 1;
+            }
+        }
+    }
+
+    return cached == 1;
 }
 
 /*** end of file ***/
