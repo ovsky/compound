@@ -84,17 +84,22 @@ pound_default_logger(void *user_data, log_data_t *data, const char *format, va_l
         }
     }
 
-    const char *POUND_RESTRICT filename   = data->filename;
-    const char *POUND_RESTRICT slash      = strrchr(filename, '/');
-    const char *POUND_RESTRICT backslash  = strrchr(filename, '\\');
-    const char *POUND_RESTRICT last_slash = slash > backslash ? slash : backslash;
+    // Reduce "__FILE__" to a bare basename. `strrchr` is never fed NULL because
+    // `data->filename` is validated below.
+    const char *filename = (data->filename != NULL) ? data->filename : "<unknown>";
 
-    if (last_slash)
+    const char *slash     = strrchr(filename, '/');
+    const char *backslash = strrchr(filename, '\\');
+    const char *separator = (slash > backslash) ? slash : backslash;
+
+    if (separator != NULL)
     {
-        filename = last_slash;
+        filename = separator + 1;
     }
 
-    fprintf(stderr, "[%s] [%s] [%s:%d] ", level_string, data->function, filename, data->line);
+    const char *function = (data->function != NULL) ? data->function : "<unknown>";
+
+    fprintf(stderr, "[%s] [%s] [%s:%d] ", level_string, function, filename, data->line);
     vfprintf(stderr, format, args);
     fprintf(stderr, "\n");
 }

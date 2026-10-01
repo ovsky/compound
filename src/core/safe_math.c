@@ -35,7 +35,10 @@ safe_math_add_u8(const uint8_t a, const uint8_t b, uint8_t *result)
 
     if (POUND_UNLIKELY(__builtin_add_overflow(a, b, &out)))
     {
-        POUND_LOG_ERROR(&thread_logger, "%u + %u exceeds UINT8_MAX.", a, b);
+        POUND_LOG_ERROR(&thread_logger,
+                        "%u + %u exceeds UINT8_MAX.",
+                        (unsigned int)a,
+                        (unsigned int)b);
         *result = 0;
         return POUND_MATH_ERROR_UNSIGNED_OVERFLOW;
     }
@@ -57,7 +60,10 @@ safe_math_add_u16(const uint16_t a, const uint16_t b, uint16_t *result)
 
     if (POUND_UNLIKELY(__builtin_add_overflow(a, b, &out)))
     {
-        POUND_LOG_ERROR(&thread_logger, "%u + %u exceeds UINT16_MAX.", a, b);
+        POUND_LOG_ERROR(&thread_logger,
+                        "%u + %u exceeds UINT16_MAX.",
+                        (unsigned int)a,
+                        (unsigned int)b);
         *result = 0;
         return POUND_MATH_ERROR_UNSIGNED_OVERFLOW;
     }
@@ -101,7 +107,10 @@ safe_math_add_u64(const uint64_t a, const uint64_t b, uint64_t *result)
 
     if (POUND_UNLIKELY(__builtin_add_overflow(a, b, &out)))
     {
-        POUND_LOG_ERROR(&thread_logger, "%u + %u exceeds UINT64_MAX.", a, b);
+        POUND_LOG_ERROR(&thread_logger,
+                        "%llu + %llu exceeds UINT64_MAX.",
+                        (unsigned long long)a,
+                        (unsigned long long)b);
         *result = 0;
         return POUND_MATH_ERROR_UNSIGNED_OVERFLOW;
     }
@@ -212,12 +221,18 @@ safe_math_add_i64(int64_t a, int64_t b, int64_t *result)
     {
         if ((a > 0 && b > 0))
         {
-            POUND_LOG_ERROR(&thread_logger, "%lld + %lld exceed INT64_MAX.", a, b);
+            POUND_LOG_ERROR(&thread_logger,
+                        "%lld + %lld exceed INT64_MAX.",
+                        (long long)a,
+                        (long long)b);
             *result = 0;
             return POUND_MATH_ERROR_SIGNED_POSITIVE_OVERFLOW;
         }
 
-        POUND_LOG_ERROR(&thread_logger, "%lld + %lld is below INT64_MIN", a, b);
+        POUND_LOG_ERROR(&thread_logger,
+                        "%lld + %lld is below INT64_MIN",
+                        (long long)a,
+                        (long long)b);
         *result = 0;
         return POUND_MATH_ERROR_SIGNED_NEGATIVE_OVERFLOW;
     }
