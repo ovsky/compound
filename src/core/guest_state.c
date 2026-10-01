@@ -1,4 +1,5 @@
 #include "guest_state.h"
+#include "log.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -8,6 +9,7 @@ guest_state_init(guest_state_t *POUND_RESTRICT state)
 {
     if (NULL == state)
     {
+        POUND_LOG_ERROR(&thread_logger, "Rejecting guest state initialisation: state is NULL.");
         return POUND_ERROR_INVALID_ARGUMENT;
     }
 
