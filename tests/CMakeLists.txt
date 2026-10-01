@@ -35,7 +35,15 @@ set(POUND_TEST_SOURCES
 
 add_executable(PoundTests ${POUND_TEST_SOURCES})
 
-target_include_directories(PoundTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# `PoundCore` exports `src/core` as a PUBLIC include directory, which makes
+# "attributes.h" and "memory/memory.h" resolve but not the bare
+# "guest_memory.h"/"guest_state.h" that those headers themselves use internally.
+# Adding `src/core/memory` reproduces the header's own view of its siblings, so
+# a test can spell an include exactly the way the header under test spells it.
+target_include_directories(PoundTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/core/memory
+)
 
 # The allocator is named explicitly rather than inherited. `PoundCore` is an
 # OBJECT library and therefore has no link step of its own, so its PRIVATE

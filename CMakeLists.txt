@@ -12,6 +12,25 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 include(CmakePolicies)
 
+# MSVC runtime selection must be fixed before any target is created, because
+# CMP0091 is set to NEW in cmake/CmakePolicies.cmake: from that policy onwards
+# CMake stops guessing and emits no /MD or /MT of its own, so a target created
+# without this variable silently takes the compiler driver default instead.
+#
+# The dynamic runtime is required, not merely conventional. mimalloc's Windows
+# redirection works by interposing on the CRT allocator inside ucrtbase.dll, so
+# a statically linked CRT would leave nothing to interpose on and the override
+# would silently never engage -- see requirement 1 in
+# extern/mimalloc/mimalloc/bin/readme.md. SDL3, mimalloc and cimgui all inherit
+# this from the enclosing scope, so the whole graph agrees on one runtime.
+#
+# The consequence is that a staged build needs the matching Visual C++
+# redistributable (or app-local msvcp140.dll/vcruntime140.dll) present at run
+# time; docs/BUILDING.md records that.
+if (NOT DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+endif ()
+
 project(Pound LANGUAGES C CXX VERSION 0.1.0)
 
 include(CompilerFlags)
@@ -166,7 +185,26 @@ set(MI_INSTALL_TOPLEVEL OFF CACHE BOOL "" FORCE)
 add_subdirectory(extern/mimalloc/mimalloc)
 
 message(STATUS "[ImGUI] Configuring ImGUI...")
-add_subdirectory(extern/cimgui)
+
+# cimgui's own CMakeLists is deliberately not added as a subdirectory. It would
+# define a `cimgui` target built from exactly the sources listed below, plus an
+# unconditional `install(TARGETS cimgui ...)` rule that drops an unused
+# cimgui.dll and its import library at the root of the install prefix. Pound
+# links the `imgui` target defined just below and never the `cimgui` one, so
+# pulling the subproject in would double the ImGui compile time and pollute the
+# staged tree with a DLL nothing loads.
+#
+# The subproject also applies `IMGUI_USER_CONFIG=../cimconfig.h`, which is
+# directory-scoped and therefore never reached the `imgui` target anyway.
+# cimconfig.h only does `#undef NDEBUG`, which a Debug build already satisfies.
+#
+# Re-derive the two paths `add_subdirectory()` would have set.
+set(cimgui_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/extern/cimgui")
+if (NOT EXISTS "${cimgui_SOURCE_DIR}/cimgui.cpp")
+    message(FATAL_ERROR
+            "[ImGUI] cimgui sources are missing from ${cimgui_SOURCE_DIR}. "
+            "Initialise the 'extern' submodules before configuring.")
+endif ()
 
 if (POUND_LINK_GUI_STATICALLY)
     set(POUND_IMGUI_LIBRARY_TYPE STATIC)
@@ -185,7 +223,23 @@ add_library(imgui ${POUND_IMGUI_LIBRARY_TYPE}
         ${cimgui_SOURCE_DIR}/imgui/backends/imgui_impl_sdl3.cpp
 )
 target_include_directories(imgui PUBLIC ${cimgui_SOURCE_DIR} ${cimgui_SOURCE_DIR}/imgui)
-target_compile_definitions(imgui PUBLIC "-DIMGUI_IMPL_API=extern \"C\" ")
+
+# cimgui exports its core API through `CIMGUI_API`, which is
+# `extern "C" __declspec(dllexport)` on Windows. The platform backends are a
+# different macro: `IMGUI_IMPL_API`, which imgui.h only defaults to `IMGUI_API`
+# -- and `IMGUI_API` defaults to *nothing*. Overriding `IMGUI_IMPL_API` with a
+# bare `extern "C"` therefore stripped the dllexport from every
+# `ImGui_ImplSDL3_*` / `ImGui_ImplOpenGL3_*` entry point, leaving them private to
+# imgui.dll while the core stayed exported -- so the host linked against the
+# core but not the backends it calls directly. The macro is `#ifndef`-guarded, so
+# this definition has to carry the export attribute itself.
+if (WIN32)
+    set(POUND_IMGUI_IMPL_API "extern \"C\" __declspec(dllexport)")
+else ()
+    # ELF and Mach-O export by default visibility; nothing extra is needed.
+    set(POUND_IMGUI_IMPL_API "extern \"C\"")
+endif ()
+target_compile_definitions(imgui PUBLIC "-DIMGUI_IMPL_API=${POUND_IMGUI_IMPL_API}")
 target_compile_definitions(imgui PUBLIC -DIMGUI_DISABLE_OBSOLETE_FUNCTIONS=1)
 target_link_libraries(imgui PRIVATE SDL3::SDL3)
 set_target_properties(imgui PROPERTIES
@@ -312,10 +366,27 @@ else ()
 endif ()
 
 target_include_directories(PoundGui PUBLIC src/gui src/core)
+
+# `PoundGui` calls into core -- `thread_logger`, `pound_log_message`,
+# `memory_subsystem_get_memory_used_by_bucket`, `safe_math_error_string` -- so it
+# has to resolve those symbols at link time.
+#
+# On desktop `PoundGui` is a SHARED image and linking `PoundCore` embeds the core
+# objects into it, which is what makes the DLL self-contained: an unresolved
+# symbol in a shared object is resolved against whatever happens to be loaded
+# first, so relying on the host to export them would work on Windows by accident
+# and fail on ELF. `gui_plugin_exports_get()` installs a default sink on the
+# plugin's own thread-local logger so those records are emitted rather than
+# silently dropped.
+#
+# On Android `PoundGui` is STATIC, and a static archive does not consume an
+# OBJECT library's objects, so the plugin image stays core-free and `libmain.so`
+# supplies the single copy -- which is what we want there.
+#
 # Windows loads PoundGui before the EXE finishes its own imports. Listing
 # mimalloc ahead of imgui keeps mimalloc-redirect ahead of ucrt in PoundGui's
 # import table.
-target_link_libraries(PoundGui PRIVATE ${POUND_MIMALLOC_TARGET} imgui)
+target_link_libraries(PoundGui PRIVATE ${POUND_MIMALLOC_TARGET} imgui PoundCore)
 
 if (MSVC)
     target_link_options(PoundGui PRIVATE "/INCLUDE:mi_version")
@@ -403,6 +474,23 @@ if (POUND_ENABLE_INSTALL_RULES)
 
         if (NOT POUND_LINK_GUI_STATICALLY)
             install(TARGETS PoundGui imgui
+                    RUNTIME DESTINATION "${POUND_INSTALL_BIN_DIR}"
+                    LIBRARY DESTINATION "${POUND_INSTALL_LIB_DIR}"
+            )
+        endif ()
+
+        # SDL's own install rules are switched off above (SDL_INSTALL=OFF) so a
+        # Pound release ships neither SDL's headers, its pkg-config file, nor its
+        # CMake package config -- none of which the emulator needs at run time.
+        # The consequence is that the SDL runtime is no longer staged either,
+        # and the loader cannot find SDL3.dll next to Pound.exe, so the
+        # installed executable fails to start. Stage it explicitly.
+        #
+        # Android is excluded because it links SDL statically (see above), and
+        # `install(TARGETS ...)` on an archive-only target would install the
+        # import library the APK has no loader for.
+        if (TARGET SDL3-shared)
+            install(TARGETS SDL3-shared
                     RUNTIME DESTINATION "${POUND_INSTALL_BIN_DIR}"
                     LIBRARY DESTINATION "${POUND_INSTALL_LIB_DIR}"
             )
