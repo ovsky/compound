@@ -107,6 +107,82 @@
         "POUND_SANITIZERS": "",
         "POUND_ENABLE_LINK_TIME_OPTIMIZATION": "ON"
       }
+    },
+    {
+      "name": "linux-aarch64-debug",
+      "displayName": "Linux aarch64 Debug (cross, QEMU)",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/linux-aarch64-debug",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-aarch64.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER_LAUNCHER": "ccache",
+        "CMAKE_CXX_COMPILER_LAUNCHER": "ccache",
+        "CMAKE_C_FLAGS": "",
+        "CMAKE_CXX_FLAGS": "",
+        "POUND_COMPILER_FLAGS": "-Wall -Wextra -Wconversion -Wsign-conversion -Wshadow -Wstrict-prototypes -fstack-protector-strong -Wpadded -Wvla -fstrict-aliasing -fno-omit-frame-pointer -ftrivial-auto-var-init=zero -gsplit-dwarf -g",
+        "POUND_LINKER_FLAGS": "",
+        "POUND_SANITIZERS": "",
+        "POUND_ENABLE_LINK_TIME_OPTIMIZATION": "OFF",
+        "POUND_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "linux-aarch64-release",
+      "displayName": "Linux aarch64 Release (cross, QEMU)",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/linux-aarch64-release",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-aarch64.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER_LAUNCHER": "ccache",
+        "CMAKE_CXX_COMPILER_LAUNCHER": "ccache",
+        "CMAKE_C_FLAGS": "-ffile-prefix-map=${sourceDir}=. -O3",
+        "CMAKE_CXX_FLAGS": "-ffile-prefix-map=${sourceDir}=. -O3",
+        "POUND_COMPILER_FLAGS": "-fPIC -fstrict-aliasing -fno-omit-frame-pointer -ffunction-sections -fdata-sections",
+        "POUND_LINKER_FLAGS": "-Wl,--gc-sections",
+        "POUND_SANITIZERS": "",
+        "POUND_ENABLE_LINK_TIME_OPTIMIZATION": "OFF",
+        "POUND_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "android-arm64-debug",
+      "displayName": "Android arm64-v8a Debug",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/android-arm64-debug",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/android-arm64.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ANDROID_ABI": "arm64-v8a",
+        "ANDROID_PLATFORM": "android-26",
+        "POUND_COMPILER_FLAGS": "-Wall -Wextra -Wshadow -Wstrict-prototypes -fstrict-aliasing -fno-omit-frame-pointer -ftrivial-auto-var-init=zero -g",
+        "POUND_LINKER_FLAGS": "",
+        "POUND_SANITIZERS": "",
+        "POUND_ENABLE_LINK_TIME_OPTIMIZATION": "OFF",
+        "POUND_BUILD_TESTS": "OFF",
+        "POUND_LINK_GUI_STATICALLY": "ON"
+      }
+    },
+    {
+      "name": "android-arm64-release",
+      "displayName": "Android arm64-v8a Release",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/android-arm64-release",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/android-arm64.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ANDROID_ABI": "arm64-v8a",
+        "ANDROID_PLATFORM": "android-26",
+        "CMAKE_C_FLAGS": "-ffile-prefix-map=${sourceDir}=. -O3",
+        "CMAKE_CXX_FLAGS": "-ffile-prefix-map=${sourceDir}=. -O3",
+        "POUND_COMPILER_FLAGS": "-fPIC -fstrict-aliasing -fno-omit-frame-pointer -ffunction-sections -fdata-sections",
+        "POUND_LINKER_FLAGS": "-Wl,--gc-sections",
+        "POUND_SANITIZERS": "",
+        "POUND_ENABLE_LINK_TIME_OPTIMIZATION": "ON",
+        "POUND_BUILD_TESTS": "OFF",
+        "POUND_LINK_GUI_STATICALLY": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -125,6 +201,22 @@
     {
       "name": "release-windows",
       "configurePreset": "release-windows"
+    },
+    {
+      "name": "linux-aarch64-debug",
+      "configurePreset": "linux-aarch64-debug"
+    },
+    {
+      "name": "linux-aarch64-release",
+      "configurePreset": "linux-aarch64-release"
+    },
+    {
+      "name": "android-arm64-debug",
+      "configurePreset": "android-arm64-debug"
+    },
+    {
+      "name": "android-arm64-release",
+      "configurePreset": "android-arm64-release"
     }
   ],
   "testPresets": [
@@ -141,8 +233,42 @@
       }
     },
     {
+      "name": "release",
+      "configurePreset": "release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error",
+        "jobs": 0
+      }
+    },
+    {
       "name": "debug-windows",
       "configurePreset": "debug-windows",
+      "output": {
+        "outputOnFailure": true,
+        "verbosity": "verbose"
+      },
+      "execution": {
+        "noTestsAction": "error",
+        "jobs": 0
+      }
+    },
+    {
+      "name": "release-windows",
+      "configurePreset": "release-windows",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error",
+        "jobs": 0
+      }
+    },
+    {
+      "name": "linux-aarch64-debug",
+      "configurePreset": "linux-aarch64-debug",
       "output": {
         "outputOnFailure": true,
         "verbosity": "verbose"
