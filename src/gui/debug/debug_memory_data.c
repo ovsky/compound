@@ -22,7 +22,13 @@
 
 #if POUND_PLATFORM_WINDOWS
 
+// The Windows presets put WIN32_LEAN_AND_MEAN on the command line for every
+// target, so re-defining it here would trip -Wmacro-redefined. The guard keeps
+// the header lean when the build supplied it and still keeps this translation
+// unit correct when it is compiled on its own.
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif // WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
 #elif POUND_PLATFORM_POSIX
