@@ -66,6 +66,18 @@ gui_plugin_exports_get(gui_plugin_exports_t *out)
         return GUI_PLUGIN_ERROR_INVALID_ARGUMENT;
     }
 
+    // As a separate shared image the plugin carries its own copy of core, and
+    // therefore its own `thread_logger`, which starts out zero-initialised. Its
+    // `log` member being NULL is what makes `pound_log_message` drop every
+    // record, so a default sink is installed here -- before the first call the
+    // host can make -- rather than letting the GUI fail silently. Assigning it
+    // unconditionally is safe: `pound_logger_init_default()` only writes the two
+    // fields, and the host may have configured a richer sink on *its* copy.
+    if (NULL == thread_logger.log)
+    {
+        pound_logger_init_default();
+    }
+
     out->create       = gui_create;
     out->destroy      = gui_destroy;
     out->render_frame = gui_render_frame;

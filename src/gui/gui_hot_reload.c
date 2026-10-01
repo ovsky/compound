@@ -6,7 +6,13 @@
 
 #if POUND_PLATFORM_WINDOWS
 
+// See the matching note in `debug_memory_data.c`: the Windows presets already
+// define WIN32_LEAN_AND_MEAN for every target, so the guard avoids a
+// -Wmacro-redefined diagnostic without weakening the header when this file is
+// compiled on its own.
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif // WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
 #else

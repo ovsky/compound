@@ -90,7 +90,11 @@ typedef struct
 /// Returns a human readable description of `error`.
 ///
 /// Never returns `NULL`; unknown values map to a sentinel string.
-const char *gui_plugin_error_to_string(gui_plugin_error_t error);
+///
+/// Marked POUND_EXPORT like every other host-facing entry point in this header:
+/// src/main.c calls it to turn a plugin failure into a log message, and an
+/// unexported definition is unreachable across the plugin boundary.
+POUND_EXPORT const char *gui_plugin_error_to_string(gui_plugin_error_t error);
 
 /// gui.c
 ///
