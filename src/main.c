@@ -38,18 +38,24 @@
 
 typedef struct
 {
+    // Ordered widest-first so the only padding in the struct is the trailing
+    // alignment gap, which `pad` below accounts for explicitly. Interleaving
+    // the bools with the pointers instead left a 5-byte hole in the middle,
+    // which -Wpadded flags and which `app_t` is large enough for to matter:
+    // it embeds gui_plugin_t, and that struct carries its own 4096-byte path.
     SDL_Window   *window;
     SDL_GLContext gl_context;
     ImGuiContext *imgui_context;
-    bool          running;
-    bool          gui_reload_request;
-    bool          gui_frozen;
-    char          gui_frozen_reason[GUI_FREEZE_REASON_SIZE];
-    char          gui_source_path[POUND_PATH_MAX];
     uint64_t      gui_source_time;
     uint64_t      gui_pending_time;
     uint64_t      gui_pending_since;
+    char          gui_frozen_reason[GUI_FREEZE_REASON_SIZE];
+    char          gui_source_path[POUND_PATH_MAX];
     gui_plugin_t  gui;
+    bool          running;
+    bool          gui_reload_request;
+    bool          gui_frozen;
+    char          pad[5];
 } app_t;
 
 static bool app_video_init(app_t *app);
@@ -61,20 +67,28 @@ static void app_gui_freeze(app_t *app, const char *reason);
 static void app_gui_unfreeze(app_t *app);
 static bool app_hot_reload_init(app_t *app);
 static bool app_hot_reload_shutdown(app_t *app);
+#if !POUND_PLATFORM_SUPPORTS_HOT_RELOAD
 static bool app_gui_bind_static(app_t *app);
+#endif // !POUND_PLATFORM_SUPPORTS_HOT_RELOAD
 static void app_poll_events(app_t *app);
 static void app_render_frame(app_t *app);
 static void app_render_frozen_overlay(app_t *app);
 static void app_memory_churn(void);
-static bool app_memory_churn_requested(void);
+static bool app_memory_churn_requested(int argc, char *argv[]);
 static void app_frame_limit(uint64_t frame_start_ms);
 
 // -----------------------------------------------------------------------------
 // Entry point
 // -----------------------------------------------------------------------------
 
+/// SDL3 defines no command-line introspection API -- the SDL2 `SDL_GetNumArgv`
+/// / `SDL_GetArgv` pair was removed outright -- so the only way to see the
+/// arguments is to accept them in the entry point. `SDL_main.h` renames this to
+/// `SDL_main`, and SDL invokes it through `SDL_main_func`, whose signature is
+/// `int (int, char *[])`; declaring `main(void)` here would therefore have
+/// disagreed with the function pointer SDL actually calls.
 int
-main(void)
+main(int argc, char *argv[])
 {
     mi_option_set(mi_option_arena_reserve, 128 * 1024);
     pound_logger_init_default();
@@ -142,7 +156,7 @@ main(void)
     POUND_LOG_INFO(&thread_logger, "Starting main loop on %s.", POUND_PLATFORM_NAME);
 
     // Diagnostic only: see app_memory_churn_requested().
-    const bool run_memory_selftest = app_memory_churn_requested();
+    const bool run_memory_selftest = app_memory_churn_requested(argc, argv);
 
     if (run_memory_selftest)
     {
@@ -329,14 +343,10 @@ app_video_shutdown(app_t *app)
 
     if (app->window != NULL)
     {
-        if (false == SDL_DestroyWindow(app->window))
-        {
-            POUND_LOG_ERROR(&thread_logger,
-                            "SDL_DestroyWindow failed because %s.",
-                            SDL_GetError());
-            ok = false;
-        }
-
+        // SDL_DestroyWindow returns void, so unlike the context teardown above
+        // there is no status to branch on and nothing to report. The pointer is
+        // cleared unconditionally so a later shutdown cannot double free.
+        SDL_DestroyWindow(app->window);
         app->window = NULL;
     }
 
@@ -769,12 +779,19 @@ app_hot_reload_init(app_t *app)
 #endif // !POUND_PLATFORM_SUPPORTS_HOT_RELOAD
 }
 
+#if !POUND_PLATFORM_SUPPORTS_HOT_RELOAD
+
 /// Binds the statically linked GUI into `app->gui`.
 ///
 /// The plugin contract is identical to the hot-reload path; only the mechanism
 /// that obtains the vtable differs. `module` stays NULL so
 /// `gui_plugin_destroy` skips the `dlclose`, and `loaded_path` stays empty so
 /// nothing is unlinked from disk.
+///
+/// Compiled only where hot reload is unavailable: on the platforms that do
+/// support it the vtable always comes from `gui_plugin_load_module`, and a
+/// definition with no caller would be dead code the compiler rightly rejects
+/// under -Wunused-function.
 static bool
 app_gui_bind_static(app_t *app)
 {
@@ -831,6 +848,8 @@ app_gui_bind_static(app_t *app)
     POUND_LOG_INFO(&thread_logger, "Bound the statically linked GUI at %s.", POUND_PLATFORM_NAME);
     return true;
 }
+
+#endif // !POUND_PLATFORM_SUPPORTS_HOT_RELOAD
 
 static bool
 app_hot_reload_shutdown(app_t *app)
@@ -1136,7 +1155,7 @@ app_memory_churn(void)
 /// release builds, so it is opt-in via `--selftest-memory` or
 /// `POUND_SELFTEST_MEMORY=1`.
 static bool
-app_memory_churn_requested(void)
+app_memory_churn_requested(int argc, char *argv[])
 {
     static int cached = -1;
 
@@ -1144,9 +1163,9 @@ app_memory_churn_requested(void)
     {
         cached = 0;
 
-        for (int i = 1; i < SDL_GetNumArgv(); ++i)
+        for (int i = 1; i < argc; ++i)
         {
-            if (0 == SDL_strcmp(SDL_GetArgv(i), "--selftest-memory"))
+            if (NULL != argv[i] && (0 == SDL_strcmp(argv[i], "--selftest-memory")))
             {
                 cached = 1;
                 break;
