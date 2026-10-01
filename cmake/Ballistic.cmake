@@ -20,14 +20,6 @@ include_guard(GLOBAL)
 #   linux/       lib/libBallistic.a                        bin/libluajit.so
 #   android/     lib/<abi>/libBallistic.a                  lib/<abi>/libluajit.so
 
-function(ballistic_verify_directory path description)
-    string(STRIP "${path}" path)
-
-    if (NOT IS_DIRECTORY "${path}")
-        message(FATAL_ERROR "[Ballistic] Missing ${description}: ${path}")
-    endif ()
-endfunction()
-
 function(ballistic_verify_file path description)
     string(STRIP "${path}" path)
 
@@ -126,12 +118,20 @@ if (BALLISTIC_ENGINE_LIBRARY STREQUAL "" OR BALLISTIC_LUAJIT_RUNTIME STREQUAL ""
 endif ()
 
 foreach (artefact IN ITEMS BALLISTIC_ENGINE_LIBRARY BALLISTIC_LUAJIT_RUNTIME BALLISTIC_LUAJIT_IMPLIB)
-    if (${artefact} STREQUAL "")
+    # Resolve through an intermediate variable first. Testing `${${artefact}}`
+    # directly inside if() would expand an empty value to nothing, leaving a
+    # two-token if() that CMake rejects outright -- which is exactly the case on
+    # every platform that ships no separate import library.
+    set(artefact_path "${${artefact}}")
+
+    if (artefact_path STREQUAL "")
+        # Not applicable to this target: only the MSVC layout ships a separate
+        # import library. Nothing to verify.
         continue()
     endif ()
 
-    if (NOT EXISTS "${${artefact}}")
-        message(STATUS "[Ballistic] Not present: ${${artefact}}")
+    if (NOT EXISTS "${artefact_path}")
+        message(STATUS "[Ballistic] Not present: ${artefact_path}")
         set(BALLISTIC_ARTEFACTS_PRESENT FALSE)
     endif ()
 endforeach ()
@@ -191,7 +191,7 @@ else ()
     # A no-op target keeps `if (TARGET Ballistic::Engine)` call sites in the
     # source working without preprocessor guards in every file.
     add_library(Ballistic::Engine INTERFACE IMPORTED GLOBAL)
-    message(STATUS "[Ballistic] JIT disabled; linking an inert placeholder target.")
+    message(STATUS "[Ballistic] JIT disabled; providing an inert no-op target instead.")
 endif ()
 
 # -----------------------------------------------------------------------------
