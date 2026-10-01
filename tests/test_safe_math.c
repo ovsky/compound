@@ -71,7 +71,8 @@ POUND_TEST(safe_math, add_u16_detects_unsigned_overflow)
 {
     uint16_t result = 0;
 
-    POUND_CHECK_EQ_I64(safe_math_add_u16(UINT16_MAX, 1U, &result), POUND_MATH_SUCCESS);
+    // UINT16_MAX is representable, so only adding nothing keeps it in range.
+    POUND_CHECK_EQ_I64(safe_math_add_u16(UINT16_MAX, 0U, &result), POUND_MATH_SUCCESS);
     POUND_CHECK_EQ_U64(result, UINT16_MAX);
 
     POUND_CHECK_EQ_I64(safe_math_add_u16(UINT16_MAX, 2U, &result),

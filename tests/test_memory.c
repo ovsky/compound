@@ -49,18 +49,16 @@ POUND_TEST(memory, distinct_buckets_are_not_aliased)
 
     memory_subsystem_init();
 
+    // Selecting each bucket in turn must make exactly that bucket the active
+    // one: the read-back is the only way to observe what `set_bucket` stored.
     for (size_t i = 0; i < (sizeof(k_buckets) / sizeof(k_buckets[0])); ++i)
     {
-        (void)memory_subsystem_set_bucket(MEMORY_BUCKET_NONE);
+        (void)memory_subsystem_set_bucket(k_buckets[i]);
         POUND_CHECK_EQ_I64(memory_subsystem_get_bucket(), k_buckets[i]);
 
         for (size_t j = 0; j < (sizeof(k_buckets) / sizeof(k_buckets[0])); ++j)
         {
-            if (i == j)
-            {
-                POUND_CHECK_EQ_I64(memory_subsystem_get_bucket(), k_buckets[j]);
-            }
-            else
+            if (i != j)
             {
                 POUND_CHECK(memory_subsystem_get_bucket() != k_buckets[j]);
             }

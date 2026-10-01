@@ -143,7 +143,12 @@ POUND_TEST(guest_memory, contains_does_not_wrap_a_high_window)
                                        UINT64_MAX - GUEST_TEST_HOST_SIZE));
 
     POUND_CHECK(guest_memory_contains(&region, UINT64_MAX - GUEST_TEST_HOST_SIZE));
-    POUND_CHECK(guest_memory_contains(&region, UINT64_MAX));
+
+    // guest_end is UINT64_MAX itself, and the window is half-open, so the very
+    // top of the address space is one past the last mapped byte.
+    POUND_CHECK(guest_memory_contains(&region, UINT64_MAX - 1U));
+    POUND_CHECK(false == guest_memory_contains(&region, UINT64_MAX));
+
     POUND_CHECK(false == guest_memory_contains(&region, 0U));
     POUND_CHECK(false == guest_memory_contains(&region, UINT64_MAX - GUEST_TEST_HOST_SIZE - 1U));
 }
@@ -158,18 +163,22 @@ POUND_TEST(guest_memory, translate_read_reports_the_remaining_span)
     POUND_REQUIRE(POUND_SUCCESS == init_region(&region, GUEST_TEST_APP_BASE));
 
     size_t               readable = 0U;
-    const uint8_t *const host = guest_memory_translate_read(&region, GUEST_TEST_APP_BASE, &readable);
+    const uint8_t *const host    = guest_memory_translate_read(&region,
+                                                           GUEST_TEST_APP_BASE,
+                                                           &readable);
 
     POUND_CHECK_PTR_EQ(host, g_host_buffer);
     POUND_CHECK_EQ_U64(readable, GUEST_TEST_HOST_SIZE);
 
-    host = guest_memory_translate_read(&region, GUEST_TEST_APP_BASE + 16U, &readable);
-    POUND_CHECK_PTR_EQ(host, g_host_buffer + 16U);
+    const uint8_t *const offset_host
+        = guest_memory_translate_read(&region, GUEST_TEST_APP_BASE + 16U, &readable);
+    POUND_CHECK_PTR_EQ(offset_host, g_host_buffer + 16U);
     POUND_CHECK_EQ_U64(readable, GUEST_TEST_HOST_SIZE - 16U);
 
     // The final byte leaves exactly one byte readable.
-    host = guest_memory_translate_read(&region, region.guest_end - 1U, &readable);
-    POUND_CHECK_PTR_EQ(host, g_host_buffer + GUEST_TEST_HOST_SIZE - 1U);
+    const uint8_t *const last_host
+        = guest_memory_translate_read(&region, region.guest_end - 1U, &readable);
+    POUND_CHECK_PTR_EQ(last_host, g_host_buffer + GUEST_TEST_HOST_SIZE - 1U);
     POUND_CHECK_EQ_U64(readable, 1U);
 }
 

@@ -16,14 +16,14 @@ static size_t             g_case_count;
 // Running-case state
 // -----------------------------------------------------------------------------
 
-static const char *g_current_case;
-static unsigned    g_current_case_failures;
+static const pound_test_t *g_current_case;
+static unsigned           g_current_case_failures;
 
 static unsigned
 run_one(const pound_test_t *test)
 {
-    g_current_case          = test;
-    g_current_case_failures = 0;
+    g_current_case            = test;
+    g_current_case_failures  = 0;
 
     // Log state is per-case. Without this, a case asserting "no error was
     // logged" would observe records emitted by whichever case ran before it,
@@ -74,7 +74,10 @@ pound_test_fail(const char *file, const int line, const char *format, ...)
     // broken; say so loudly instead of silently counting it.
     if (NULL == g_current_case)
     {
-        fprintf(stderr, "[ FATAL    ] failure reported outside a test case: %s:%d\n", file, line);
+        fprintf(stderr,
+                "[ FATAL    ] failure reported outside a test case: %s:%d\n",
+                file,
+                line);
         abort();
     }
 

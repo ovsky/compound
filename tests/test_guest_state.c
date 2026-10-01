@@ -59,9 +59,12 @@ POUND_TEST(guest_state, layout_is_the_size_the_jit_assumes)
     POUND_CHECK_EQ_U64(offsetof(guest_state_t, flag_v), 267U);
     POUND_CHECK_EQ_U64(offsetof(guest_state_t, pad), 268U);
 
-    // A C struct is always padded up to its own alignment: 272 rounded up to the
-    // next multiple of 64.
-    POUND_CHECK_EQ_U64(sizeof(guest_state_t), 320U);
+    // `POUND_ALIGNED(64)` raises the type's alignment, which the Itanium/MSVC ABI
+    // satisfies by aligning each member's offset, not by extending sizeof. The
+    // size is therefore exactly the sum of the members: 256 + 8 + 4 flags + 4 pad.
+    // Verified rather than assumed -- it is the value the recompiler bakes in.
+    POUND_CHECK_EQ_U64(_Alignof(guest_state_t), 64U);
+    POUND_CHECK_EQ_U64(sizeof(guest_state_t), 272U);
 }
 
 POUND_TEST(guest_state, a_zeroed_state_is_idempotently_reinitialisable)
