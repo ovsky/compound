@@ -16,6 +16,9 @@ void pound_register_safe_math_tests(void);
 void pound_register_guest_memory_tests(void);
 void pound_register_guest_state_tests(void);
 void pound_register_memory_tests(void);
+void pound_register_pool_allocator_tests(void);
+void pound_register_mutex_tests(void);
+void pound_register_slab_allocator_tests(void);
 
 static void
 print_usage(const char *argv0)
@@ -52,6 +55,9 @@ main(int argc, char **argv)
     pound_register_guest_memory_tests();
     pound_register_guest_state_tests();
     pound_register_memory_tests();
+    pound_register_pool_allocator_tests();
+    pound_register_mutex_tests();
+    pound_register_slab_allocator_tests();
 
     const char *filter      = (argc == 2) ? argv[1] : NULL;
     const int   exit_status = pound_test_run_all(filter);

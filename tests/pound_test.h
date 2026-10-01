@@ -70,6 +70,20 @@ typedef struct
         } \
     } while (0)
 
+/// Records a failure with additional context and continues.
+///
+/// Use where the bare condition would not identify *which* iteration or element
+/// failed. A loop that checks the same condition a hundred times is close to
+/// useless without the loop variable in the message.
+#define POUND_CHECK_MSG(cond, ...)                              \
+    do                                                          \
+    {                                                           \
+        if (!(cond))                                            \
+        {                                                       \
+            pound_test_fail(__FILE__, __LINE__, __VA_ARGS__);   \
+        }                                                       \
+    } while (0)
+
 /// Records a failure against the running case and abandons it.
 ///
 /// Use for preconditions where continuing would dereference invalid state.
@@ -81,6 +95,31 @@ typedef struct
             pound_test_fail(__FILE__, __LINE__, "required: %s", #cond); \
             return; \
         } \
+    } while (0)
+
+/// Records a failure with additional context and abandons the case.
+#define POUND_REQUIRE_MSG(cond, ...)                        \
+    do                                                      \
+    {                                                       \
+        if (!(cond))                                        \
+        {                                                   \
+            pound_test_fail(__FILE__, __LINE__, __VA_ARGS__); \
+            return;                                         \
+        }                                                   \
+    } while (0)
+
+/// Asserts a pointer is non-NULL, abandoning the case if it is not.
+#define POUND_REQUIRE_PTR_NON_NULL(actual)      \
+    do                                          \
+    {                                           \
+        if (NULL == (const void *)(actual))     \
+        {                                       \
+            pound_test_fail(__FILE__,           \
+                            __LINE__,           \
+                            "%s is NULL",       \
+                            #actual);           \
+            return;                             \
+        }                                       \
     } while (0)
 
 #define POUND_CHECK_EQ_U64(actual, expected)                                   \
