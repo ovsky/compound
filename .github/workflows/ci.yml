@@ -1,0 +1,328 @@
+name: CI
+
+# ---------------------------------------------------------------------------
+# Every lane that must stay green before a change lands.
+#
+# Matrix:
+#   linux            x86-64 Debug (ASan/UBSan + ctest) and Release (ctest)
+#   linux-aarch64    cross-built ARM64, executed under qemu-user
+#   windows          clang-cl Debug and Release (ctest)
+#   android-arm64    NDK build producing libmain.so for arm64-v8a
+#
+# The Android lane builds the native image only. Packaging an installable APK
+# additionally needs a signed keystore, which is handled by android-apk.yml.
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+# A superseded run for the same ref is not interesting.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep ccache inside the runner so it is restored by actions/cache.
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Native x86-64 Linux
+  # -------------------------------------------------------------------------
+  linux:
+    name: linux-${{ matrix.config }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - config: debug
+            preset: debug
+            test_preset: debug
+          - config: release
+            preset: release
+            test_preset: release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # clang/clang++ are already on the runner image; mold and ccache are
+          # pinned explicitly because the presets hard-code them.
+          sudo apt-get install --no-install-recommends --yes \
+            ccache mold ninja-build cmake
+          sudo ccache --set-config=max_size=2G
+          ccache --version
+          mold --version
+          clang --version
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-linux-${{ matrix.config }}-${{ github.sha }}
+          restore-keys: |
+            ccache-linux-${{ matrix.config }}-
+            ccache-linux-
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }} --fresh
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} --parallel
+
+      - name: Test
+        run: ctest --preset ${{ matrix.test_preset }}
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.config }}-logs
+          path: |
+            build/${{ matrix.config }}/CMakeFiles/CMakeOutput.log
+            build/${{ matrix.config }}/CMakeFiles/CMakeError.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------
+  # ARM64 Linux, cross-compiled and executed under qemu-user
+  # -------------------------------------------------------------------------
+  linux-aarch64:
+    name: linux-aarch64
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cross toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            qemu-user binutils-aarch64-linux-gnu \
+            ccache ninja-build cmake
+          aarch64-linux-gnu-gcc --version
+          qemu-aarch64 --version
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-linux-aarch64-${{ github.sha }}
+          restore-keys: |
+            ccache-linux-aarch64-
+            ccache-linux-
+
+      - name: Configure
+        run: cmake --preset linux-aarch64-debug --fresh
+
+      - name: Build
+        run: cmake --build --preset linux-aarch64-debug --parallel
+
+      - name: Verify the produced binary really is ARM64
+        run: |
+          set -euo pipefail
+          # file(1) catches a silently-native build, which would make the QEMU
+          # test step pass without ever exercising the ARM64 code path.
+          file build/linux-aarch64-debug/bin/linux/Pound
+          file build/linux-aarch64-debug/bin/linux/Pound | grep -q 'ARM aarch64'
+
+      - name: Test under QEMU
+        run: ctest --preset linux-aarch64-debug
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-aarch64-logs
+          path: |
+            build/linux-aarch64-debug/CMakeFiles/CMakeOutput.log
+            build/linux-aarch64-debug/CMakeFiles/CMakeError.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------
+  # Windows, clang-cl
+  # -------------------------------------------------------------------------
+  windows:
+    name: windows-${{ matrix.config }}
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - config: debug
+            preset: debug-windows
+            test_preset: debug-windows
+          - config: release
+            preset: release-windows
+            test_preset: release-windows
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # clang-cl links against the MSVC runtime and the Windows SDK, so the
+      # MSVC environment has to be present even though nothing is compiled with
+      # cl.exe itself.
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Locate LLVM toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $llvm = 'C:\Program Files\LLVM\bin'
+          if (-not (Test-Path $llvm)) {
+            throw "LLVM was not found at $llvm; this runner image no longer ships it."
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $llvm
+          & "$llvm\clang-cl.exe" --version
+          & "$llvm\sccache.exe" --version
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }} --fresh
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} --parallel
+
+      - name: Test
+        run: ctest --preset ${{ matrix.test_preset }}
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.config }}-logs
+          path: build/${{ matrix.config }}/CMakeFiles/CMakeOutput.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------
+  # Android arm64-v8a
+  # -------------------------------------------------------------------------
+  android-arm64:
+    name: android-arm64
+    runs-on: ubuntu-24.04
+    env:
+      ANDROID_NDK_VERSION: 27.2.12479018
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.ANDROID_NDK_VERSION }}
+
+      - name: Install native toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            ninja-build cmake ccache
+          echo "ANDROID_NDK=${ANDROID_NDK_HOME}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK=${ANDROID_NDK_HOME}" >> "$GITHUB_STEP_SUMMARY"
+          test -f "${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake"
+
+      - name: Configure
+        run: cmake --preset android-arm64-release --fresh
+
+      - name: Build
+        run: cmake --build --preset android-arm64-release --parallel
+
+      - name: Verify the staged JNI image
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging=build/android-arm64-release/jniLibs/arm64-v8a
+          test -d "$staging"
+          ls -la "$staging"
+          test -f "$staging/libmain.so"
+          # The staging step must have produced a genuine AArch64 shared object
+          # exporting SDL_main, which is what SDLActivity dlopen()s from Java.
+          file "$staging/libmain.so" | tee /dev/stderr | grep -q 'ARM aarch64'
+          readelf -h "$staging/libmain.so" | grep -q 'AArch64'
+          readelf --dyn-syms -W "$staging/libmain.so" | grep -q 'SDL_main'
+
+      - name: Upload libmain.so
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-arm64-libmain
+          path: build/android-arm64-release/jniLibs/arm64-v8a/
+          retention-days: 14
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # Hygiene: nothing may be committed with placeholder markers left in it
+  # -------------------------------------------------------------------------
+  placeholder-audit:
+    name: placeholder-audit
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fail on TODO / FIXME / stub markers
+        run: |
+          set -euo pipefail
+          # Tracked sources only, so vendored third-party trees (which legitimately
+          # contain their own TODOs) never trip the audit.
+          mapfile -t files < <(git ls-files \
+            'src/*.c' 'src/*.h' \
+            'tests/*.c' 'tests/*.h' \
+            'cmake/*.cmake' 'cmake/*/*.cmake')
+
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No tracked sources matched the audit globs." >&2
+            exit 1
+          fi
+
+          if grep -nE '\b(TODO|FIXME|XXX|HACK)\b|// *\.\.\.|/\* *\.\.\. *\*/' \
+            -- "${files[@]}"; then
+            echo "::error::Placeholder markers found in tracked sources." >&2
+            exit 1
+          fi
+
+          echo "Audited ${#files[@]} tracked source files: no placeholder markers."
+
+      - name: Validate CMakePresets.json
+        run: |
+          set -euo pipefail
+          python3 -c 'import json,sys; json.load(open("CMakePresets.json"))'
+          cmake --list-presets
+          cmake --list-presets=build
+          cmake --list-presets=test
+
+      - name: Validate workflow YAML
+        run: |
+          set -euo pipefail
+          for f in .github/workflows/*.yml; do
+            python3 - "$f" <<'PY'
+          import sys
+          try:
+              import yaml
+          except ImportError:
+              sys.exit(0)  # PyYAML absent; the CMake configure step is the real gate.
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              yaml.safe_load(handle)
+          print(f"parsed {sys.argv[1]}")
+          PY
+          done

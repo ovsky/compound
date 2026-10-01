@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+        An emulated Nintendo Switch 2 renders through OpenGL ES 3.x, so this is a
+        hard requirement rather than a hint.
+    -->
+    <uses-feature
+        android:glEsVersion="0x00030000"
+        android:required="true" />
+
+    <!-- Controllers and touch input are how a Switch 2 title is actually played. -->
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.gamepad"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.bluetooth"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.usb.host"
+        android:required="false" />
+
+    <!-- Rumble for emulated HD haptics. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!--
+        No INTERNET permission is declared. Pound has no networking code, and
+        asking for the permission would be an unjustified capability request in
+        any store listing.
+    -->
+
+    <application
+        android:allowBackup="false"
+        android:enableOnBackInvokedCallback="false"
+        android:hardwareAccelerated="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Pound">
+
+        <activity
+            android:name=".MainActivity"
+            android:alwaysRetainTaskState="true"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode|density|layoutDirection|locale|grammaticalGender|fontScale|fontWeightAdjustment"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:preferMinimalPostProcessing="true"
+            android:screenOrientation="sensorLandscape">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!--
+                SDL's HIDAPI backend claims USB devices through this filter; the
+                manifest has to declare the intent for it to be delivered.
+            -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

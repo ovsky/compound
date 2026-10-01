@@ -1,0 +1,220 @@
+name: Android APK
+
+# ---------------------------------------------------------------------------
+# Packages the arm64-v8a native image into an installable APK.
+#
+# Signing is optional: with no keystore secrets configured the workflow still
+# produces a debug-signed APK so the packaging path itself stays covered by CI.
+# With them configured it produces a release-signed APK and uploads it as a
+# workflow artifact.
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+    tags:
+      - "v*"
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GRADLE_VERSION: "8.12"
+  ANDROID_NDK_VERSION: 27.2.12479018
+
+jobs:
+  assemble-apk:
+    name: assemble-apk-${{ matrix.build_type }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - build_type: debug
+            signed: false
+          - build_type: release
+            signed: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.ANDROID_NDK_VERSION }}
+
+      - name: Install Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      # The keystore is generated rather than stored so the repository never
+      # contains signing material. A CI-only keystore is not a distribution
+      # credential; releases intended for a store need a key supplied from the
+      # release environment instead.
+      - name: Provision signing keystore
+        if: matrix.signed
+        env:
+          POUND_KEYSTORE_PASSWORD: ${{ secrets.POUND_KEYSTORE_PASSWORD }}
+          POUND_KEY_ALIAS: ${{ secrets.POUND_KEY_ALIAS }}
+          POUND_KEY_PASSWORD: ${{ secrets.POUND_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${POUND_KEYSTORE_PASSWORD:-}" ]; then
+            echo "::notice::No POUND_KEYSTORE_PASSWORD secret configured; " \
+                 "falling back to an unsigned release build."
+            exit 0
+          fi
+
+          # `envsubst` is not installed on the runner by default.
+          cat > /tmp/keystore.properties.template <<'EOF'
+          storeFile=POUND_KEYSTORE_PATH
+          storePassword=POUND_KEYSTORE_PASSWORD
+          keyAlias=POUND_KEY_ALIAS
+          keyPassword=POUND_KEY_PASSWORD
+          EOF
+
+          sed \
+            -e "s|POUND_KEYSTORE_PATH|${{ runner.temp }}/pound-release.jks|g" \
+            -e "s|POUND_KEYSTORE_PASSWORD|${POUND_KEYSTORE_PASSWORD}|g" \
+            -e "s|POUND_KEY_ALIAS|${POUND_KEY_ALIAS:-pound}|g" \
+            -e "s|POUND_KEY_PASSWORD|${POUND_KEY_PASSWORD:-${POUND_KEYSTORE_PASSWORD}}|g" \
+            /tmp/keystore.properties.template > /tmp/keystore.properties
+
+          keytool -genkeypair \
+            -keystore "${{ runner.temp }}/pound-release.jks" \
+            -storepass "${POUND_KEYSTORE_PASSWORD}" \
+            -keypass  "${POUND_KEY_PASSWORD:-${POUND_KEYSTORE_PASSWORD}}" \
+            -alias    "${POUND_KEY_ALIAS:-pound}" \
+            -keyalg   RSA \
+            -keysize  4096 \
+            -validity 10000 \
+            -dname   "CN=Pound Emulator, OU=Development, O=Pound, L=Unknown, ST=Unknown, C=ZZ"
+
+          echo "POUND_KEYSTORE_PATH=${{ runner.temp }}/pound-release.jks" >> "$GITHUB_ENV"
+          echo "POUND_KEYSTORE_PASSWORD=${POUND_KEYSTORE_PASSWORD}" >> "$GITHUB_ENV"
+          echo "POUND_KEY_ALIAS=${POUND_KEY_ALIAS:-pound}" >> "$GITHUB_ENV"
+          echo "POUND_KEY_PASSWORD=${POUND_KEY_PASSWORD:-${POUND_KEYSTORE_PASSWORD}}" >> "$GITHUB_ENV"
+
+          keytool -list -keystore "${{ runner.temp }}/pound-release.jks" \
+            -storepass "${POUND_KEYSTORE_PASSWORD}" | head -5
+
+      - name: Build libmain.so (arm64-v8a)
+        run: |
+          set -euo pipefail
+          cmake --preset "android-arm64-${{ matrix.build_type }}" --fresh
+          cmake --build --preset "android-arm64-${{ matrix.build_type }}" --parallel
+
+      - name: Assemble APK
+        working-directory: android
+        run: |
+          set -euo pipefail
+          gradle --no-daemon --stacktrace \
+            "assemble${{ matrix.build_type == 'release' && 'Release' || 'Debug' }}"
+
+      - name: Verify the APK actually contains a runnable native image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The output filename carries the signing suffix ("release-unsigned",
+          # "release", "debug"), which AGP changes between versions, so the APK
+          # is located rather than assumed.
+          mapfile -t apks < <(find android/app/build/outputs/apk -name '*.apk' -type f | sort)
+
+          if [ ${#apks[@]} -eq 0 ]; then
+            echo "::error::No APK was produced under android/app/build/outputs/apk."
+            exit 1
+          fi
+
+          for apk in "${apks[@]}"; do
+            echo "Inspecting $apk ($(stat -c%s "$apk") bytes)"
+            unzip -l "$apk" | grep -E 'lib/arm64-v8a/.*\.so' || {
+              echo "::error::No arm64-v8a native libraries inside $apk."
+              exit 1
+            }
+
+            # An APK whose libmain.so is not AArch64 installs successfully and
+            # then fails at dlopen with an unhelpful message on the device.
+            unzip -p "$apk" lib/arm64-v8a/libmain.so > "$RUNNER_TEMP/libmain.so"
+            file "$RUNNER_TEMP/libmain.so" | tee /dev/stderr | grep -q 'ARM aarch64' || {
+              echo "::error::libmain.so in $apk is not an AArch64 shared object."
+              exit 1
+            }
+            readelf --dyn-syms -W "$RUNNER_TEMP/libmain.so" | grep -q 'SDL_main' || {
+              echo "::error::libmain.so in $apk does not export SDL_main; SDLActivity cannot start it."
+              exit 1
+            }
+          done
+
+          echo "Verified ${#apks[@]} APK(s)."
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: pound-${{ matrix.build_type }}-apk
+          path: android/app/build/outputs/apk/${{ matrix.build_type }}/*.apk
+          retention-days: 14
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # Attach the signed APK to a tagged release.
+  # -------------------------------------------------------------------------
+  attach-to-release:
+    name: attach-apk-to-release
+    needs: assemble-apk
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pound-release-apk
+          path: artifacts
+          merge-multiple: true
+
+      - name: Upload to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          shopt -s nullglob
+          apks=(artifacts/*.apk)
+
+          if [ ${#apks[@]} -eq 0 ]; then
+            echo "::error::No APK artefact was produced for the release."
+            exit 1
+          fi
+
+          # --clobber makes a re-run of the tag replace the previous attachment
+          # instead of failing with "already exists".
+          gh release upload "$VERSION" "${apks[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber

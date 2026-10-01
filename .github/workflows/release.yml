@@ -1,0 +1,344 @@
+name: Release
+
+# ---------------------------------------------------------------------------
+# Tag-triggered distribution packages.
+#
+# Produces, from one `v*` tag:
+#   Windows  zip  : Pound.exe + libPoundGui.dll + libimgui.dll + mimalloc.dll + lua51.dll
+#   Linux    tgz  : Pound + libPoundGui.so + libimgui.so + libmimalloc.so + libluajit.so
+#   macOS    tgz  : Pound + libPoundGui.dylib + libimgui.dylib + libmimalloc.dylib
+#
+# Every artefact is verified to contain its emulator image before upload: an
+# archive that ships without it is worse than no archive at all.
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string to stamp into the artefact names (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: 4
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Resolve the tag once so every platform builds the same version.
+  # -------------------------------------------------------------------------
+  resolve-version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Determine version
+        id: version
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.version }}"
+          else
+            version="${GITHUB_REF_NAME}"
+          fi
+
+          if ! printf '%s' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Version '$version' is not a vMAJOR.MINOR.PATCH tag."
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing $version"
+
+  linux:
+    name: linux-x86_64
+    needs: resolve-version
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [release]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            ccache mold ninja-build cmake zip
+
+      - name: Build
+        run: |
+          cmake --preset ${{ matrix.config }} --fresh
+          cmake --build --preset ${{ matrix.config }} --parallel
+
+      - name: Package
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # Plain mkdir/cp rather than `install -D`: BSD install has no -D, and
+          # these steps also run on macOS.
+          payload="pound-linux-x86_64-${VERSION#v}"
+          stage="${payload}"
+
+          mkdir -p "${stage}/bin" "${stage}/lib"
+
+          # Only the runtime image ships: headers, static archives and CMake
+          # export files are build inputs, not part of a runnable tree.
+          cp -p build/${{ matrix.config }}/bin/linux/Pound          "${stage}/bin/Pound"
+          cp -p build/${{ matrix.config }}/bin/linux/libPoundGui.so "${stage}/bin/libPoundGui.so"
+
+          for so in build/${{ matrix.config }}/bin/linux/*.so; do
+            [ -e "$so" ] || continue
+            name="$(basename "$so")"
+            case "$name" in
+              libPoundGui.so) continue ;;
+            esac
+            cp -p "$so" "${stage}/lib/${name}"
+          done
+
+          cp -p LICENSE   "${stage}/LICENSE"
+          cp -p README.md "${stage}/README.md"
+
+          # A package whose emulator image cannot resolve its own libraries
+          # extracts cleanly and then fails on first launch.
+          if ldd "${stage}/bin/Pound" | grep -q 'not found'; then
+            echo "::error::Unresolved shared library in the packaged Linux image:"
+            ldd "${stage}/bin/Pound"
+            exit 1
+          fi
+
+          if [ ! -f "${stage}/bin/Pound" ]; then
+            echo "::error::The packaged tree has no emulator image."
+            exit 1
+          fi
+
+          tar -czf "${payload}.tar.gz" "$payload"
+          test -f "${payload}.tar.gz"
+          ls -lh "${payload}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pound-linux-x86_64
+          path: pound-linux-x86_64-*.tar.gz
+          retention-days: 30
+          if-no-files-found: error
+
+  windows:
+    name: windows-x86_64
+    needs: resolve-version
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [release-windows]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Locate LLVM toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $llvm = 'C:\Program Files\LLVM\bin'
+          if (-not (Test-Path $llvm)) {
+            throw "LLVM was not found at $llvm."
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $llvm
+          & "$llvm\clang-cl.exe" --version
+
+      - name: Build
+        run: |
+          cmake --preset ${{ matrix.config }} --fresh
+          cmake --build --preset ${{ matrix.config }} --parallel
+
+      - name: Package
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $version   = $env:VERSION.TrimStart('v')
+          $payload   = "pound-windows-x86_64-$version"
+          $root      = $env:GITHUB_WORKSPACE
+          $stage     = Join-Path $root "stage\$payload"
+          $binOut    = "build\${{ matrix.config }}\bin\windows"
+
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          # A missing DLL here is the classic Wayland/Windows packaging failure:
+          # the archive extracts fine and then refuses to start.
+          $required = @('Pound.exe', 'libPoundGui.dll')
+          foreach ($name in $required) {
+            $path = Join-Path $binOut $name
+            if (-not (Test-Path $path)) {
+              throw "Required runtime file missing: $path (contents: $((Get-ChildItem $binOut | ForEach-Object Name) -join ', '))"
+            }
+            Copy-Item $path $stage
+          }
+
+          Get-ChildItem -Path $binOut -Filter '*.dll' | ForEach-Object {
+            if ($_.Name -notin $required) { Copy-Item $_.FullName $stage }
+          }
+
+          Copy-Item LICENSE  (Join-Path $stage 'LICENSE')
+          Copy-Item README.md (Join-Path $stage 'README.md')
+
+          Compress-Archive -Path (Join-Path $root 'stage\*') `
+                            -DestinationPath (Join-Path $root "$payload.zip") `
+                            -Force
+
+          if (-not (Test-Path (Join-Path $root "$payload.zip"))) {
+            throw "Archive was not produced."
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pound-windows-x86_64
+          path: pound-windows-x86_64-*.zip
+          retention-days: 30
+          if-no-files-found: error
+
+  macos:
+    name: macos-arm64
+    needs: resolve-version
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [release]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          set -euo pipefail
+          brew install cmake ninja mold ccache
+          cmake --version
+          ninja --version
+
+      - name: Build
+        run: |
+          cmake --preset ${{ matrix.config }} --fresh
+          cmake --build --preset ${{ matrix.config }} --parallel
+
+      - name: Package
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # Plain mkdir/cp rather than `install -D`: BSD install has no -D.
+          payload="pound-macos-arm64-${VERSION#v}"
+          stage="${payload}"
+
+          mkdir -p "${stage}/bin" "${stage}/lib"
+
+          cp -p build/${{ matrix.config }}/bin/mac/Pound            "${stage}/bin/Pound"
+          cp -p build/${{ matrix.config }}/bin/mac/libPoundGui.dylib "${stage}/bin/libPoundGui.dylib"
+
+          for dylib in build/${{ matrix.config }}/bin/mac/*.dylib; do
+            [ -e "$dylib" ] || continue
+            name="$(basename "$dylib")"
+            case "$name" in
+              libPoundGui.dylib) continue ;;
+            esac
+            cp -p "$dylib" "${stage}/lib/${name}"
+          done
+
+          # macOS refuses unsigned arm64 binaries unless they are at least
+          # ad-hoc signed, which is the difference between an artefact that
+          # launches and one the kernel kills on first exec.
+          find "$payload" -type f \( -name '*.dylib' -o -name Pound \) \
+            -exec codesign --force --sign - {} \;
+
+          codesign --verify --deep --strict "${stage}/bin/Pound"
+
+          # Catches a library left out of lib/ instead of leaving it to fail at
+          # dyld time on the user's machine.
+          otool -L "${stage}/bin/Pound"
+
+          cp -p LICENSE   "${stage}/LICENSE"
+          cp -p README.md "${stage}/README.md"
+
+          tar -czf "${payload}.tar.gz" "$payload"
+          test -f "${payload}.tar.gz"
+          ls -lh "${payload}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pound-macos-arm64
+          path: pound-macos-arm64-*.tar.gz
+          retention-days: 30
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # Publish
+  # -------------------------------------------------------------------------
+  publish:
+    name: publish-release
+    needs: [resolve-version, linux, windows, macos]
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artefacts
+        run: |
+          set -euo pipefail
+          find artifacts -type f -exec ls -lh {} \;
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          shopt -s nullglob
+          archives=(artifacts/*)
+
+          if [ ${#archives[@]} -eq 0 ]; then
+            echo "::error::No release artefacts were produced."
+            exit 1
+          fi
+
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            gh release create "$VERSION" "${archives[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Pound $VERSION" \
+              --generate-notes \
+              --verify-tag
+          else
+            # workflow_dispatch is not necessarily on a tag, so an existing
+            # release is updated instead of failing on a duplicate tag.
+            gh release upload "$VERSION" "${archives[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          fi
+
+      # Android APKs are intentionally *not* attached here: they are produced by
+      # android-apk.yml in a separate workflow run, so they are not present in
+      # this run's artifact set. That workflow uploads them on `v*` tags.
