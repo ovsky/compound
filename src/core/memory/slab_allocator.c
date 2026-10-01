@@ -88,6 +88,18 @@ struct slab
 /// same value as `SLAB_OBJECT_FREE_NONE`, so the two fields are interchangeable.
 #define SLAB_FREE_HEAD_NONE UINT32_MAX
 
+// The object header is 16 bytes by design, so that at the default 16-byte
+// alignment it consumes no slack. A change to its field list that added padding
+// would silently cost 8 bytes on every object in every slab, and the tests would
+// still pass, so the layout is pinned here rather than left to review.
+_Static_assert(sizeof(slab_object_t) == 16U,
+               "the object header must stay 16 bytes to avoid per-object slack");
+
+// The slab header's size is load-bearing in a subtler way: it offsets the object
+// region, so a change to it shifts every payload in every slab. Pinned for the
+// same reason.
+_Static_assert(sizeof(slab_t) == 72U, "the slab header layout is part of the arena geometry");
+
 /// One object type.
 struct slab_cache
 {
@@ -245,9 +257,9 @@ find_slab(const slab_allocator_t *POUND_RESTRICT allocator,
 {
     const uint8_t *const address = (const uint8_t *)(uintptr_t)object;
 
-    // Slabs on the reuse list have been detached from every cache, so they hold
-    // no live objects and are deliberately not searched. A pointer into one is a
-    // use-after-free that `cache_destroy` or `trim` already invalidated.
+    // A released slab is detached from every cache's lists, so it holds no live
+    // objects and is never searched. A pointer into one is a use-after-free that
+    // `cache_destroy` or `trim` already invalidated.
     for (size_t c = 0U; c < allocator->cache_count; ++c)
     {
         slab_t *const slab = search_cache_slabs(allocator->caches[c], address, out_index);
@@ -1228,9 +1240,9 @@ slab_allocator_free(slab_allocator_t *POUND_RESTRICT allocator, void *POUND_REST
 
     slab_cache_t *const cache = slab->cache;
 
-    // A slab on the reuse list has its cache cleared, so a stale object can never
-    // reach this point; assert the invariant rather than trusting it, because
-    // dereferencing a NULL cache below would be a crash in an emulator.
+    // A released slab is off every cache's lists, so `find_slab` cannot return one.
+    // Assert the invariant rather than trusting it, because dereferencing a NULL
+    // cache below would be a crash in an emulator.
     if (POUND_UNLIKELY(NULL == cache))
     {
         POUND_LOG_ERROR(&thread_logger,
@@ -1387,51 +1399,15 @@ slab_allocator_trim(slab_allocator_t *POUND_RESTRICT allocator, slab_cache_id_t 
         return 0U;
     }
 
-    size_t released = 0U;
-
-    for (size_t c = 0U; c < allocator->cache_count; ++c)
-    {
-        slab_cache_t *const cache = allocator->caches[c];
-
-        if ((NULL != only) && (cache != only))
-        {
-            continue;
-        }
-
-        slab_t **link = &cache->partial;
-
-        while (NULL != *link)
-        {
-            slab_t *const slab = *link;
-
-            if (0U != slab->in_use)
-            {
-                link = &slab->next;
-                continue;
-            }
-
-            // Unlink before mutating, so `*link` already points at the next slab
-            // and the loop needs no separate advancement.
-            *link = slab->next;
-
-            allocator->object_count -= slab->object_count;
-            allocator->slab_count--;
-            cache->object_count -= slab->object_count;
-            cache->slab_count--;
-
-            slab->cache        = NULL;
-            slab->next         = allocator->reusable;
-            allocator->reusable = slab;
-            allocator->reusable_count++;
-            released++;
-        }
-    }
+    const size_t released = trim_trailing(allocator, only);
 
     mutex_unlock(&allocator->lock);
 
     if (0U != released)
     {
-        POUND_LOG_DEBUG(&thread_logger, "Released %zu empty slabs for reuse.", released);
+        POUND_LOG_DEBUG(&thread_logger,
+                        "Rewound the arena over %zu empty trailing slab(s).",
+                        released);
     }
 
     return released;
@@ -1475,7 +1451,6 @@ slab_allocator_get_stats(const slab_allocator_t *POUND_RESTRICT allocator,
 
     out->cache_count      = allocator->cache_count;
     out->slab_count      = allocator->slab_count;
-    out->slabs_available = allocator->reusable_count;
     out->object_count    = allocator->object_count;
     out->in_use          = allocator->in_use;
     out->bytes_committed = allocator->bytes_committed;
