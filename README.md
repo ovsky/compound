@@ -1,115 +1,197 @@
-<h1 align="center">
-  <a href="https://github.com/pound-emu/pound/actions/workflows/ci.yml?query=branch%3Amain">
-    <img src="https://github.com/pound-emu/pound/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI: Linux, ARM64 and Windows">
+<p align="center">
+  <a href="https://github.com/ovsky/compound/actions/workflows/ci.yml?query=branch%3Amain">
+    <img src="https://github.com/ovsky/compound/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI: Linux, ARM64 and Windows" />
   </a>
-  <a href="https://github.com/pound-emu/pound/actions/workflows/android-apk.yml?query=branch%3Amain">
-    <img src="https://github.com/pound-emu/pound/actions/workflows/android-apk.yml/badge.svg?branch=main" alt="CI: Android APK">
+  <a href="https://github.com/ovsky/compound/actions/workflows/android-apk.yml?query=branch%3Amain">
+    <img src="https://github.com/ovsky/compound/actions/workflows/android-apk.yml/badge.svg?branch=main" alt="CI: Android APK" />
   </a>
-  <br><br>
-  Pound
-</h1>
+  <a href="https://github.com/ovsky/compound/blob/main/LICENSE">
+    <img src="https://img.shields.io/badge/License-GPLv3-blue.svg" alt="License: GPLv3" />
+  </a>
+  <a href="https://github.com/ovsky/compound">
+    <img src="https://img.shields.io/badge/Language-C-5E6EF2.svg" alt="Language: C" />
+  </a>
+</p>
 
-<p align="center"><em>A Nintendo Switch 2 emulator, written in C.</em></p>
+<h1 align="center">Compound</h1>
+
+<p align="center">
+  <strong>Open source emulator for Nintendo Switch 1 and 2</strong><br>
+  <em>Highly experimental, but steadily growing.</em>
+</p>
 
 ---
 
-## Status
+## Overview
 
-**Pound is early-stage software.** It builds, its unit tests pass, and the
-emulator shell, memory accounting, logging, checked arithmetic and debug GUI all
-work — but the guest CPU, Horizon OS, and the Ballistic JIT integration are not
-finished. It does not yet boot a commercial game.
+Compound is a work-in-progress emulator project focused on bringing Nintendo Switch 1 and 2 emulation to a solid, maintainable, and portable codebase. The project combines low-level system emulation, a modern CMake build, cross-platform testing, and an experimental JIT effort built around ARM64 execution.
 
-The honest summary of where things stand:
+### Highlights
 
-| Area | State |
+- Cross-platform build and CI support
+- Linux, macOS, Windows, Android, and ARM64 targets
+- Defensive runtime and checked arithmetic infrastructure
+- Debug GUI with live reload support
+- Experimental JIT and filesystem/crypto subsystem work
+- Clean project structure and architecture-first design
+
+---
+
+## Current Status
+
+Compound is in an early-stage development state. The project is capable of building, has a working test suite, and has many foundational systems in place. However, it does not yet run commercial titles.
+
+| Area | Status |
 | --- | --- |
-| Build system (CMake, presets, cross toolchains) | Complete: x86-64 and ARM64, Windows, Linux, macOS, Android |
-| CI/CD | Complete: 5 lanes, plus release packaging |
-| Unit tests | 49 cases across 4 suites |
-| Host memory accounting | Working |
-| Checked arithmetic (`safe_math`) | Working |
-| Logging | Working |
-| Debug GUI + live reload (desktop) | Working |
-| Debug GUI (Android) | Working, statically bound |
-| **Ballistic JIT** | **No ARM64 prebuilt artefact — disabled on ARM** |
-| **Guest CPU (Horizon OS)** | **Not implemented** |
+| Build system and presets | ✅ Complete |
+| CI/CD | ✅ Complete |
+| Unit test coverage | ✅ Working |
+| Host memory accounting | ✅ Working |
+| Logging and debug tooling | ✅ Working |
+| Debug GUI | ✅ Working |
+| Ballistic ARM64 JIT integration | 🚧 Experimental / partial |
+| Guest CPU and Horizon OS | 🚧 Not implemented |
+| Filesystem parsing | 🚧 Experimental work in progress |
+| Cryptography support | 🚧 Experimental work in progress |
+| Full Switch compatibility | 🚧 Planned |
 
-### About the ARM64 JIT
+### Architecture notes
 
-Performance work has shifted to [Ballistic](https://github.com/pound-emu/ballistic),
-a purpose-built ARM64 recompiler. It ships as a **prebuilt** static library per
-platform. Only x86-64 artefacts exist today:
+Performance work is centered around the Ballistic ARM64 recompiler. The emulator intentionally avoids forcing ARM64 JIT support on unsupported platforms while preserving a clean build matrix.
 
-```
-extern/ballistic/windows/{include,lib,bin}   libBallistic.lib, lua51.lib, lua51.dll
-extern/ballistic/linux/{include,lib,bin}     libBallistic.a,  libluajit.so
-```
+The repository currently includes experimental branches for:
 
-Because there is no `extern/ballistic/android/` or `extern/ballistic/linux-arm64/`,
-the ARM64 lanes build the emulator without the JIT rather than failing. Drop the
-ARM64 artefacts into those two directories and the same build picks the JIT up
-with no further changes — see [docs/BUILDING.md](docs/BUILDING.md#ballistic).
+- `general-upgrade-experimental-fs-hfs0-parser`
+- `general-upgrade-experimental-fs-reader`
+- `general-upgrade-experimental-crypto-sha256`
+- `general-upgrade-experimental-jit-memory-ballistic`
+- `general-upgrade-experimental-jit-metadata`
+- `general-upgrade-experimental-core-error-logs`
+- `general-upgrade-experimental-tests-jit-metadata`
 
-**Compiler developers:** contributions to the recompiler are the single
-highest-value thing you can bring to this project.
+This reflects a staged approach: foundational runtime support first, then JIT, then guest CPU and OS emulation.
+
+---
 
 ## Roadmap
 
-- [ ] Translate SM86 to SPIR-V to Vulkan
-- [x] Add `mimalloc` for the host allocator
-- [ ] Create a custom pool / slab allocator for Horizon OS
-- [ ] Create a JIT code cache memory allocator for Ballistic
-- [ ] Create a JIT metadata manager
-- [ ] Integrate Ballistic into Pound
-- [ ] Implement the guest CPU
+### Phase 1: Foundation and runtime
+
+- [x] Add `mimalloc` host allocator
+- [x] Establish core build and CI infrastructure
+- [x] Add unit tests and debug instrumentation
+- [ ] Improve memory ownership and allocator design for guest OS memory
+- [ ] Harden checked arithmetic and validation paths
+
+### Phase 2: Filesystem and crypto
+
+- [ ] Build HFS0 filesystem parser
+- [ ] Implement filesystem reader abstraction
+- [ ] Add SHA256 and cryptographic primitives
+- [ ] Add verification and signature-aware file handling
+
+### Phase 3: JIT and execution engine
+
+- [ ] Create JIT code cache allocator
+- [ ] Implement JIT metadata manager
+- [ ] Add core error logging and diagnostic systems
+- [ ] Expand JIT validation tests
+- [ ] Integrate Ballistic into the execution loop
+
+### Phase 4: Guest CPU and OS emulation
+
+- [ ] Implement ARM64 guest CPU instruction dispatch
+- [ ] Implement Horizon OS kernel abstraction
+- [ ] Add system call handling and scheduling logic
+- [ ] Integrate core OS services and memory layout
+
+### Phase 5: Graphics and completeness
+
+- [ ] Translate SM86 to SPIR-V
+- [ ] Add Vulkan render backend
+- [ ] Expand input, audio, and platform services
+- [ ] Reach a bootable, self-hosted guest state
+- [ ] Support a wider range of titles and software compatibility
+
+---
+
+## Branch Strategy
+
+The repository is organized around a few focused development branches:
+
+| Branch | Purpose |
+| --- | --- |
+| `main` | Stable baseline and release-ready state |
+| `general-upgrade-dev-v1` | Main development track |
+| `general-upgrade-experimental-*` | Feature-specific experimental builds |
+| `origin/enhancement/project-upgrade-core-cmake` | CMake and build-system improvements |
+
+This branch layout matches the project’s current progression: feature experiments first, then selective merging into the main development stream.
+
+---
 
 ## Building
 
-Requires **CMake ≥ 3.25**, **Ninja**, and **Clang** (Clang only — GCC and MSVC
-are not supported).
+### Requirements
 
-```sh
+- CMake 3.25+
+- Ninja
+- Clang compiler
+
+### Quick start
+
+```bash
 cmake --preset debug
 cmake --build --preset debug --parallel
-ctest  --preset debug
+ctest --preset debug
 ```
+
+### Presets
 
 | Preset | Target | Notes |
 | --- | --- | --- |
-| `debug`, `release` | Linux / macOS x86-64 | ASan + UBSan in `debug` |
+| `debug`, `release` | Linux / macOS x86-64 | ASan + UBSan in debug |
 | `debug-windows`, `release-windows` | Windows x86-64 | clang-cl |
 | `linux-aarch64-debug`, `linux-aarch64-release` | ARM64 Linux | Cross-compiled, tested under QEMU |
 | `android-arm64-debug`, `android-arm64-release` | Android arm64-v8a | Produces `libmain.so` |
 
-Full instructions, prerequisites, and the Android APK steps are in
-**[docs/BUILDING.md](docs/BUILDING.md)**.
+For setup steps, prerequisites, and Android packaging details, see [docs/BUILDING.md](docs/BUILDING.md).
+
+---
 
 ## Contributing
 
-Read **[CONTRIBUTING.md](CONTRIBUTING.md)** before opening a pull request. The
-project holds a deliberately high bar: every line is expected to be defensible,
-and undocumented behaviour is treated as a defect.
+Before contributing, read [CONTRIBUTING.md](CONTRIBUTING.md) and the project documentation.
 
-Further reading:
+Relevant references:
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the pieces fit together
-- [docs/CI.md](docs/CI.md) — what each CI lane proves, and how to reproduce it
-- [docs/PROGRAMMING_RULES.md](docs/PROGRAMMING_RULES.md) — coding conventions
-- [docs/SM86_TO_SPIRV_RULES.md](docs/SM86_TO_SPIRV_RULES.md) — recompiler rules
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [docs/CI.md](docs/CI.md)
+- [docs/PROGRAMMING_RULES.md](docs/PROGRAMMING_RULES.md)
+- [docs/SM86_TO_SPIRV_RULES.md](docs/SM86_TO_SPIRV_RULES.md)
 
-## Repository layout
+---
 
+## Repository Layout
+
+```text
+src/              Emulator core, runtime, GUI, and bootstrap logic
+cmake/            Build modules, toolchains, and platform configuration
+tests/            Unit tests and lightweight validation harness
+android/          Android packaging and JNI integration
+extern/           Vendored dependencies and third-party code
+docs/             Architecture, build, CI, and contributor docs
 ```
-src/core/         Emulator core: logging, memory, checked arithmetic, guest state
-src/gui/          Debug GUI (ImGui) and its hot-reload plugin loader
-src/main.c        Emulator bootstrap: SDL window, frame loop, GUI lifecycle
-cmake/            Build modules, cross toolchains, JNI staging
-tests/            Unit test suite and its dependency-free harness
-android/          Gradle project that packages the ARM64 image into an APK
-extern/           Vendored third-party sources (SDL, mimalloc, cimgui, Ballistic)
-```
 
-## Licence
+---
 
-See [LICENSE](LICENSE).
+## License
+
+Compound is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE) for details.
+
+---
+
+<p align="center">
+  <strong>Project status:</strong> early-stage emulator development<br>
+  <strong>Focus:</strong> runtime foundations, JIT, guest execution, compatibility
+</p>
