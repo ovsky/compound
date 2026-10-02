@@ -30,6 +30,7 @@ set(POUND_TEST_SUITES
         fs_reader
         keys
         pfs0
+        metadata
         )
 
 set(POUND_TEST_SOURCES
@@ -44,6 +45,7 @@ set(POUND_TEST_SOURCES
         test_jit_cache.c
         test_sha256.c
         test_fs.c
+        test_jit_metadata.c
         )
 
 # The Ballistic bridge is the only thing under test that needs the engine's headers,
