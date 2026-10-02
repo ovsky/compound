@@ -916,22 +916,23 @@ POUND_TEST(metadata, an_invalidation_clears_the_blocks_the_guest_overwrote)
     jit_metadata_stats_t stats;
 
     POUND_REQUIRE(POUND_SUCCESS == jit_metadata_get_stats(&manager, &stats));
-    POUND_CHECK_MSG(3U == stats.ready, "%zu of the 4 surviving blocks are ready.", stats.ready);
+
+    // Five blocks published, two cleared -- the one inside [0x1080, 0x1100) and the one
+    // the 16-byte range at 0x11C0 landed in.
+    POUND_CHECK_MSG(3U == stats.ready, "%zu of the 3 surviving blocks are ready.", stats.ready);
     POUND_CHECK(0U == stats.claimed);
     POUND_CHECK(0U == stats.failed);
 
     // Cleared blocks no longer count as interned, because they are not blocks any
     // more. They do keep their slots, which is the price of not splitting the table's
-    // chains -- and `stats.interned` is recounted from the states rather than read off
-    // the running counter, so this is the number the manager's own accounting has to
-    // agree with. Two of five are gone.
+    // chains.
     POUND_CHECK_MSG(3U == stats.interned, "%zu of the 5 published blocks still count as interned.",
                     stats.interned);
 
-    // The manager's running counter is not the same thing as the recount, and the
-    // difference is a bug this case would otherwise not see: the block at 0x1080 was
-    // cleared and its slot reused is exactly the path where a counter can be
-    // decremented for an entry it never counted.
+    // The block at 0x1080 is put back. Reclaiming a vacated slot is exactly the path
+    // where the running counter and the recount can diverge: the slot's key was
+    // already there, so nothing *new* was interned, yet the entry is live again and
+    // has to be counted.
     //
     // Expressed as a round trip rather than by reaching into the struct, because the
     // symptom of getting it wrong is not a wrong number here -- it is a table that
@@ -944,13 +945,14 @@ POUND_TEST(metadata, an_invalidation_clears_the_blocks_the_guest_overwrote)
 
     POUND_REQUIRE(POUND_SUCCESS == jit_metadata_get_stats(&manager, &after_reuse));
 
-    POUND_CHECK_MSG(3U == after_reuse.interned,
+    POUND_CHECK_MSG(4U == after_reuse.interned,
                     "Re-interning an invalidated address left the manager counting %zu address(es) "
-                    "rather than 3.",
+                    "rather than 4.",
                     after_reuse.interned);
 
     // And with the table's count correct, new addresses still fit. A counter that had
-    // wrapped would report the table full here and refuse.
+    // wrapped would report the table full here and refuse, long after the entry that
+    // wrapped it had been cleared.
     size_t fresh = 0U;
 
     POUND_CHECK_MSG(POUND_SUCCESS == jit_metadata_intern(&manager, 0xE000U, &fresh),
@@ -1053,6 +1055,163 @@ POUND_TEST(metadata, every_interned_address_is_still_findable_after_its_own_slot
                         "Slot %zu could be found but not claimed after a full invalidation.",
                         slot);
     }
+
+    jit_metadata_destroy(&manager);
+}
+
+// The invariant that makes a fixed-size table work at all: invalidating one block
+// must not hide the blocks that were stored *behind* it.
+//
+// A linear-probe slot is only safe to clear outright if nothing can ever probe past
+// it. It can, so invalidation keeps the key in a `VACANT` slot instead. Clearing the
+// slot to `UNOCCUPIED` instead does not merely lose the key -- it turns that slot into
+// a wall. Every address whose probe passed through it now terminates there and reports
+// "no such address", for a block that is published, leased and running.
+POUND_TEST(metadata, an_invalidated_slot_does_not_hide_the_blocks_behind_it)
+{
+    jit_metadata_t manager;
+
+    POUND_REQUIRE(POUND_SUCCESS == make_manager(&manager));
+
+    fake_code_t code;
+
+    enum
+    {
+        ADDRESS_COUNT = 192U,
+    };
+
+    size_t slots[ADDRESS_COUNT];
+    size_t homes[ADDRESS_COUNT];
+
+    jit_metadata_stats_t stats;
+
+    POUND_REQUIRE(POUND_SUCCESS == jit_metadata_get_stats(&manager, &stats));
+
+    for (size_t i = 0U; i < ADDRESS_COUNT; ++i)
+    {
+        const uint64_t guest_pc = 0x10000000ULL + ((uint64_t)i * 0x1000ULL);
+        const uint_least64_t before = stats.probe_total;
+
+        POUND_REQUIRE(POUND_SUCCESS == jit_metadata_intern(&manager, guest_pc, &slots[i]));
+        POUND_REQUIRE(POUND_SUCCESS == jit_metadata_get_stats(&manager, &stats));
+
+        // `probe_total` advances by the number of slots the probe walked, so the slot an
+        // address *started* at is recoverable from the public statistics: a probe that
+        // walked n slots ended n - 1 slots after its home. Without that, there is no way
+        // from outside the module to know which slots a given address's chain covers --
+        // and which slots a chain covers is the whole subject of this case.
+        const size_t walked = (size_t)(stats.probe_total - before);
+
+        POUND_REQUIRE_MSG(walked >= 1U, "Interning address %zu walked no slots at all.", i);
+        POUND_REQUIRE_MSG((walked - 1U) <= slots[i],
+                          "Address %zu walked %zu slot(s) but landed on slot %zu, so its home slot "
+                          "would be negative.",
+                          i,
+                          walked,
+                          slots[i]);
+
+        homes[i] = slots[i] - (walked - 1U);
+
+        jit_metadata_state_t previous = JIT_METADATA_STATE_EMPTY;
+
+        POUND_REQUIRE(POUND_SUCCESS == jit_metadata_try_begin(&manager, slots[i], &previous));
+        POUND_REQUIRE(POUND_SUCCESS == jit_metadata_publish(&manager, slots[i], code.bytes, 8U, 0x10U, 0U));
+    }
+
+    POUND_REQUIRE_MSG(stats.probe_worst > 1U,
+                      "The longest probe was one slot across %u addresses, so no chain exists here "
+                      "and this case would pass whatever the invalidation did.",
+                      (unsigned)ADDRESS_COUNT);
+
+    // A victim that something else probes *past*. Found rather than chosen, because a
+    // slot nothing probes through cannot demonstrate anything: clearing it splits no
+    // chain, which is exactly why a weaker version of this case passes against a
+    // broken implementation.
+    size_t victim = ADDRESS_COUNT;
+    size_t witness = ADDRESS_COUNT;
+
+    for (size_t i = 0U; i < ADDRESS_COUNT; ++i)
+    {
+        for (size_t j = 0U; j < ADDRESS_COUNT; ++j)
+        {
+            if ((i != j) && (homes[j] <= slots[i]) && (slots[i] <= slots[j]))
+            {
+                victim = i;
+                witness = j;
+
+                break;
+            }
+        }
+
+        if (victim < ADDRESS_COUNT)
+        {
+            break;
+        }
+    }
+
+    POUND_REQUIRE_MSG(victim < ADDRESS_COUNT,
+                      "No slot in a table of %u addresses is probed past by another address, so there "
+                      "is no chain here for the invalidation to break.",
+                      (unsigned)ADDRESS_COUNT);
+
+    const uint64_t victim_pc = 0x10000000ULL + ((uint64_t)victim * 0x1000ULL);
+    const uint64_t witness_pc = 0x10000000ULL + ((uint64_t)witness * 0x1000ULL);
+
+    size_t cleared = 0U;
+
+    POUND_REQUIRE(POUND_SUCCESS
+                  == jit_metadata_invalidate_range(&manager, victim_pc, victim_pc + 0x10U, &cleared));
+
+    POUND_CHECK_MSG(1U == cleared, "Invalidating one block's range cleared %zu.", cleared);
+
+    // The witness: stored at a slot at or past the one that was just vacated, so its
+    // probe now walks the vacated slot on its way to its own. Its block was not
+    // invalidated, was never claimed by anybody else, and is still published.
+    size_t found = SIZE_MAX;
+
+    POUND_CHECK_MSG(POUND_SUCCESS == jit_metadata_lookup(&manager, witness_pc, &found),
+                    "Address 0x%llx probes through slot %zu, which was just vacated, and cannot be "
+                    "found any more. Vacating the slot turned it into the end of a chain it was "
+                    "never the end of.",
+                    (unsigned long long)witness_pc,
+                    slots[victim]);
+
+    POUND_CHECK_MSG(slots[witness] == found,
+                    "Address 0x%llx came back on slot %zu rather than its own slot %zu, so the "
+                    "invalidation moved it.",
+                    (unsigned long long)witness_pc,
+                    found,
+                    slots[witness]);
+
+    // Not only the witness: nothing that survives an invalidation may become
+    // unreachable. One address per chain position would be a sample of the symptom;
+    // this is the whole table.
+    for (size_t i = 0U; i < ADDRESS_COUNT; ++i)
+    {
+        if (i == victim)
+        {
+            continue;
+        }
+
+        const uint64_t guest_pc = 0x10000000ULL + ((uint64_t)i * 0x1000ULL);
+
+        found = SIZE_MAX;
+
+        POUND_CHECK_MSG(POUND_SUCCESS == jit_metadata_find_ready(&manager, guest_pc, &found),
+                        "Address 0x%llx became unfindable after an unrelated block at 0x%llx was "
+                        "invalidated.",
+                        (unsigned long long)guest_pc,
+                        (unsigned long long)victim_pc);
+    }
+
+    // And the vacated address is reclaimable on its own slot, by the same address only.
+    found = SIZE_MAX;
+
+    POUND_REQUIRE(POUND_SUCCESS == jit_metadata_intern(&manager, victim_pc, &found));
+    POUND_CHECK_MSG(slots[victim] == found,
+                    "The invalidated address came back on slot %zu rather than its own slot %zu.",
+                    found,
+                    slots[victim]);
 
     jit_metadata_destroy(&manager);
 }
@@ -2159,6 +2318,8 @@ POUND_TEST_SUITE(metadata,
                 POUND_TEST_CASE(metadata, an_invalidation_clears_the_blocks_the_guest_overwrote),
                 POUND_TEST_CASE(metadata,
                                 every_interned_address_is_still_findable_after_its_own_slot_is_invalidated),
+                POUND_TEST_CASE(metadata,
+                                an_invalidated_slot_does_not_hide_the_blocks_behind_it),
                 POUND_TEST_CASE(metadata, an_invalidation_that_would_catch_a_running_block_is_refused_whole),
                 POUND_TEST_CASE(metadata,
                                 an_invalidation_range_is_half_open_and_may_reach_the_top_of_the_address_space),

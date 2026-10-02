@@ -380,7 +380,11 @@ typedef struct
     /// A `jit_metadata_state_t` value.
     uint32_t state;
 
-    /// Leases outstanding when the snapshot was taken.
+    /// Leases outstanding when the snapshot was taken, counting the calling thread's
+    /// own lease if it holds one. So an uncontended block reports 1.
+    ///
+    /// Sampled relaxed and therefore lossy under concurrency; it is a diagnostic.
+    /// `jit_metadata_leases` is the authoritative count.
     uint32_t leases;
 
     /// Entries in the register map that are in use. Zero until published.

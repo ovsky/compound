@@ -293,9 +293,14 @@ fill_info(const jit_metadata_entry_t *POUND_RESTRICT entry, jit_metadata_info_t 
     out->flags = entry->flags;
     out->map_used = entry->map_used;
 
-    // Sampled relaxed: it is a diagnostic, and the caller is told it is the count
-    // from before its own acquire.
+    // Sampled relaxed: a diagnostic, and a caller that needs the authoritative lease
+    // count asks `jit_metadata_leases`.
     out->state = atomic_load_explicit(&entry->state, memory_order_relaxed);
+
+    // Sampled after the calling thread's own lease has been taken, so `leases`
+    // counts that thread: a block nobody else is in reports 1, not 0. That is the
+    // convention a caller actually wants -- `info.leases == 1` reads as
+    // "uncontended" -- and it means no call site has to remember an off-by-one.
     out->leases = (uint32_t)atomic_load_explicit(&entry->leases, memory_order_relaxed);
 
     memcpy(out->label, entry->text, sizeof(out->label));
@@ -587,8 +592,28 @@ jit_metadata_init(jit_metadata_t *POUND_RESTRICT manager, const jit_metadata_con
 
     jit_metadata_entry_t *POUND_RESTRICT entries = (jit_metadata_entry_t *)table;
 
+    // The whole table is zeroed before any entry is published, and this is not
+    // tidiness. `memory_subsystem_allocate` hands back whatever was in the arena, so
+    // every payload field -- `guest_size`, `host_code`, `map_used`, `text`, the
+    // register map -- starts as whatever the last allocation left there.
+    //
+    // `intern` makes a slot live by writing two fields, `guest_pc` and `generation`.
+    // The rest are then *readable* -- an `EMPTY` entry is not refused by `peek`,
+    // `get_map`, or `entry_in_range` -- while still holding those bytes. The sharpest
+    // consequence is `get_map`, which memcpy's `map_used` entries out of the entry: an
+    // uninitialised count there is a heap overflow of the caller's array, and a count
+    // is read from uninitialised memory to produce it. `peek` likewise returns a
+    // `host_code` the caller has no way to recognise as junk.
+    //
+    // Once at start-up rather than per `intern`, because a probe must be able to read
+    // an entry's key without first checking that somebody has written it.
+    memset(entries, 0, table_bytes);
+
     for (size_t index = 0U; index < capacity; ++index)
     {
+        // `atomic_init` rather than a plain store: these are the two fields written
+        // without the manager lock, and each thread has to observe the value that was
+        // published before it.
         atomic_init(&entries[index].state, (uint_least32_t)JIT_METADATA_STATE_UNOCCUPIED);
         atomic_init(&entries[index].leases, (uint_least64_t)0);
     }
@@ -1359,8 +1384,8 @@ jit_metadata_acquire(jit_metadata_t *POUND_RESTRICT manager,
         return POUND_ERROR_NOT_INITIALIZED;
     }
 
-    // Sampled after the increment above has published, so `leases` is the count from
-    // before this call's own increment and a caller can see contention.
+    // Sampled after the increment above has published, so the snapshot counts the
+    // calling thread; `fill_info` documents the convention.
     fill_info(entry, out_info);
 
     (void)atomic_fetch_add_explicit(&manager->leases_outstanding, (uint_least64_t)1, memory_order_relaxed);
