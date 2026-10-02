@@ -885,6 +885,23 @@ reserve_block(jit_cache_t *POUND_RESTRICT   cache,
     }
 
 try_new_chunk:
+    // Checked before the chunk is created, not after. A request that cannot fit in a
+    // chunk of this size will not fit in one of a larger size either, so reserving
+    // first would leave a freshly reserved chunk behind that nothing can use and
+    // that only `jit_cache_reclaim` would give back.
+    if (POUND_UNLIKELY(need > cache->chunk_bytes))
+    {
+        POUND_LOG_ERROR(&thread_logger,
+                        "Refusing a %zu-byte block at %zu-byte alignment: it needs %zu bytes, "
+                        "which is more than one %zu-byte chunk can hold. Raise "
+                        "jit_cache_config_t::chunk_bytes.",
+                        size,
+                        effective,
+                        need,
+                        cache->chunk_bytes);
+        return POUND_ERROR_ALLOCATION_FAILED;
+    }
+
     {
         jit_chunk_t *created = NULL;
         const error_t result = chunk_create(cache, &created);
@@ -896,17 +913,6 @@ try_new_chunk:
 
         // A fresh chunk's tail begins at zero, which is aligned to any power of two
         // no larger than the chunk, so there is no leading gap to record.
-        if (POUND_UNLIKELY(created->bytes < need))
-        {
-            POUND_LOG_ERROR(&thread_logger,
-                            "A fresh %zu-byte chunk cannot hold a %zu-byte block at %zu-byte "
-                            "alignment; raise jit_cache_config_t::chunk_bytes.",
-                            created->bytes,
-                            size,
-                            effective);
-            return POUND_ERROR_ALLOCATION_FAILED;
-        }
-
         created->used   = need;
         *out_offset     = 0U;
         *out_chunk      = created;
@@ -1067,17 +1073,6 @@ jit_cache_init(jit_cache_t *POUND_RESTRICT cache, const jit_cache_config_t *POUN
                         resolved.max_bytes,
                         resolved.chunk_bytes);
         return POUND_ERROR_MEMORY_ALIGNMENT;
-    }
-
-    // A chunk has to be able to hold a largest-alignment block and still have room
-    // for another one, or a single request consumes the whole chunk and growth
-    // starts a new chunk per allocation.
-    if (POUND_UNLIKELY(resolved.chunk_bytes < (JIT_CACHE_MAX_ALIGNMENT * 2U)))
-    {
-        POUND_LOG_WARN(&thread_logger,
-                       "A %zu-byte chunk is smaller than two maximally aligned blocks, so such a "
-                       "cache will grow a chunk per allocation.",
-                       resolved.chunk_bytes);
     }
 
     cache->chunk_bytes       = resolved.chunk_bytes;
