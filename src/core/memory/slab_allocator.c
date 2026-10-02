@@ -152,6 +152,20 @@ align_up_checked(size_t value, size_t alignment, size_t *POUND_RESTRICT out)
     return true;
 }
 
+/// Rounds `value` up to the next multiple of the compile-time constant
+/// `alignment`, without logging on overflow.
+///
+/// Used where the alignment is a literal from this file rather than caller input,
+/// so overflow is a property of the constants and cannot be triggered at runtime.
+/// `align_up_checked` remains the entry point for anything caller-supplied.
+static size_t
+align_up_unlogged(size_t value, size_t alignment)
+{
+    const size_t mask = alignment - 1U;
+
+    return (value + mask) & ~mask;
+}
+
 /// Returns the cache for `cache_id`, or NULL if it does not exist.
 ///
 /// One-based ids are what make this safe: a zeroed table contains no caches at
@@ -382,9 +396,30 @@ plan_slab(const slab_allocator_t *POUND_RESTRICT allocator,
           size_t *POUND_RESTRICT                   out_object_count,
           size_t *POUND_RESTRICT                   out_used_bytes)
 {
+    // The header for object `i` is stored at `objects + i * stride - header_stride`,
+    // which is to say in the slack *below* object `i`'s payload -- the gap between
+    // the end of object `i - 1`'s payload and object `i`'s payload start.
+    //
+    // So `stride` and `header_stride` cannot be computed independently. If they
+    // were, `header_stride` rounding up to the alignment while `stride` rounded
+    // only `sizeof(slab_object_t)` would make the slack `stride - header_stride`
+    // smaller than `object_size`, and every header would be written on top of the
+    // previous object's payload. That is silent: allocations succeed, the
+    // alignment checks pass, and only a later free notices the header now holds
+    // guest data. Hence `stride` is derived from `header_stride`.
+    size_t header_stride = 0U;
+
+    if (POUND_UNLIKELY(!align_up_checked(sizeof(slab_object_t), config->alignment, &header_stride)))
+    {
+        POUND_LOG_ERROR(&thread_logger,
+                        "Cache \"%s\" cannot be created: header alignment overflowed.",
+                        config->name);
+        return POUND_ERROR_MEMORY_ALIGNMENT;
+    }
+
     size_t stride = 0U;
 
-    if (POUND_UNLIKELY(!align_up_checked(sizeof(slab_object_t) + config->object_size,
+    if (POUND_UNLIKELY(!align_up_checked(header_stride + config->object_size,
                                          config->alignment,
                                          &stride)))
     {
@@ -395,16 +430,6 @@ plan_slab(const slab_allocator_t *POUND_RESTRICT allocator,
                         config->object_size,
                         config->alignment);
         return POUND_ERROR_ALLOCATION_FAILED;
-    }
-
-    size_t header_stride = 0U;
-
-    if (POUND_UNLIKELY(!align_up_checked(sizeof(slab_object_t), config->alignment, &header_stride)))
-    {
-        POUND_LOG_ERROR(&thread_logger,
-                        "Cache \"%s\" cannot be created: header alignment overflowed.",
-                        config->name);
-        return POUND_ERROR_MEMORY_ALIGNMENT;
     }
 
     // Only arena beyond the cursor can hold this slab; anything before it belongs
@@ -435,7 +460,18 @@ plan_slab(const slab_allocator_t *POUND_RESTRICT allocator,
 
     const uintptr_t base = (uintptr_t)allocator->arena + allocator->bump;
 
-    if (POUND_UNLIKELY(base > (UINTPTR_MAX - (uintptr_t)sizeof(slab_t))))
+    // The lead-in must clear two structures: the slab header, and the *first object's*
+    // header, which sits *below* the payload region at `objects - header_stride`.
+    //
+    // The second is easy to forget, and forgetting it is silent until the
+    // alignment is wide enough for `header_stride` to exceed `sizeof(slab_t)`. At
+    // that point object zero's header lands on top of the slab header and
+    // overwrites its cache pointer, after which every free resolves to the wrong
+    // slab and every stats query reports nonsense. So the requirement is their
+    // sum, not their maximum.
+    const size_t minimum_lead = sizeof(slab_t) + header_stride;
+
+    if (POUND_UNLIKELY(base > (UINTPTR_MAX - (uintptr_t)minimum_lead)))
     {
         POUND_LOG_ERROR(&thread_logger,
                         "Cache \"%s\" cannot be created: the slab address overflows.",
@@ -443,16 +479,19 @@ plan_slab(const slab_allocator_t *POUND_RESTRICT allocator,
         return POUND_ERROR_ALLOCATION_FAILED;
     }
 
-    // Align the payload start relative to the slab's real address, not relative
-    // to the header size: the arena is aligned to 16 but a slab's header can end
-    // at any multiple of the header alignment, so `base + sizeof(slab_t)` is not
-    // necessarily already aligned to the cache's alignment.
-    const uintptr_t first_payload = base + sizeof(slab_t);
-    size_t         payload_offset = 0U;
+    // Align against the slab's *real address*, not against the header size.
+    //
+    // This distinction is the whole correctness of the alignment guarantee. The
+    // arena is aligned to 16, but a slab's own address is not: a preceding cache
+    // record or an earlier slab can leave the cursor at any multiple of eight. So
+    // `align_up(minimum_lead, alignment)` -- the offset that would be correct if
+    // every slab started on an alignment boundary -- is wrong here, and would hand
+    // out every payload with the same residual misalignment.
+    size_t payload_start = 0U;
 
-    if (POUND_UNLIKELY(!align_up_checked((size_t)(first_payload - base),
+    if (POUND_UNLIKELY(!align_up_checked((size_t)(base + minimum_lead),
                                          config->alignment,
-                                         &payload_offset)))
+                                         &payload_start)))
     {
         POUND_LOG_ERROR(&thread_logger,
                         "Cache \"%s\" cannot be created: payload alignment overflowed.",
@@ -460,26 +499,34 @@ plan_slab(const slab_allocator_t *POUND_RESTRICT allocator,
         return POUND_ERROR_MEMORY_ALIGNMENT;
     }
 
-    const size_t objects_size = remaining - payload_offset;
+    const size_t payload_offset = payload_start - (size_t)base;
 
-    if (objects_size < stride)
+    // Guard the subtraction before making it. A wide alignment can push the
+    // payload start past the end of what is left, and `remaining - payload_offset`
+    // would then wrap to a value near SIZE_MAX, producing an object count in the
+    // billions and a carve that scribbles over the whole address space.
+    if (POUND_UNLIKELY((payload_offset > remaining) || ((remaining - payload_offset) < stride)))
     {
         POUND_LOG_ERROR(&thread_logger,
-                        "Cache \"%s\" cannot be created: %zu arena bytes remain, too few for one "
-                        "%zu-byte object plus its header.",
+                        "Cache \"%s\" cannot be created: %zu arena bytes remain, which cannot hold "
+                        "a %zu-byte header, %zu bytes of alignment padding, and one %zu-byte object.",
                         config->name,
                         remaining,
+                        sizeof(slab_t),
+                        payload_offset,
                         stride);
         return POUND_ERROR_ALLOCATION_FAILED;
     }
+
+    const size_t objects_size = remaining - payload_offset;
 
     size_t object_count = objects_size / stride;
 
     // Honour the cache's slab size by capping how much of the remaining arena the
     // slab may claim. The remainder is stranded rather than reused, which is the
     // documented cost of a fixed slab size.
-    const size_t cap_payload = (config->slab_bytes > sizeof(slab_t))
-                                   ? (config->slab_bytes - sizeof(slab_t))
+    const size_t cap_payload = (config->slab_bytes > payload_offset)
+                                   ? (config->slab_bytes - payload_offset)
                                    : 0U;
 
     if ((object_count * stride) > cap_payload)
@@ -512,29 +559,52 @@ plan_slab(const slab_allocator_t *POUND_RESTRICT allocator,
         return POUND_ERROR_ALLOCATION_FAILED;
     }
 
-    size_t used_bytes = 0U;
+    // Round the slab's footprint up to the cache's alignment, not merely to the
+    // header's. That way the *next* slab also starts on an alignment boundary, so
+    // `payload_offset` is the same for every slab of a cache and a slab's object
+    // count does not vary with where in the arena it happened to land.
+    //
+    // The rounding can push the footprint past what is left even though the
+    // objects themselves fit, in which case the last object is dropped rather
+    // than the carve being refused: an object fewer is a smaller slab, and a
+    // smaller slab that fits is worth far more than the configured one that
+    // cannot.
+    const size_t granule = (config->alignment > _Alignof(slab_t)) ? config->alignment
+                                                                 : _Alignof(slab_t);
+    size_t       used_bytes = 0U;
 
-    if (POUND_UNLIKELY(!align_up_checked(payload_offset + (object_count * stride),
-                                         _Alignof(slab_t),
-                                         &used_bytes)))
+    for (;;)
     {
-        POUND_LOG_ERROR(&thread_logger,
-                        "Cache \"%s\" cannot be created: the slab size overflows.",
-                        config->name);
-        return POUND_ERROR_ALLOCATION_FAILED;
-    }
+        if (POUND_UNLIKELY(!align_up_checked(payload_offset + (object_count * stride),
+                                             granule,
+                                             &used_bytes)))
+        {
+            POUND_LOG_ERROR(&thread_logger,
+                            "Cache \"%s\" cannot be created: the slab size overflows.",
+                            config->name);
+            return POUND_ERROR_ALLOCATION_FAILED;
+        }
 
-    if (used_bytes > remaining)
-    {
-        // Unreachable: `object_count` was derived from `remaining`. Checked anyway
-        // because `grow_cache` advances the arena cursor by this value.
-        POUND_LOG_ERROR(&thread_logger,
-                        "Cache \"%s\" cannot be created: a %zu-byte slab does not fit in the "
-                        "%zu bytes remaining.",
-                        config->name,
-                        used_bytes,
-                        remaining);
-        return POUND_ERROR_ALLOCATION_FAILED;
+        if (used_bytes <= remaining)
+        {
+            break;
+        }
+
+        if (0U == object_count)
+        {
+            POUND_LOG_ERROR(&thread_logger,
+                            "Cache \"%s\" cannot be created: a %zu-byte header, %zu bytes of "
+                            "alignment padding and %zu bytes of rounding do not fit in the %zu "
+                            "bytes remaining.",
+                            config->name,
+                            sizeof(slab_t),
+                            payload_offset,
+                            granule,
+                            remaining);
+            return POUND_ERROR_ALLOCATION_FAILED;
+        }
+
+        object_count--;
     }
 
     if (NULL != out_stride)
@@ -1007,14 +1077,21 @@ slab_allocator_cache_create(slab_allocator_t *POUND_RESTRICT allocator,
     // needs no host allocator of its own and every structure it hands out has one
     // owner and one lifetime. It is placed after any slabs already carved, which
     // is why the geometry below is computed against the current cursor.
-    if (POUND_UNLIKELY((allocator->arena_size - allocator->bump) < sizeof(slab_cache_t)))
+    //
+    // The reserve is rounded up to the default alignment so every slab that
+    // follows starts on an alignment boundary rather than on whatever offset the
+    // record's size happened to leave behind.
+    const size_t reserve = align_up_unlogged(sizeof(slab_cache_t),
+                                             SLAB_ALLOCATOR_DEFAULT_ALIGNMENT);
+
+    if (POUND_UNLIKELY((allocator->arena_size - allocator->bump) < reserve))
     {
         POUND_LOG_ERROR(&thread_logger,
                         "Refusing to create cache \"%s\": %zu arena bytes remain, too few for its "
                         "%zu-byte record.",
                         resolved.name,
                         allocator->arena_size - allocator->bump,
-                        sizeof(slab_cache_t));
+                        reserve);
         mutex_unlock(&allocator->lock);
         return SLAB_CACHE_ID_NONE;
     }
@@ -1022,7 +1099,7 @@ slab_allocator_cache_create(slab_allocator_t *POUND_RESTRICT allocator,
     slab_cache_t *const cache = (slab_cache_t *)(void *)(allocator->arena + allocator->bump);
 
     memset(cache, 0, sizeof(*cache));
-    allocator->bump += sizeof(slab_cache_t);
+    allocator->bump += reserve;
 
     cache->config = resolved;
 
@@ -1041,7 +1118,7 @@ slab_allocator_cache_create(slab_allocator_t *POUND_RESTRICT allocator,
     {
         // Give the record back: nothing references it, and a caller that retries
         // with a smaller object should not pay for the abandoned one.
-        allocator->bump -= sizeof(slab_cache_t);
+        allocator->bump -= reserve;
         mutex_unlock(&allocator->lock);
         return SLAB_CACHE_ID_NONE;
     }

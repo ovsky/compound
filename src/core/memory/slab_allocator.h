@@ -45,6 +45,31 @@
 //! `SLAB_ALLOCATOR_MAX_SLAB_BYTES / SLAB_ALLOCATOR_MIN_OBJECT_SIZE`, which is far
 //! below `UINT32_MAX`, so an index cannot overflow.
 //!
+//! # Stride and header stride are coupled
+//!
+//! The header for object `i` is stored at `payload(i) - header_stride`, which is
+//! to say in the gap between the end of object `i - 1`'s payload and object `i`'s
+//! own. So `header_stride` and `stride` are not independent quantities:
+//!
+//! ```text
+//! stride = align_up(header_stride + object_size, alignment)
+//! header_stride = align_up(sizeof(slab_object_t), alignment)
+//! ```
+//!
+//! Computing the stride from `sizeof(slab_object_t)` instead of from
+//! `header_stride` is the obvious mistake and it is invisible at 16-byte
+//! alignment, where the two happen to agree. At 64-byte alignment they diverge:
+//! a 32-byte object gets `header_stride` 64 and `stride` 64, leaving zero bytes
+//! of slack, so every header is written on top of the previous object's payload.
+//! Allocation still succeeds, alignment still checks out, and the corruption only
+//! surfaces as a free that reads a header full of guest bytes.
+//!
+//! Deriving the stride from the header stride keeps the default case slack-free
+//! and makes wide alignments cost padding before the payload rather than after
+//! it. The payload region must additionally start `sizeof(slab_t) +
+//! header_stride` bytes into the slab, or object zero's header overwrites the slab
+//! header; that is the other half of the same constraint.
+//!
 //! # Releasing slabs
 //!
 //! The arena is a stack: each carve takes the bytes at the cursor and pushes the
