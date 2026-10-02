@@ -20,6 +20,11 @@ void pound_register_pool_allocator_tests(void);
 void pound_register_mutex_tests(void);
 void pound_register_slab_allocator_tests(void);
 void pound_register_jit_cache_tests(void);
+void pound_register_sha256_tests(void);
+void pound_register_fs_reader_tests(void);
+void pound_register_keys_tests(void);
+void pound_register_pfs0_tests(void);
+void pound_register_metadata_tests(void);
 
 // Registered only by `tests/CMakeLists.txt` when the Ballistic engine is linked, and
 // therefore only defined there. The weak declaration is what lets one `main` serve
@@ -68,6 +73,11 @@ main(int argc, char **argv)
     pound_register_mutex_tests();
     pound_register_slab_allocator_tests();
     pound_register_jit_cache_tests();
+    pound_register_sha256_tests();
+    pound_register_fs_reader_tests();
+    pound_register_keys_tests();
+    pound_register_pfs0_tests();
+    pound_register_metadata_tests();
 
     // Absent on a lane with no Ballistic prebuild, in which case there is nothing to
     // register and the suites above already cover the code cache underneath it.

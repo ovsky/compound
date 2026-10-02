@@ -90,6 +90,18 @@ pound_test_fail(const char *file, const int line, const char *format, ...)
     vprintf(format, args);
     va_end(args);
 
+    // Every Pound entry point is required to report a failure through both a status
+    // and a log record, so the record captured last is usually the explanation for
+    // what just failed. Printing it here means a failing case is diagnosable from the
+    // run's output alone, rather than needing a second run with the capture hooked up
+    // to a different sink.
+    const char *const last = pound_test_log_last();
+
+    if ((last != NULL) && ('\0' != last[0]))
+    {
+        printf("               last log: %s\n", last);
+    }
+
     printf("\n");
     fflush(stdout);
 }
