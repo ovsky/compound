@@ -32,6 +32,7 @@ void pound_register_metadata_tests(void);
 // unconditional call would be an unresolved one on a lane with no prebuild.
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((weak)) void pound_register_jit_ballistic_tests(void);
+__attribute__((weak)) void pound_register_ballistic_engine_tests(void);
 #endif
 
 static void
@@ -78,6 +79,7 @@ main(int argc, char **argv)
     pound_register_keys_tests();
     pound_register_pfs0_tests();
     pound_register_metadata_tests();
+    pound_register_ballistic_engine_tests();
 
     // Absent on a lane with no Ballistic prebuild, in which case there is nothing to
     // register and the suites above already cover the code cache underneath it.

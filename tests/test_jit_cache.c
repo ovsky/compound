@@ -150,18 +150,28 @@ check_accounting(const jit_cache_t *cache, const char *where)
                     stats.live_blocks,
                     (unsigned long long)stats.frees);
 
-    // Every chunk is the same size, so this is an equality rather than a bound: a chunk
-    // that was reserved but not counted, or counted but not reserved, moves it. The size
-    // is read back from the cache rather than taken from this file's constants, so the
-    // check holds for a case that deliberately configures an unusual chunk size.
+    // Every chunk is at least the configured size, and the total never passes the ceiling.
+    // Both as bounds rather than as the equality this used to be: a chunk carved for a
+    // request larger than `chunk_bytes` is deliberately bigger than the configured size,
+    // so `reserved == chunk_count * chunk_bytes` no longer holds and cannot be recovered
+    // from the statistics alone -- they do not report per-chunk sizes. What the numbers
+    // can still say is that every chunk got at least what it was configured for and that
+    // nothing pushed past the ceiling, which between them catch a chunk that was reserved
+    // but not counted, counted but not reserved, or counted twice.
     const size_t chunk_bytes = read_resolved(cache).chunk_bytes;
+    const size_t max_bytes   = read_resolved(cache).max_bytes;
 
-    POUND_CHECK_MSG((stats.chunk_count * chunk_bytes) == stats.reserved_bytes,
-                    "%s: %zu chunks of %zu bytes cannot account for %zu reserved bytes",
+    POUND_CHECK_MSG(stats.chunk_count <= (stats.reserved_bytes / chunk_bytes),
+                    "%s: %zu chunk(s) of at least %zu bytes cannot account for %zu reserved bytes",
                     where,
                     stats.chunk_count,
                     chunk_bytes,
                     stats.reserved_bytes);
+    POUND_CHECK_MSG(stats.reserved_bytes <= max_bytes,
+                    "%s: %zu reserved bytes is past the %zu-byte ceiling",
+                    where,
+                    stats.reserved_bytes,
+                    max_bytes);
 }
 
 /// True when `[a, a + a_size)` and `[b, b + b_size)` share a byte.
@@ -562,25 +572,25 @@ POUND_TEST(jit_cache, allocation_refuses_impossible_requests)
     jit_cache_destroy(&cache);
 }
 
-POUND_TEST(jit_cache, a_request_larger_than_a_chunk_is_refused_without_growing)
+POUND_TEST(jit_cache, a_request_past_the_ceiling_is_refused_without_reserving)
 {
     jit_cache_t cache;
 
     init_cache(&cache, JIT_TEST_CHUNK, JIT_TEST_CEILING);
 
-    // A request no chunk of this size could ever hold. Refusing it *before* reserving
-    // matters: reserving first would leave an empty chunk behind that nothing can use
-    // and that only `jit_cache_reclaim` would give back.
+    // A request no arrangement of chunks could satisfy under this ceiling. Refusing it
+    // *before* reserving matters: reserving first would leave an empty chunk behind that
+    // nothing can use and that only `jit_cache_reclaim` would give back.
     pound_test_log_reset();
-    POUND_CHECK_PTR_NULL(jit_cache_alloc(&cache, JIT_TEST_CHUNK + 1U));
-    POUND_CHECK(pound_test_log_contains("more than one"));
+    POUND_CHECK_PTR_NULL(jit_cache_alloc(&cache, JIT_TEST_CEILING + 1U));
+    POUND_CHECK(pound_test_log_contains("Refusing to reserve"));
 
     POUND_CHECK_EQ_U64(read_stats(&cache).chunk_count, 0U);
     POUND_CHECK_EQ_U64(read_stats(&cache).reserved_bytes, 0U);
     check_accounting(&cache, "after an impossible request");
 
     // A request that exactly fills a chunk is fine, and is not mistaken for the one
-    // above.
+    // above -- nor for one that needs a chunk carved for it.
     void *const exact = jit_cache_alloc(&cache, JIT_TEST_CHUNK);
 
     POUND_REQUIRE_PTR_NON_NULL(exact);
@@ -588,6 +598,46 @@ POUND_TEST(jit_cache, a_request_larger_than_a_chunk_is_refused_without_growing)
     check_accounting(&cache, "after an exactly-fitting request");
 
     jit_cache_free(&cache, exact);
+
+    // Reclaimed first, so the oversized request below starts from nothing. Leaving the
+    // freed chunk in place would be legitimate -- nothing reclaims automatically -- but it
+    // would mean the cache held two chunks, and the count is what says whether the carved
+    // one was a second chunk or a replacement, which is the thing under test.
+    POUND_CHECK_MSG((size_t)JIT_TEST_CHUNK == jit_cache_reclaim(&cache),
+                    "Reclaiming the one empty chunk returned the wrong number of bytes.");
+    POUND_CHECK_EQ_U64(read_stats(&cache).chunk_count, 0U);
+
+    // A block larger than one chunk, and comfortably under the ceiling, is served from a
+    // chunk carved to its size. This is what makes the engine's single 16 MiB code buffer
+    // possible against a 4 MiB default, and the carved chunk is verifiably bigger than the
+    // configured one -- without that it would be serving an oversized block out of an
+    // ordinary chunk, which is the arithmetic this whole path exists to avoid.
+    void *const oversized = jit_cache_alloc(&cache, JIT_TEST_CHUNK * 3U);
+
+    POUND_REQUIRE_PTR_NON_NULL(oversized);
+
+    const jit_cache_stats_t after = read_stats(&cache);
+
+    POUND_CHECK_MSG(1U == after.chunk_count,
+                    "An oversized block was served with %zu chunks reserved; the first request "
+                    "should have carved exactly one.",
+                    after.chunk_count);
+    POUND_CHECK_MSG(after.reserved_bytes > (size_t)JIT_TEST_CHUNK,
+                    "%zu byte(s) are reserved for a block that outgrows a %u-byte chunk, so it "
+                    "came out of a chunk that can hold it.",
+                    after.reserved_bytes,
+                    (unsigned int)JIT_TEST_CHUNK);
+    check_accounting(&cache, "after an oversized request");
+
+    // And the carved chunk counts against the ceiling like any other. A third of the
+    // ceiling is still free on paper, but committing it would mean reserving past the
+    // limit -- so a cache that forgot to count the carved chunk would hand this out and
+    // exceed its ceiling in exactly the case that made the carve necessary.
+    POUND_CHECK_PTR_NULL(jit_cache_alloc(&cache, JIT_TEST_CHUNK * 2U));
+    POUND_CHECK_EQ_U64(read_stats(&cache).chunk_count, 1U);
+    check_accounting(&cache, "once the ceiling would be passed");
+
+    jit_cache_free(&cache, oversized);
     jit_cache_destroy(&cache);
 }
 
@@ -1512,14 +1562,21 @@ POUND_TEST(jit_cache, an_extent_too_short_to_reach_an_aligned_address_is_not_use
     // more back to the correct total. `reserved == live + free` holds either way.
     //
     // What the wrap does break is refusal. With the extent believed to be effectively
-    // infinite, a request that no chunk can satisfy is answered from it -- the cache
+    // infinite, a request the cache cannot honour at all is answered from it -- the cache
     // hands out a block that is not backed by any memory, and the caller faults on its
     // first store. That is the observable difference this case asserts.
-    POUND_CHECK_MSG(NULL == jit_cache_alloc(&cache, JIT_TEST_CHUNK * 2U),
-                    "a request twice a chunk's size was served from a 64-byte extent, which means "
+    //
+    // The request is a byte past the ceiling rather than a byte past a chunk. Being larger
+    // than one chunk is no longer unsatisfiable on its own: a request that big gets a chunk
+    // carved for it, which is exactly what makes the engine's 16 MiB code buffer possible.
+    // Only the ceiling still means "no", so that is what has to be tested -- otherwise this
+    // case would be asserting the absence of a feature on the strength of a bug in a
+    // neighbouring arithmetic path, and whoever fixed that bug would be told to undo it.
+    POUND_CHECK_MSG(NULL == jit_cache_alloc(&cache, JIT_TEST_CEILING + 1U),
+                    "a request past the ceiling was served from a 64-byte extent, which means "
                     "the extent is believed to be far longer than it is");
-    POUND_CHECK_MSG(NULL == jit_cache_alloc_executable(&cache, JIT_TEST_CHUNK * 2U),
-                    "an executable request twice a chunk's size was served from a 64-byte extent");
+    POUND_CHECK_MSG(NULL == jit_cache_alloc_executable(&cache, JIT_TEST_CEILING + 1U),
+                    "an executable request past the ceiling was served from a 64-byte extent");
 
     // The short extent is untouched rather than consumed or discarded, and still serves
     // what it can serve.
@@ -2177,7 +2234,7 @@ POUND_TEST_SUITE(jit_cache,
                 POUND_TEST_CASE(jit_cache, data_blocks_are_writable_and_correctly_sized),
                 POUND_TEST_CASE(jit_cache, data_blocks_honour_every_legal_alignment),
                 POUND_TEST_CASE(jit_cache, allocation_refuses_impossible_requests),
-                POUND_TEST_CASE(jit_cache, a_request_larger_than_a_chunk_is_refused_without_growing),
+                POUND_TEST_CASE(jit_cache, a_request_past_the_ceiling_is_refused_without_reserving),
                 POUND_TEST_CASE(jit_cache, live_blocks_never_alias),
                 POUND_TEST_CASE(jit_cache, block_info_reports_the_truth),
                 POUND_TEST_CASE(jit_cache, block_info_rejects_null_arguments),

@@ -67,6 +67,30 @@ if (POUND_ENABLE_BALLISTIC)
     list(APPEND POUND_TEST_SUITES jit_ballistic)
 endif ()
 
+# -----------------------------------------------------------------------------
+# The one suite that links the engine
+# -----------------------------------------------------------------------------
+#
+# `test_jit_ballistic.c` above deliberately does not: it fills in a callback table and
+# never calls the engine, so linking it there would add the prebuilt and its LuaJIT
+# runtime to every test binary for no coverage.
+#
+# This file is different in kind. It builds a real `bal_engine_t`, hands it the bridge's
+# allocator, and runs real guest ARM64 through it, so it is the only coverage of the
+# contract *between* the two -- that the engine accepts what the bridge produces, asks
+# for what the bridge can give, and reads a refused allocation as a failure. That
+# contract cannot be tested from either side alone: the bridge cannot observe whether
+# the engine understands its `NULL`, and the engine cannot be observed without a host.
+#
+# It is in its own source file rather than appended above because it is the only thing
+# that needs the engine linked, and keeping that in one place means the lanes that have
+# no prebuilt (Android arm64, aarch64 Linux) drop exactly one file and one link
+# dependency rather than needing a preprocessor guard inside a shared translation unit.
+if (POUND_ENABLE_BALLISTIC)
+    list(APPEND POUND_TEST_SOURCES test_ballistic_engine.c)
+    list(APPEND POUND_TEST_SUITES ballistic_engine)
+endif ()
+
 add_executable(PoundTests ${POUND_TEST_SOURCES})
 
 # `PoundCore` exports `src/core` as a PUBLIC include directory, which makes
@@ -89,6 +113,19 @@ endif ()
 # INTERFACE_LINK_LIBRARIES. Without this the test binary would fail to resolve
 # `mi_malloc_aligned`, `mi_malloc_usable_size`, `mi_free` and `mi_stats_get`.
 target_link_libraries(PoundTests PRIVATE PoundCore ${POUND_MIMALLOC_TARGET})
+
+# The prebuilt engine and its LuaJIT runtime. Only reached when the suite above added
+# `test_ballistic_engine.c`, which is exactly when `Ballistic::Engine` carries the
+# artefacts rather than being the inert no-op. Linking it unconditionally would be
+# harmless on a lane that has it and impossible on one that does not.
+if (POUND_ENABLE_BALLISTIC)
+    target_link_libraries(PoundTests PRIVATE Ballistic::Engine)
+endif ()
+
+# The LuaJIT runtime beside the test binary. This is not cosmetic: the suite below runs
+# the real engine, so without it the binary links cleanly and then dies at start-up with
+# STATUS_DLL_NOT_FOUND, which reads as a broken test rather than a missing file.
+ballistic_stage_runtime(PoundTests)
 
 add_compiler_flags(PoundTests)
 add_linker_flags(PoundTests)

@@ -389,15 +389,18 @@ POUND_TEST(jit_ballistic, a_failed_executable_request_yields_both_pointers_null)
     // with only one field set would be a fault waiting to happen, so both are checked.
     pound_test_log_reset();
 
-    // Larger than a whole chunk, so no chunk can ever satisfy it.
-    bal_executable_buffer_t buffer
+    // Larger than the whole ceiling, so no arrangement of chunks can ever satisfy it. Note
+    // that "larger than a chunk" is deliberately *not* used here: a block that outgrows a
+    // single chunk gets a chunk of its own and succeeds, which is what the case below
+    // covers. What has to fail is a request the cache's ceiling forbids outright.
+    const bal_executable_buffer_t buffer
         = fixture.allocator.allocate_executable((bal_allocator_handle_t)&fixture.cache,
                                                 64U,
-                                                BALLISTIC_TEST_CHUNK + 1U);
+                                                BALLISTIC_TEST_CEILING + 1U);
 
     POUND_CHECK_PTR_NULL(buffer.rw_pointer);
     POUND_CHECK_PTR_NULL(buffer.rx_pointer);
-    POUND_CHECK(pound_test_log_contains("more than one"));
+    POUND_CHECK(pound_test_log_contains("Refusing to reserve"));
 
     // The same for a misaligned request that cannot be honoured: the bridge raises
     // sub-minimum alignments but still refuses a non-power-of-two, because no address
@@ -407,6 +410,201 @@ POUND_TEST(jit_ballistic, a_failed_executable_request_yields_both_pointers_null)
 
     POUND_CHECK_PTR_NULL(odd.rw_pointer);
     POUND_CHECK_PTR_NULL(odd.rx_pointer);
+
+    fixture_close(&fixture);
+}
+
+/// A block too big for any single chunk is served from a chunk of its own, and that
+/// chunk is handed back.
+///
+/// This is the arrangement the engine actually needs. Ballistic asks for one 16 MiB
+/// contiguous executable region at 4 KiB alignment; the cache's default chunk is 4 MiB, so
+/// no chunk could ever hold it and `bal_engine_init` failed outright with "failed to
+/// allocate memory". Raising the default chunk only moves the cliff, because the size of
+/// the request is the engine's choice and not the cache's -- so the cache has to be able
+/// to serve a request larger than any chunk it would otherwise have created, and to give
+/// the result back when the engine is done with it.
+///
+/// Three things are checked here, because each can fail on its own:
+///
+///   * the block is served, and at the alignment asked for rather than the chunk's;
+///   * it comes out of a *new* chunk, not a grown one, so the original chunk's other
+///     occupants are undisturbed;
+///   * it is reclaimable, because a dedicated chunk that was never returned would turn a
+///     single engine into a permanent slice of the emulator's ceiling.
+POUND_TEST(jit_ballistic, a_block_larger_than_a_chunk_is_served_and_then_handed_back)
+{
+    fixture_t fixture;
+
+    fixture_open(&fixture);
+
+    // One byte over the chunk size, so it cannot come out of the existing chunk, and well
+    // under the ceiling, so the ceiling is not what is under test.
+    const size_t oversized = (size_t)BALLISTIC_TEST_CHUNK + 1U;
+
+    // Page alignment, which is what the engine asks for. Taken from the cache rather than
+    // written as a literal: the cache detects the host page size at init, and executable
+    // blocks are aligned to `max(alignment, page_size)` because their protection gets
+    // flipped. A hard-coded 4096 would silently stop being the right number on a host with
+    // a different page size, and the case would go on passing anyway.
+    const size_t alignment = fixture.cache.page_size;
+
+    const bal_executable_buffer_t block
+        = fixture.allocator.allocate_executable((bal_allocator_handle_t)&fixture.cache,
+                                                alignment,
+                                                oversized);
+
+    POUND_CHECK_PTR_NON_NULL(block.rw_pointer);
+    POUND_CHECK_PTR_NON_NULL(block.rx_pointer);
+
+    jit_cache_stats_t stats;
+
+    memset(&stats, 0, sizeof(stats));
+    POUND_REQUIRE(POUND_SUCCESS == jit_cache_get_stats(&fixture.cache, &stats));
+
+    POUND_CHECK_MSG(1U == stats.chunk_count,
+                    "A %zu-byte block from a %u-byte chunk left the cache with %zu chunk(s). One "
+                    "chunk is right -- the cache creates its first chunk on the first request "
+                    "rather than reserving one up front -- and it has to be that chunk rather "
+                    "than a second one, because a second would mean the request was served out "
+                    "of the original chunk, which cannot hold it.",
+                    oversized,
+                    (unsigned int)BALLISTIC_TEST_CHUNK,
+                    stats.chunk_count);
+    POUND_CHECK_EQ_U64(stats.live_blocks, 1U);
+
+    // A page multiple, not the exact request. Executable blocks own whole pages, because
+    // `mprotect` and `VirtualProtect` both round outward and a sub-page block would take a
+    // neighbour's protection with it. Asserted as "at least, and page-aligned" so this case
+    // states the real contract rather than the shape of one number.
+    POUND_CHECK_MSG(stats.live_bytes >= (uint64_t)oversized,
+                    "%llu byte(s) are live but %zu were asked for.",
+                    (unsigned long long)stats.live_bytes,
+                    oversized);
+    POUND_CHECK_MSG(0U == (stats.live_bytes % (uint64_t)fixture.cache.page_size),
+                    "%llu live byte(s) is not a multiple of the %zu-byte page.",
+                    (unsigned long long)stats.live_bytes,
+                    fixture.cache.page_size);
+    POUND_CHECK_MSG(stats.reserved_bytes >= (size_t)oversized,
+                    "%zu byte(s) are reserved but %zu were handed out.",
+                    stats.reserved_bytes,
+                    oversized);
+
+    // The requested alignment, not merely the chunk's. A block reported aligned to the
+    // chunk would satisfy every check above and still hand the engine code it cannot
+    // execute at an address its own assumptions do not hold.
+    if (NULL != block.rw_pointer)
+    {
+        POUND_CHECK_MSG(0U == ((uintptr_t)block.rw_pointer % alignment),
+                        "The oversized block is at %p, which is not %zu-byte aligned.",
+                        block.rw_pointer,
+                        alignment);
+    }
+
+    // Writable on the way out and executable after a protection change, like any other
+    // block. The oversized path is a different branch in the cache, so this is worth
+    // stating rather than assuming.
+    fixture.allocator.protect_rx((bal_allocator_handle_t)&fixture.cache, block, oversized);
+
+    memset(&stats, 0, sizeof(stats));
+    POUND_REQUIRE(POUND_SUCCESS == jit_cache_get_stats(&fixture.cache, &stats));
+
+    POUND_CHECK_EQ_U64(stats.rx_blocks, 1U);
+    POUND_CHECK_MSG(1U == stats.rx_transitions,
+                    "Making the oversized block executable took %llu transition(s).",
+                    (unsigned long long)stats.rx_transitions);
+
+    fixture.allocator.free_executable((bal_allocator_handle_t)&fixture.cache, block, oversized);
+
+    memset(&stats, 0, sizeof(stats));
+    POUND_REQUIRE(POUND_SUCCESS == jit_cache_get_stats(&fixture.cache, &stats));
+
+    POUND_CHECK_EQ_U64(stats.live_blocks, 0U);
+    POUND_CHECK_EQ_U64(stats.live_bytes, 0U);
+
+    // Now nothing is live, so the dedicated chunk is reclaimable. This is the assertion
+    // that is the whole reason the case exists: a chunk created for an oversized request
+    // and never released would otherwise silently eat the ceiling for the rest of the
+    // session, one engine at a time.
+    //
+    // `jit_cache_reclaim` answers with the byte count it returned to the OS, not with a
+    // status, so "it succeeded" is "it returned something".
+    const size_t released = jit_cache_reclaim(&fixture.cache);
+
+    memset(&stats, 0, sizeof(stats));
+    POUND_REQUIRE(POUND_SUCCESS == jit_cache_get_stats(&fixture.cache, &stats));
+
+    POUND_CHECK_MSG(0U < released,
+                    "Reclaiming released %zu byte(s), so the chunk the oversized request carved "
+                    "is still reserved.",
+                    released);
+    POUND_CHECK_EQ_U64(stats.chunk_count, 0U);
+    POUND_CHECK_MSG(0U == stats.reserved_bytes,
+                    "%zu byte(s) are still reserved after everything was freed and reclaimed.",
+                    stats.reserved_bytes);
+
+    // And the oversized chunk must not have changed the cache's idea of how big a chunk is.
+    // A cache that grew its chunk size to fit one request would spend the rest of the
+    // session committing four times the memory for every ordinary block, which is a far
+    // quieter way to leak than never giving the chunk back at all.
+    const bal_executable_buffer_t ordinary
+        = fixture.allocator.allocate_executable((bal_allocator_handle_t)&fixture.cache,
+                                                64U,
+                                                512U);
+
+    POUND_CHECK_PTR_NON_NULL(ordinary.rw_pointer);
+
+    memset(&stats, 0, sizeof(stats));
+    POUND_REQUIRE(POUND_SUCCESS == jit_cache_get_stats(&fixture.cache, &stats));
+
+    POUND_CHECK_MSG(stats.reserved_bytes <= (size_t)BALLISTIC_TEST_CHUNK,
+                    "An ordinary %u-byte request committed %zu byte(s), so the oversized request "
+                    "raised the cache's chunk size permanently.",
+                    512U,
+                    stats.reserved_bytes);
+
+    fixture.allocator.free_executable((bal_allocator_handle_t)&fixture.cache, ordinary, 512U);
+
+    fixture_close(&fixture);
+}
+
+/// A size that would wrap is refused rather than rounded into a chunk smaller than the
+/// block carved from it.
+///
+/// The dedicated-chunk path rounds the request up to the page size before reserving it, so
+/// a request a few bytes under `SIZE_MAX` would wrap to almost nothing. What makes that
+/// worth a case rather than a comment is the consequence: the cache would then reserve a
+/// tiny chunk and hand out a block of the full requested size out of it, which is a heap
+/// overflow rather than a refusal. Refusing is the only acceptable answer.
+POUND_TEST(jit_ballistic, a_size_that_would_wrap_is_refused_rather_than_rounded)
+{
+    fixture_t fixture;
+
+    fixture_open(&fixture);
+
+    // Seven bytes under `SIZE_MAX`: the smallest request whose page rounding could wrap.
+    const size_t absurd = SIZE_MAX - (fixture.cache.page_size - 1U);
+
+    pound_test_log_reset();
+
+    const bal_executable_buffer_t block
+        = fixture.allocator.allocate_executable((bal_allocator_handle_t)&fixture.cache,
+                                                64U,
+                                                absurd);
+
+    POUND_CHECK_PTR_NULL(block.rw_pointer);
+    POUND_CHECK_PTR_NULL(block.rx_pointer);
+
+    jit_cache_stats_t stats;
+
+    memset(&stats, 0, sizeof(stats));
+    POUND_REQUIRE(POUND_SUCCESS == jit_cache_get_stats(&fixture.cache, &stats));
+
+    POUND_CHECK_MSG(0U == stats.chunk_count,
+                    "A %zu-byte request reserved %zu chunk(s) instead of being refused.",
+                    absurd,
+                    stats.chunk_count);
+    POUND_CHECK_EQ_U64(stats.live_blocks, 0U);
 
     fixture_close(&fixture);
 }
@@ -682,9 +880,18 @@ POUND_TEST(jit_ballistic, a_session_of_allocations_never_loses_a_byte)
                     stats.chunk_count);
 
     // Everything is free, so the whole chunk goes back to the OS rather than being
-    // held for a session that has ended.
-    POUND_CHECK_EQ_U64(jit_cache_reclaim(&fixture.cache), BALLISTIC_TEST_CHUNK);
+    // held for a session that has ended. `jit_cache_reclaim` answers with the byte count
+    // it returned, not with a status, so what came back is the return value and the
+    // statistics are the cross-check on it.
+    POUND_CHECK_MSG((size_t)BALLISTIC_TEST_CHUNK == jit_cache_reclaim(&fixture.cache),
+                    "Reclaiming a %u-byte cache returned the wrong number of bytes.",
+                    (unsigned int)BALLISTIC_TEST_CHUNK);
     POUND_CHECK_EQ_U64(jit_cache_usable_size(&fixture.cache, NULL), 0U);
+
+    memset(&stats, 0, sizeof(stats));
+    POUND_REQUIRE(POUND_SUCCESS == jit_cache_get_stats(&fixture.cache, &stats));
+    POUND_CHECK_EQ_U64(stats.chunk_count, 0U);
+    POUND_CHECK_EQ_U64(stats.reserved_bytes, 0U);
 
     fixture_close(&fixture);
 }
@@ -697,6 +904,8 @@ POUND_TEST_SUITE(jit_ballistic,
                 POUND_TEST_CASE(jit_ballistic, a_zero_size_request_is_refused_rather_than_answered),
                 POUND_TEST_CASE(jit_ballistic, executable_buffers_alias_but_stay_writable_then_executable),
                 POUND_TEST_CASE(jit_ballistic, a_failed_executable_request_yields_both_pointers_null),
+                POUND_TEST_CASE(jit_ballistic, a_block_larger_than_a_chunk_is_served_and_then_handed_back),
+                POUND_TEST_CASE(jit_ballistic, a_size_that_would_wrap_is_refused_rather_than_rounded),
                 POUND_TEST_CASE(jit_ballistic, releasing_an_empty_executable_buffer_is_reported_not_ignored),
                 POUND_TEST_CASE(jit_ballistic, a_null_context_is_reported_on_every_callback),
                 POUND_TEST_CASE(jit_ballistic, describing_a_block_rejects_anything_but_a_live_executable_one),

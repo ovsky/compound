@@ -494,32 +494,41 @@ holes_reserve(jit_chunk_t *POUND_RESTRICT chunk, const size_t capacity)
 
 /// Reserves and registers a new chunk at the head of `cache`.
 ///
+/// `bytes` is the chunk's own size rather than `cache->chunk_bytes`, because a request
+/// larger than one ordinary chunk is given a chunk sized to it. See the oversized
+/// carve in `reserve_block`. Every chunk is a multiple of the page size, so an
+/// oversized chunk reserves the same way an ordinary one does.
+///
 /// Returns `POUND_SUCCESS`, or a typed error with a log record. The chunk list is
 /// left untouched on failure.
 static error_t
-chunk_create(jit_cache_t *POUND_RESTRICT cache, jit_chunk_t **POUND_RESTRICT out)
+chunk_create(jit_cache_t *POUND_RESTRICT   cache,
+             const size_t                 bytes,
+             jit_chunk_t **POUND_RESTRICT out)
 {
     // Growing past the ceiling is refused rather than honoured. A ceiling the
     // cache quietly ignores is worse than no ceiling, because the caller that set
-    // it is bounding the emulator's footprint.
-    if (POUND_UNLIKELY((cache->reserved_bytes + cache->chunk_bytes) > cache->max_bytes))
+    // it is bounding the emulator's footprint. Checked with a subtraction rather than
+    // a sum, so an oversized request cannot wrap the sum into a small number and
+    // reserve past the ceiling it was just tested against.
+    if (POUND_UNLIKELY(bytes > (cache->max_bytes - cache->reserved_bytes)))
     {
         POUND_LOG_ERROR(&thread_logger,
                         "Refusing to reserve another %zu bytes: %zu of a %zu-byte ceiling are "
                         "already committed.",
-                        cache->chunk_bytes,
+                        bytes,
                         cache->reserved_bytes,
                         cache->max_bytes);
         return POUND_ERROR_ALLOCATION_FAILED;
     }
 
-    uint8_t *const base = chunk_reserve(cache->chunk_bytes);
+    uint8_t *const base = chunk_reserve(bytes);
 
     if (POUND_UNLIKELY(NULL == base))
     {
         POUND_LOG_ERROR(&thread_logger,
                         "Reserving a %zu-byte code cache chunk failed.",
-                        cache->chunk_bytes);
+                        bytes);
         return POUND_ERROR_ALLOCATION_FAILED;
     }
 
@@ -531,7 +540,7 @@ chunk_create(jit_cache_t *POUND_RESTRICT cache, jit_chunk_t **POUND_RESTRICT out
 
     if (POUND_UNLIKELY(NULL == chunk))
     {
-        chunk_release(base, cache->chunk_bytes);
+        chunk_release(base, bytes);
         POUND_LOG_ERROR(&thread_logger, "Allocating a chunk descriptor failed.");
         bucket_leave(previous_bucket);
         return POUND_ERROR_ALLOCATION_FAILED;
@@ -542,16 +551,16 @@ chunk_create(jit_cache_t *POUND_RESTRICT cache, jit_chunk_t **POUND_RESTRICT out
     memset(chunk, 0, sizeof(*chunk));
 
     chunk->base  = base;
-    chunk->bytes = cache->chunk_bytes;
+    chunk->bytes = bytes;
     chunk->next  = cache->chunks;
 
     cache->chunks = chunk;
     cache->chunk_count++;
-    cache->reserved_bytes += cache->chunk_bytes;
+    cache->reserved_bytes += bytes;
 
     POUND_LOG_DEBUG(&thread_logger,
                     "Reserved a %zu-byte code cache chunk at %p (%zu chunks, %zu of %zu bytes).",
-                    cache->chunk_bytes,
+                    bytes,
                     (const void *)base,
                     cache->chunk_count,
                     cache->reserved_bytes,
@@ -856,6 +865,10 @@ reserve_block(jit_cache_t *POUND_RESTRICT   cache,
     const size_t effective = effective_alignment(cache, alignment, kind);
     size_t       need      = 0U;
 
+    // Assigned after `try_new_chunk`, which a `goto` reaches, and so it cannot be
+    // initialised at the point of declaration. See the oversized carve there.
+    size_t chunk_bytes = 0U;
+
     if (POUND_UNLIKELY(!align_up_checked(size, effective, &need)))
     {
         POUND_LOG_ERROR(&thread_logger,
@@ -934,26 +947,61 @@ reserve_block(jit_cache_t *POUND_RESTRICT   cache,
     }
 
 try_new_chunk:
-    // Checked before the chunk is created, not after. A request that cannot fit in a
-    // chunk of this size will not fit in one of a larger size either, so reserving
-    // first would leave a freshly reserved chunk behind that nothing can use and
-    // that only `jit_cache_reclaim` would give back.
+    // A request bigger than one ordinary chunk is given a chunk of its own rather than
+    // refused. The size of the request belongs to the caller, and a cache that can only
+    // satisfy sizes it chose in advance is one the caller has to guess before it can run
+    // at all.
+    //
+    // That is not hypothetical. Ballistic asks for a single 16 MiB executable buffer
+    // when its engine starts, which is four times the default 4 MiB chunk, so with the
+    // refusal in place `bal_engine_init` fails outright and the emulator has no JIT at
+    // all -- a defect that only appears once something is running the real engine,
+    // because nothing in the cache's own tests ever asks for more than a chunk.
+    //
+    // The oversized chunk is rounded up to the page size, because the reserve is
+    // page-granular and a chunk ending mid-page would leave its last bytes unusable by
+    // anything. The rounding is checked rather than assumed: `need` came from the
+    // caller, and a wrapped size would reserve a chunk *smaller* than the block carved
+    // out of it, which is a heap overflow rather than a refusal.
+    chunk_bytes = cache->chunk_bytes;
+
     if (POUND_UNLIKELY(need > cache->chunk_bytes))
     {
-        POUND_LOG_ERROR(&thread_logger,
-                        "Refusing a %zu-byte block at %zu-byte alignment: it needs %zu bytes, "
-                        "which is more than one %zu-byte chunk can hold. Raise "
-                        "jit_cache_config_t::chunk_bytes.",
+        const size_t remainder = (need % cache->page_size);
+
+        if (POUND_UNLIKELY(0U == remainder))
+        {
+            chunk_bytes = need;
+        }
+        else
+        {
+            const size_t padding = (cache->page_size - remainder);
+
+            if (POUND_UNLIKELY(need > (SIZE_MAX - padding)))
+            {
+                POUND_LOG_ERROR(&thread_logger,
+                                "Refusing a %zu-byte block at %zu-byte alignment: rounding it up "
+                                "to a whole %zu-byte page would overflow the size type.",
+                                size,
+                                effective,
+                                cache->page_size);
+                return POUND_ERROR_ALLOCATION_FAILED;
+            }
+
+            chunk_bytes = (need + padding);
+        }
+
+        POUND_LOG_DEBUG(&thread_logger,
+                        "A %zu-byte block needs more than one %zu-byte chunk, so it is getting a "
+                        "%zu-byte chunk of its own.",
                         size,
-                        effective,
-                        need,
-                        cache->chunk_bytes);
-        return POUND_ERROR_ALLOCATION_FAILED;
+                        cache->chunk_bytes,
+                        chunk_bytes);
     }
 
     {
         jit_chunk_t *created = NULL;
-        const error_t result = chunk_create(cache, &created);
+        const error_t result = chunk_create(cache, chunk_bytes, &created);
 
         if (POUND_SUCCESS != result)
         {
@@ -1960,16 +2008,25 @@ jit_cache_reclaim(jit_cache_t *POUND_RESTRICT cache)
             break;
         }
 
+        // Read before the descriptor goes back to the allocator. The allocator recycles
+        // the block immediately, so `chunk->bytes` read after `memory_subsystem_free(chunk)`
+        // is whatever the next allocation has already put there -- which is how this
+        // corrupted `reserved_bytes` and the return value in the first place. The value
+        // matters: `reserved_bytes` is what the ceiling test subtracts from, so garbage in
+        // here is either a cache that silently exceeds its ceiling or one that refuses
+        // every request for the rest of the session.
+        const size_t chunk_bytes = chunk->bytes;
+
         *link = chunk->next;
 
         memory_subsystem_free(chunk->holes);
-        chunk_release(chunk->base, chunk->bytes);
+        chunk_release(chunk->base, chunk_bytes);
         memory_subsystem_free(chunk);
 
         cache->chunk_count--;
-        cache->reserved_bytes -= cache->chunk_bytes;
+        cache->reserved_bytes -= chunk_bytes;
         cache->reclaims++;
-        released += cache->chunk_bytes;
+        released += chunk_bytes;
     }
 
     bucket_leave(previous_bucket);

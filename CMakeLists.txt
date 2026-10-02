@@ -341,6 +341,7 @@ add_library(PoundCore OBJECT
         src/core/fs/keys.c
         src/core/fs/pfs0.c
         src/core/sync/mutex.c
+        src/core/sync/thread.c
         src/core/guest_state.c
         src/core/log.c
         src/core/safe_math.c
@@ -446,6 +447,12 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
         SDL3::SDL3
         imgui
 )
+
+# The LuaJIT runtime beside the emulator. Without this the emulator links cleanly and
+# then fails to start with STATUS_DLL_NOT_FOUND the moment the JIT is enabled, which is
+# why it went unnoticed for as long as it did: nothing in the build reports a link
+# error for a DLL that resolves only at load time.
+ballistic_stage_runtime(${PROJECT_NAME})
 
 if (MSVC)
     # Keep mimalloc.dll mapped so redirect can override malloc for the whole process.

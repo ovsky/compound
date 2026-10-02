@@ -193,11 +193,78 @@ if (POUND_ENABLE_BALLISTIC)
     if (WIN32)
         ballistic_verify_imported_path(Ballistic::LuaJIT IMPORTED_IMPLIB)
     endif ()
+
+    # -----------------------------------------------------------------------------
+    # Staging the runtime next to the binaries that need it
+    # -----------------------------------------------------------------------------
+    #
+    # The engine's LuaJIT runtime is a *shared* library, and linking an import library
+    # against it resolves every symbol at link time and nothing at run time. Windows
+    # resolves DLL imports by searching the executable's own directory, so a target that
+    # links `Ballistic::Engine` will not start unless the DLL is already sitting beside
+    # it -- and nothing in CMake puts it there on its own for an imported target reached
+    # transitively through a static one.
+    #
+    # That is not a hypothetical. `Pound.exe` and `PoundTests.exe` both linked, both
+    # reported a clean build, and both died at start-up with STATUS_DLL_NOT_FOUND
+    # (0xC0000135) because `lua51.dll` was never staged. A test that links the engine is
+    # what exposed it, because until now no build target did.
+    #
+    # Consumers call `ballistic_stage_runtime(<target>)` once, after the target exists.
+    # It is a function rather than a variable because the correct action differs by
+    # platform, and because a POST_BUILD command needs a concrete target name:
+    #   Windows  -- copy the DLL beside the executable; the loader will find it there.
+    #   ELF      -- add the runtime's directory to the build-tree RPATH, and `$ORIGIN`
+    #               to the installed one, so the build tree and the install tree both
+    #               resolve without LD_LIBRARY_PATH.
+    #   Android  -- nothing: the APK packaging pass in StageJniArtifacts.cmake stages
+    #               every dependency into lib/<abi>/, where the dynamic linker looks.
+    function(ballistic_stage_runtime target)
+        if (NOT TARGET ${target})
+            message(FATAL_ERROR "[Ballistic] Cannot stage the runtime for '${target}': no such target.")
+        endif ()
+
+        if (ANDROID)
+            return()
+        endif ()
+
+        if (WIN32)
+            # `TARGET_FILE_DIR` rather than `TARGET_RUNTIME_DIR`: the latter is not a
+            # generator expression this CMake accepts here, and failing to generate is a
+            # far worse outcome than the wrong directory would be.
+            add_custom_command(TARGET ${target} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${BALLISTIC_LUAJIT_RUNTIME}"
+                    "$<TARGET_FILE_DIR:${target}>"
+                    COMMENT "[Ballistic] Staging lua51.dll beside ${target}"
+                    VERBATIM
+            )
+        else ()
+            get_filename_component(_luajit_dir "${BALLISTIC_LUAJIT_RUNTIME}" DIRECTORY)
+
+            # `$ORIGIN` is relative to the executable, which is where the install rules
+            # put the runtime. Prepending it keeps the build tree working after the
+            # binary has been moved, which is what a developer running it out of the
+            # build directory does.
+            set_target_properties(${target} PROPERTIES
+                    BUILD_RPATH "${_luajit_dir}"
+                    INSTALL_RPATH "$ORIGIN"
+            )
+        endif ()
+    endfunction()
 else ()
     # A no-op target keeps `if (TARGET Ballistic::Engine)` call sites in the
     # source working without preprocessor guards in every file.
     add_library(Ballistic::Engine INTERFACE IMPORTED GLOBAL)
     message(STATUS "[Ballistic] JIT disabled; providing an inert no-op target instead.")
+
+    # The staging function is defined either way so consumers need no guard: with the
+    # engine disabled there is no runtime to stage, so the call does nothing.
+    function(ballistic_stage_runtime target)
+        if (NOT TARGET ${target})
+            message(FATAL_ERROR "[Ballistic] Cannot stage the runtime for '${target}': no such target.")
+        endif ()
+    endfunction()
 endif ()
 
 # -----------------------------------------------------------------------------

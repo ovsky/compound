@@ -93,6 +93,17 @@ typedef enum
 
     /// A translation unit could not be represented in the target module format.
     POUND_ERROR_TRANSLATION_FAILED,
+
+    // Concurrency Errors
+
+    /// A thread could not be waited on, or the platform refused to report on it.
+    ///
+    /// Separate from `POUND_ERROR_ALLOCATION_FAILED`, which covers the platform
+    /// refusing to *create* a thread, because the two have different recoveries: a
+    /// thread that cannot be created means the feature is unavailable, while one that
+    /// cannot be joined is running code nobody can account for, and joining is what
+    /// keeps a cache or an engine from being destroyed underneath it.
+    POUND_ERROR_THREAD_FAILED,
 } error_t;
 
 /// Human-readable name for `error`.
