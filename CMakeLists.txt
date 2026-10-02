@@ -335,6 +335,10 @@ add_library(PoundCore OBJECT
         src/core/memory/pool_allocator.c
         src/core/memory/slab_allocator.c
         src/core/jit/jit_cache.c
+        src/core/crypto/sha256.c
+        src/core/fs/fs_reader.c
+        src/core/fs/keys.c
+        src/core/fs/pfs0.c
         src/core/sync/mutex.c
         src/core/guest_state.c
         src/core/log.c

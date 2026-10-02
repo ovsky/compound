@@ -26,6 +26,10 @@ set(POUND_TEST_SUITES
         mutex
         slab_allocator
         jit_cache
+        sha256
+        fs_reader
+        keys
+        pfs0
         )
 
 set(POUND_TEST_SOURCES
@@ -38,6 +42,8 @@ set(POUND_TEST_SOURCES
         test_pool_allocator.c
         test_slab_allocator.c
         test_jit_cache.c
+        test_sha256.c
+        test_fs.c
         )
 
 # The Ballistic bridge is the only thing under test that needs the engine's headers,
