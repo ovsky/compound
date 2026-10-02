@@ -31,6 +31,7 @@
 #include "errors.h"
 #include "jit/jit_cache.h"
 #include "log.h"
+#include "memory.h"
 #include "platform.h"
 #include <stdio.h>
 
@@ -111,6 +112,13 @@ read_resolved(const jit_cache_t *cache)
 /// recorded as free, or still above the cursor. A byte that is none of those is a
 /// byte the cache can never hand out again, and it is the failure mode a cursor bug,
 /// an unrecorded alignment gap, or a dropped coalesce all produce.
+///
+/// It is worth knowing what this check *cannot* see, because the arithmetic it performs
+/// is modular and a wrapped quantity can cancel: an extent recorded with a size near
+/// SIZE_MAX sums to the correct total again once it is added back, so a free-extent
+/// entry corrupted by a subtraction underflow passes this check unchanged. What that
+/// corruption breaks is refusal -- an impossibly large request becomes answerable --
+/// so the cases that care about it assert that instead.
 static void
 check_accounting(const jit_cache_t *cache, const char *where)
 {
@@ -124,7 +132,9 @@ check_accounting(const jit_cache_t *cache, const char *where)
                     stats.live_bytes,
                     stats.free_bytes,
                     stats.live_bytes + stats.free_bytes,
-                    stats.reserved_bytes - (stats.live_bytes + stats.free_bytes));
+                    (stats.reserved_bytes > (stats.live_bytes + stats.free_bytes))
+                        ? (stats.reserved_bytes - (stats.live_bytes + stats.free_bytes))
+                        : ((stats.live_bytes + stats.free_bytes) - stats.reserved_bytes));
 
     POUND_CHECK_MSG(stats.rw_blocks + stats.rx_blocks == stats.live_blocks,
                     "%s: %zu RW + %zu RX but %zu live blocks",
@@ -140,10 +150,17 @@ check_accounting(const jit_cache_t *cache, const char *where)
                     stats.live_blocks,
                     (unsigned long long)stats.frees);
 
-    POUND_CHECK_MSG(stats.chunk_count * JIT_TEST_CHUNK >= stats.reserved_bytes,
-                    "%s: %zu chunks cannot hold %zu reserved bytes",
+    // Every chunk is the same size, so this is an equality rather than a bound: a chunk
+    // that was reserved but not counted, or counted but not reserved, moves it. The size
+    // is read back from the cache rather than taken from this file's constants, so the
+    // check holds for a case that deliberately configures an unusual chunk size.
+    const size_t chunk_bytes = read_resolved(cache).chunk_bytes;
+
+    POUND_CHECK_MSG((stats.chunk_count * chunk_bytes) == stats.reserved_bytes,
+                    "%s: %zu chunks of %zu bytes cannot account for %zu reserved bytes",
                     where,
                     stats.chunk_count,
+                    chunk_bytes,
                     stats.reserved_bytes);
 }
 
@@ -878,19 +895,27 @@ POUND_TEST(jit_cache, release_refuses_a_block_of_the_wrong_kind)
     POUND_REQUIRE_PTR_NON_NULL(code);
 
     // A data block released through the executable path would leave its recorded
-    // state inconsistent with how a later query reads it.
+    // state inconsistent with how a later query reads it. Both blocks are still live
+    // afterwards, and the refused one is still usable -- which is what tells the two
+    // apart from a release that half-succeeded.
     pound_test_log_reset();
     jit_cache_free_executable(&cache, data);
     POUND_CHECK(pound_test_log_contains("is a data block"));
-    POUND_CHECK_MSG(1U == read_stats(&cache).live_blocks,
-                    "a data block released through the executable path was accepted");
+    POUND_CHECK_MSG(2U == read_stats(&cache).live_blocks,
+                    "a refused mismatched release took a block with it: %zu live, expected 2",
+                    read_stats(&cache).live_blocks);
+    POUND_CHECK_MSG(jit_cache_usable_size(&cache, data) > 0U,
+                    "the data block was released despite the refusal");
 
     // And the reverse.
     pound_test_log_reset();
     jit_cache_free(&cache, code);
     POUND_CHECK(pound_test_log_contains("is an executable block"));
-    POUND_CHECK_MSG(1U == read_stats(&cache).live_blocks,
-                    "an executable block released through the data path was accepted");
+    POUND_CHECK_MSG(2U == read_stats(&cache).live_blocks,
+                    "a refused mismatched release took a block with it: %zu live, expected 2",
+                    read_stats(&cache).live_blocks);
+    POUND_CHECK_MSG(jit_cache_usable_size(&cache, code) > 0U,
+                    "the executable block was released despite the refusal");
 
     // Each still frees through its own path.
     jit_cache_free(&cache, data);
@@ -1448,6 +1473,71 @@ POUND_TEST(jit_cache, data_and_executable_blocks_stay_independent)
     jit_cache_destroy(&cache);
 }
 
+POUND_TEST(jit_cache, an_extent_too_short_to_reach_an_aligned_address_is_not_used)
+{
+    jit_cache_t cache;
+
+    init_cache(&cache, JIT_TEST_CHUNK, JIT_TEST_CEILING);
+
+    const size_t page = read_resolved(&cache).page_size;
+
+    // Two 64-byte blocks side by side, so releasing the second leaves a 64-byte extent
+    // at offset 64. That extent is far too short to reach the next page boundary: on a
+    // 4 KiB page it is 4032 bytes away from one, a gap larger than the extent itself.
+    void *const first  = jit_cache_alloc(&cache, 64U);
+    void *const second = jit_cache_alloc(&cache, 64U);
+
+    POUND_REQUIRE_PTR_NON_NULL(first);
+    POUND_REQUIRE_PTR_NON_NULL(second);
+
+    jit_cache_free(&cache, second);
+    check_accounting(&cache, "with a 64-byte extent at offset 64");
+
+    // An executable block needs a whole page, so that extent cannot serve one. The
+    // reason this case exists is the way a free-extent search gets this wrong: judging
+    // the extent by `size - (aligned - offset)` subtracts a larger number from a
+    // smaller one and wraps to a value near SIZE_MAX, after which the extent looks able
+    // to hold anything.
+    void *const code = jit_cache_alloc_executable(&cache, 64U);
+
+    POUND_REQUIRE_PTR_NON_NULL(code);
+    POUND_CHECK_MSG(0U == ((uintptr_t)code % page),
+                    "an executable block landed at %p, which is not %zu-byte aligned",
+                    code,
+                    page);
+
+    // The wrapped size cannot be caught by the accounting invariant, and the reason is
+    // worth stating so nobody trusts the arithmetic check for it: the wrapped extent
+    // reports 2^64 - 3968 bytes, and summing that with the other free bytes wraps once
+    // more back to the correct total. `reserved == live + free` holds either way.
+    //
+    // What the wrap does break is refusal. With the extent believed to be effectively
+    // infinite, a request that no chunk can satisfy is answered from it -- the cache
+    // hands out a block that is not backed by any memory, and the caller faults on its
+    // first store. That is the observable difference this case asserts.
+    POUND_CHECK_MSG(NULL == jit_cache_alloc(&cache, JIT_TEST_CHUNK * 2U),
+                    "a request twice a chunk's size was served from a 64-byte extent, which means "
+                    "the extent is believed to be far longer than it is");
+    POUND_CHECK_MSG(NULL == jit_cache_alloc_executable(&cache, JIT_TEST_CHUNK * 2U),
+                    "an executable request twice a chunk's size was served from a 64-byte extent");
+
+    // The short extent is untouched rather than consumed or discarded, and still serves
+    // what it can serve.
+    void *const again = jit_cache_alloc(&cache, 64U);
+
+    POUND_REQUIRE_PTR_NON_NULL(again);
+    check_accounting(&cache, "after the short extent served a data block");
+
+    jit_cache_free(&cache, again);
+    jit_cache_free_executable(&cache, code);
+    jit_cache_free(&cache, first);
+
+    check_accounting(&cache, "with nothing live");
+    POUND_CHECK_EQ_U64(jit_cache_reclaim(&cache), JIT_TEST_CHUNK);
+
+    jit_cache_destroy(&cache);
+}
+
 POUND_TEST(jit_cache, executable_cycles_do_not_grow_the_cache)
 {
     jit_cache_t cache;
@@ -1600,6 +1690,77 @@ POUND_TEST(jit_cache, a_chunk_grows_the_cache_rather_than_overspilling)
     // Now everything is free, so every chunk is trailing-empty and all of them go back.
     POUND_CHECK_EQ_U64(jit_cache_reclaim(&cache), stats.reserved_bytes);
     POUND_CHECK_EQ_U64(read_stats(&cache).chunk_count, 0U);
+
+    jit_cache_destroy(&cache);
+}
+
+POUND_TEST(jit_cache, a_full_chunk_does_not_hand_out_bytes_past_its_end)
+{
+    // The cache's minimum chunk size plus one page: page-aligned, comfortably inside the
+    // documented bounds, and -- the reason for the odd value -- deliberately *not* a
+    // multiple of the largest supported alignment. A chunk size that happened to be a
+    // multiple of 64 KiB could never produce a cursor that rounds up past the end of its
+    // chunk, so on a conventional chunk size the bound this case exists to test could
+    // not be reached at all.
+    const size_t chunk_bytes = JIT_TEST_CHUNK + 4096U;
+
+    jit_cache_t cache;
+
+    init_cache(&cache, chunk_bytes, chunk_bytes * 2U);
+
+    // Fill the first chunk exactly. This block owns every byte of it, so there is no
+    // free extent and no tail left above the cursor, and the cursor sits precisely on
+    // the chunk's end -- which is the only state in which rounding it up moves.
+    void *const filler = jit_cache_alloc(&cache, chunk_bytes);
+
+    POUND_REQUIRE_PTR_NON_NULL(filler);
+    check_accounting(&cache, "with the first chunk full to its last byte");
+
+    // Rounding a cursor of 266240 up to a 64 KiB alignment gives 327680, which is 61440
+    // bytes past the end of a 266240-byte chunk. An allocation that subtracts the two
+    // without first checking that the subtraction is legal wraps to a number near
+    // SIZE_MAX, concludes the chunk has room, and carves a block out of memory the cache
+    // never reserved.
+    //
+    // The result is deceptively plausible: a real address, on a real page boundary, from
+    // a real mapping. It is simply not this cache's memory, and the first write to it
+    // corrupts an unrelated allocation. So the block is not written to here -- the case
+    // asserts the arithmetic instead, which is what actually fails.
+    void *const code = jit_cache_alloc_executable_aligned(&cache, JIT_CACHE_MAX_ALIGNMENT, 64U);
+
+    POUND_REQUIRE_PTR_NON_NULL(code);
+
+    POUND_CHECK_MSG(0U == ((uintptr_t)code % JIT_CACHE_MAX_ALIGNMENT),
+                    "an executable block landed at %p, which is not %zu-byte aligned",
+                    code,
+                    JIT_CACHE_MAX_ALIGNMENT);
+    POUND_CHECK_MSG(((uintptr_t)code < (uintptr_t)filler)
+                        || ((uintptr_t)code >= ((uintptr_t)filler + chunk_bytes)),
+                    "an executable block landed at %p, which is inside the full chunk starting "
+                    "at %p and %zu bytes long",
+                    code,
+                    filler,
+                    chunk_bytes);
+
+    // With the bound honoured the only remaining option was a second chunk, which the
+    // ceiling of two chunks' worth allows exactly.
+    POUND_CHECK_MSG(2U == read_stats(&cache).chunk_count,
+                    "a full chunk of %zu bytes did not force a second chunk, so the block came "
+                    "from somewhere it should not have",
+                    chunk_bytes);
+
+    // The cursor of the full chunk is now past its own end, so summing what is left
+    // above it underflows and the accounting collapses.
+    check_accounting(&cache, "after a block that outgrew the chunk it came from");
+
+    POUND_REQUIRE(POUND_SUCCESS == jit_cache_protect_rx(&cache, code));
+    POUND_CHECK(JIT_BLOCK_STATE_READ_EXECUTE == jit_cache_block_state(&cache, code));
+
+    jit_cache_free_executable(&cache, code);
+    jit_cache_free(&cache, filler);
+
+    check_accounting(&cache, "with nothing live");
+    POUND_CHECK_EQ_U64(jit_cache_reclaim(&cache), chunk_bytes * 2U);
 
     jit_cache_destroy(&cache);
 }
@@ -1933,6 +2094,79 @@ POUND_TEST(jit_cache, destroy_returns_every_chunk_to_the_system)
                     "a clean teardown logged an error");
 }
 
+POUND_TEST(jit_cache, every_byte_the_cache_charges_comes_back_to_the_bucket_it_took)
+{
+    // A caller with a bucket of its own selected, which is the situation the case is
+    // really about. The cache is entitled to charge its own bookkeeping wherever it
+    // likes, but a caller that has a bucket active must get it back untouched, and every
+    // byte the cache took must be given back to the same ledger it came from.
+    (void)memory_subsystem_set_bucket(MEMORY_BUCKET_UI);
+    POUND_REQUIRE(MEMORY_BUCKET_UI == memory_subsystem_get_bucket());
+
+    const size_t jit_before = memory_subsystem_get_memory_used_by_bucket((int)MEMORY_BUCKET_JIT_RECOMPILER);
+    const size_t ui_before  = memory_subsystem_get_memory_used_by_bucket((int)MEMORY_BUCKET_UI);
+
+    jit_cache_t cache;
+
+    init_cache(&cache, JIT_TEST_CHUNK, JIT_TEST_CEILING);
+
+    // Mix both block kinds, a protection flip, a reuse and a teardown, so every internal
+    // allocation the cache makes is exercised at least once: the chunk descriptor, the
+    // free-extent array, the block descriptors, and the reallocation of that array as it
+    // grows.
+    void *const data = jit_cache_alloc(&cache, 4U * 1024U);
+    void *const code = jit_cache_alloc_executable(&cache, 4U * 1024U);
+
+    POUND_REQUIRE_PTR_NON_NULL(data);
+    POUND_REQUIRE_PTR_NON_NULL(code);
+
+    // A third block forces the free-extent array to grow, which is the one internal
+    // allocation whose charge and release happen inside a single call.
+    for (size_t i = 0U; i < 8U; ++i)
+    {
+        void *const scratch = jit_cache_alloc(&cache, 64U);
+
+        POUND_REQUIRE_PTR_NON_NULL(scratch);
+        jit_cache_free(&cache, scratch);
+    }
+
+    POUND_REQUIRE(POUND_SUCCESS == jit_cache_protect_rx(&cache, code));
+    jit_cache_free_executable(&cache, code);
+    jit_cache_free(&cache, data);
+
+    jit_cache_destroy(&cache);
+
+    // The point of the case. A descriptor charged to the JIT bucket and released under
+    // the caller's bucket leaves the JIT total permanently high and debits a bucket that
+    // never took the bytes -- which saturates at zero, so the caller's ledger is simply
+    // wrong with no error anywhere. It is a small drift per chunk and per block,
+    // invisible in the cache's own statistics because the bytes really are handed back to
+    // the allocator, and cumulative over a session's worth of compilation.
+    const size_t jit_after = memory_subsystem_get_memory_used_by_bucket((int)MEMORY_BUCKET_JIT_RECOMPILER);
+    const size_t ui_after  = memory_subsystem_get_memory_used_by_bucket((int)MEMORY_BUCKET_UI);
+
+    POUND_CHECK_MSG(jit_before == jit_after,
+                    "the JIT bucket holds %zu bytes after the cache was destroyed, but it held "
+                    "%zu before it existed: %zu bytes of bookkeeping were charged to one bucket "
+                    "and released to another",
+                    jit_after,
+                    jit_before,
+                    (jit_after > jit_before) ? (jit_after - jit_before) : (jit_before - jit_after));
+    POUND_CHECK_MSG(ui_before == ui_after,
+                    "the caller's UI bucket holds %zu bytes after the cache was destroyed, but "
+                    "it held %zu before, so the cache released its own bookkeeping against it",
+                    ui_after,
+                    ui_before);
+
+    // A well-behaved cache leaves the caller's selection alone, and the case has to put
+    // the thread back the way it found it either way.
+    POUND_CHECK_MSG(MEMORY_BUCKET_UI == memory_subsystem_get_bucket(),
+                    "the cache left the caller's bucket as %d",
+                    (int)memory_subsystem_get_bucket());
+
+    (void)memory_subsystem_set_bucket(MEMORY_BUCKET_NONE);
+}
+
 POUND_TEST_SUITE(jit_cache,
                 POUND_TEST_CASE(jit_cache, init_rejects_a_null_cache),
                 POUND_TEST_CASE(jit_cache, init_takes_every_default_from_a_null_config),
@@ -1962,9 +2196,11 @@ POUND_TEST_SUITE(jit_cache,
                 POUND_TEST_CASE(jit_cache, protection_refuses_a_data_block),
                 POUND_TEST_CASE(jit_cache, state_is_free_for_anything_the_cache_does_not_own),
                 POUND_TEST_CASE(jit_cache, data_and_executable_blocks_stay_independent),
+                POUND_TEST_CASE(jit_cache, an_extent_too_short_to_reach_an_aligned_address_is_not_used),
                 POUND_TEST_CASE(jit_cache, executable_cycles_do_not_grow_the_cache),
                 POUND_TEST_CASE(jit_cache, the_ceiling_is_enforced_and_reported),
                 POUND_TEST_CASE(jit_cache, a_chunk_grows_the_cache_rather_than_overspilling),
+                POUND_TEST_CASE(jit_cache, a_full_chunk_does_not_hand_out_bytes_past_its_end),
                 POUND_TEST_CASE(jit_cache, poisoning_fills_freshly_allocated_blocks),
                 POUND_TEST_CASE(jit_cache, an_unpoisoned_cache_leaves_memory_alone),
                 POUND_TEST_CASE(jit_cache, statistics_track_the_cache),
@@ -1972,6 +2208,8 @@ POUND_TEST_SUITE(jit_cache,
                 POUND_TEST_CASE(jit_cache, reset_clears_the_cache_and_keeps_its_configuration),
                 POUND_TEST_CASE(jit_cache, reset_rejects_a_null_or_uninitialised_cache),
                 POUND_TEST_CASE(jit_cache, destroy_is_safe_with_live_blocks_and_closes_the_cache),
-                POUND_TEST_CASE(jit_cache, destroy_returns_every_chunk_to_the_system))
+                POUND_TEST_CASE(jit_cache, destroy_returns_every_chunk_to_the_system),
+                POUND_TEST_CASE(jit_cache,
+                                every_byte_the_cache_charges_comes_back_to_the_bucket_it_took))
 
 /*** end of file ***/

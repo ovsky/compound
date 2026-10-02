@@ -405,6 +405,33 @@ poison_range(const jit_cache_t *POUND_RESTRICT cache, void *POUND_RESTRICT block
     }
 }
 
+/// Charges host allocations made below to the code cache's own bucket.
+///
+/// The memory subsystem attributes every host allocation to whichever bucket the
+/// calling thread has selected, and the selected bucket is thread state that outlives
+/// any single call. So a bracket is only correct if *both* ends of it are inside: an
+/// allocation made here and released later, from a different call, would otherwise be
+/// credited to `MEMORY_BUCKET_JIT_RECOMPILER` and debited from whatever the caller
+/// happened to have active. The per-bucket totals would then drift upward for the life
+/// of the process and a reporting UI would show the JIT bucket growing without bound
+/// after a cache that had released everything.
+///
+/// That is also why these two are used as a pair rather than a single scoped helper:
+/// the release sites are in three different functions, and a scope that could not cross
+/// a call boundary would be a scope that could not be used to fix the problem.
+static memory_bucket_type_t
+bucket_enter(void)
+{
+    return memory_subsystem_set_bucket(MEMORY_BUCKET_JIT_RECOMPILER);
+}
+
+/// Restores the bucket that `bucket_enter` displaced.
+static void
+bucket_leave(const memory_bucket_type_t previous)
+{
+    (void)memory_subsystem_set_bucket(previous);
+}
+
 /// Resizes a chunk's free-extent array to hold `capacity` entries.
 ///
 /// Returns `POUND_SUCCESS`, or a typed error with a log record. On failure the
@@ -426,14 +453,14 @@ holes_reserve(jit_chunk_t *POUND_RESTRICT chunk, const size_t capacity)
         return POUND_ERROR_ALLOCATION_FAILED;
     }
 
-    // Charge the cache's own metadata to the JIT bucket rather than to whatever
-    // the calling thread happens to have active, so a guest UI allocation cannot
-    // make the code cache look larger or smaller than it is.
-    const memory_bucket_type_t previous_bucket
-        = memory_subsystem_set_bucket(MEMORY_BUCKET_JIT_RECOMPILER);
+    // Charged to the cache's own bucket rather than to whatever the calling thread
+    // happens to have active, so a guest UI allocation cannot make the code cache look
+    // larger or smaller than it is. The release of the old array is inside the same
+    // bracket, which is what keeps the two ends in the same bucket.
+    const memory_bucket_type_t previous_bucket = bucket_enter();
 
-    jit_hole_t *const grown = memory_subsystem_allocate(sizeof(*grown) * capacity,
-                                                        _Alignof(jit_hole_t));
+    jit_hole_t *const grown = memory_subsystem_allocate(_Alignof(jit_hole_t),
+                                                        sizeof(*grown) * capacity);
 
     if (NULL != grown)
     {
@@ -451,7 +478,7 @@ holes_reserve(jit_chunk_t *POUND_RESTRICT chunk, const size_t capacity)
         chunk->hole_capacity = capacity;
     }
 
-    memory_subsystem_set_bucket(previous_bucket);
+    bucket_leave(previous_bucket);
 
     if (POUND_UNLIKELY(NULL == grown))
     {
@@ -496,14 +523,21 @@ chunk_create(jit_cache_t *POUND_RESTRICT cache, jit_chunk_t **POUND_RESTRICT out
         return POUND_ERROR_ALLOCATION_FAILED;
     }
 
-    jit_chunk_t *const chunk = memory_subsystem_allocate(sizeof(*chunk), _Alignof(jit_chunk_t));
+    // Bracketed so the descriptor is charged to, and later debited from, the JIT
+    // bucket. See `bucket_enter`.
+    const memory_bucket_type_t previous_bucket = bucket_enter();
+
+    jit_chunk_t *const chunk = memory_subsystem_allocate(_Alignof(jit_chunk_t), sizeof(*chunk));
 
     if (POUND_UNLIKELY(NULL == chunk))
     {
         chunk_release(base, cache->chunk_bytes);
         POUND_LOG_ERROR(&thread_logger, "Allocating a chunk descriptor failed.");
+        bucket_leave(previous_bucket);
         return POUND_ERROR_ALLOCATION_FAILED;
     }
+
+    bucket_leave(previous_bucket);
 
     memset(chunk, 0, sizeof(*chunk));
 
@@ -629,11 +663,21 @@ holes_find(const jit_chunk_t *POUND_RESTRICT chunk, const size_t needed, const s
 {
     for (size_t i = 0U; i < chunk->hole_count; ++i)
     {
-        const size_t offset    = chunk->holes[i].offset;
-        const size_t aligned   = hole_aligned_offset(offset, alignment);
-        const size_t available = chunk->holes[i].size - (aligned - offset);
+        const size_t offset  = chunk->holes[i].offset;
+        const size_t aligned = hole_aligned_offset(offset, alignment);
 
-        if (available >= needed)
+        // The leading bytes an extent has to give up to reach an aligned address can
+        // exceed the extent's own length -- a 64-byte extent at offset 64 is more than
+        // a page away from the next aligned address. Subtracting then would wrap to a
+        // value near SIZE_MAX and the extent would be judged able to hold anything, so
+        // the comparison is made against zero instead of against a subtraction that is
+        // only meaningful when the two are in range.
+        if (aligned >= (offset + chunk->holes[i].size))
+        {
+            continue;
+        }
+
+        if ((chunk->holes[i].size - (aligned - offset)) >= needed)
         {
             return i;
         }
@@ -847,10 +891,15 @@ reserve_block(jit_cache_t *POUND_RESTRICT   cache,
 
     if (NULL != cache->chunks)
     {
-        jit_chunk_t *const chunk   = cache->chunks;
-        const size_t  aligned      = hole_aligned_offset(chunk->used, effective);
+        jit_chunk_t *const chunk  = cache->chunks;
+        const size_t  aligned     = hole_aligned_offset(chunk->used, effective);
 
-        if ((chunk->bytes - aligned) >= need)
+        // The aligned offset is tested against the chunk's size *before* the remaining
+        // bytes are computed. Rounding up can leave the cursor within one alignment of
+        // the end, in which case the rounded address is past the end of the chunk, and
+        // `chunk->bytes - aligned` would wrap to a value near SIZE_MAX and make a
+        // carve that runs off the chunk look like it fits.
+        if ((aligned <= chunk->bytes) && ((chunk->bytes - aligned) >= need))
         {
             // Reaching an aligned address can leave a gap between the cursor and the
             // carve. It is recorded rather than abandoned, so a later request can use
@@ -934,7 +983,11 @@ block_record(jit_cache_t *POUND_RESTRICT cache,
              const size_t                     capacity,
              const size_t                     requested)
 {
-    jit_block_t *const block = memory_subsystem_allocate(sizeof(*block), _Alignof(jit_block_t));
+    const memory_bucket_type_t previous_bucket = bucket_enter();
+
+    jit_block_t *const block = memory_subsystem_allocate(_Alignof(jit_block_t), sizeof(*block));
+
+    bucket_leave(previous_bucket);
 
     if (POUND_UNLIKELY(NULL == block))
     {
@@ -985,6 +1038,10 @@ chunk_list_drain(jit_cache_t *POUND_RESTRICT cache)
 {
     jit_chunk_t *chunk = cache->chunks;
 
+    // One bracket for the whole drain, because every release in it belongs to the
+    // bucket its counterpart allocation was charged to.
+    const memory_bucket_type_t previous_bucket = bucket_enter();
+
     while (NULL != chunk)
     {
         jit_chunk_t *const next = chunk->next;
@@ -1005,6 +1062,8 @@ chunk_list_drain(jit_cache_t *POUND_RESTRICT cache)
         cache->reclaims++;
         chunk = next;
     }
+
+    bucket_leave(previous_bucket);
 }
 
 // -----------------------------------------------------------------------------
@@ -1520,22 +1579,68 @@ release_block(jit_cache_t *POUND_RESTRICT cache,
 
     cache->frees++;
 
-    const error_t coalesced = holes_insert(chunk, offset, capacity);
+    // An executable block that is still in its read-execute state has *page* protection
+    // that forbids writing, and both Windows and POSIX map protection for a whole page
+    // range rather than for the block. Publishing those bytes to the free list without
+    // making them writable again would hand the next allocation memory it cannot
+    // write: a data block carved out of them faults on its first store, and an
+    // executable block faults on the store that precedes its own first `protect_rx`.
+    // Both are the engine's ordinary allocate-and-release cycle rather than anything
+    // exotic, so the flip happens before the space is published.
+    //
+    // Only a block that was actually left executable pays for it. A JIT that patches a
+    // block and releases it while writable -- which is the normal sequence -- costs
+    // nothing here, which is why this is not a per-release protection call.
+    const bool left_executable = ((JIT_BLOCK_KIND_EXECUTABLE == (jit_block_kind_t)expected_kind)
+                                   && (JIT_BLOCK_STATE_READ_EXECUTE == (jit_block_state_t)state));
 
-    memory_subsystem_free(block);
+    error_t recycled = POUND_SUCCESS;
+
+    if (left_executable)
+    {
+        recycled = chunk_make_rw(chunk->base + offset, capacity);
+    }
+
+    if (POUND_SUCCESS == recycled)
+    {
+        recycled = holes_insert(chunk, offset, capacity);
+    }
+
+    // Bracketed for the same reason as the allocation in `block_record`: the
+    // descriptor is debited from the bucket it was charged to, whatever bucket the
+    // caller has selected in the meantime.
+    {
+        const memory_bucket_type_t previous_bucket = bucket_enter();
+
+        memory_subsystem_free(block);
+        bucket_leave(previous_bucket);
+    }
 
     mutex_unlock(&cache->lock);
 
-    if (POUND_SUCCESS != coalesced)
+    if (POUND_SUCCESS != recycled)
     {
-        // The bytes stay reserved but unreachable. Saying so precisely beats a
-        // stats report that is quietly short.
-        POUND_LOG_ERROR(&thread_logger,
-                        "Released %zu bytes at offset %zu of chunk %p, but they could not be "
-                        "returned to the free list and will not be reused.",
-                        capacity,
-                        offset,
-                        (const void *)chunk);
+        // The bytes stay reserved but unreachable, which is the safe direction: an
+        // unreachable extent costs address space, a published-but-unwritable one costs
+        // the process. The protection flip already logged its own failure above.
+        if (left_executable)
+        {
+            POUND_LOG_ERROR(&thread_logger,
+                            "Released %zu bytes at offset %zu of chunk %p, but they could not be "
+                            "made writable again and will not be reused.",
+                            capacity,
+                            offset,
+                            (const void *)chunk);
+        }
+        else
+        {
+            POUND_LOG_ERROR(&thread_logger,
+                            "Released %zu bytes at offset %zu of chunk %p, but they could not be "
+                            "returned to the free list and will not be reused.",
+                            capacity,
+                            offset,
+                            (const void *)chunk);
+        }
     }
 }
 
@@ -1840,6 +1945,12 @@ jit_cache_reclaim(jit_cache_t *POUND_RESTRICT cache)
     // Only the tail can go. An extent below a live block cannot be returned to the
     // OS without fragmenting the address space into pieces no later chunk would
     // fit, which is the same rule the slab allocator follows for the same reason.
+    //
+    // A chunk with no live blocks can still own a free-extent array, so the array is
+    // released here too -- inside the same bucket bracket as the descriptor, and as
+    // the one `holes_reserve` charged the array to.
+    const memory_bucket_type_t previous_bucket = bucket_enter();
+
     while (NULL != *link)
     {
         jit_chunk_t *const chunk = *link;
@@ -1860,6 +1971,8 @@ jit_cache_reclaim(jit_cache_t *POUND_RESTRICT cache)
         cache->reclaims++;
         released += cache->chunk_bytes;
     }
+
+    bucket_leave(previous_bucket);
 
     const size_t remaining = cache->chunk_count;
 

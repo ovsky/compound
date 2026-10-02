@@ -167,12 +167,12 @@ POUND_TEST(jit_ballistic, allocations_through_the_bridge_come_from_the_cache)
 
     fixture_open(&fixture);
 
-    // The sizes are deliberately not multiples of the alignment, and the alignments
-    // include ones below the cache's own minimum, which the bridge has to raise rather
-    // than refuse: Ballistic only promises a power of two, so a request for 1 is
-    // legal on its side and has to be satisfied here.
+    // Every alignment here is a power of two, which is all Ballistic promises, and
+    // several are below the cache's own minimum and so have to be raised rather than
+    // refused. The sizes are not multiples of any of them, so each block rounds
+    // differently.
     static const size_t requests[][2] = {
-        {1U, 8U}, {8U, 1U}, {8U, 16U}, {64U, 3U}, {100U, 8U}, {1U, 32U}, {4096U, 64U},
+        {1U, 8U}, {8U, 1U}, {2U, 16U}, {16U, 3U}, {64U, 3U}, {32U, 100U}, {64U, 4096U}, {4096U, 1U},
     };
 
     void *blocks[sizeof(requests) / sizeof(requests[0])];
@@ -221,9 +221,12 @@ POUND_TEST(jit_ballistic, allocations_through_the_bridge_come_from_the_cache)
 
     memset(&stats, 0, sizeof(stats));
     POUND_REQUIRE(POUND_SUCCESS == jit_cache_get_stats(&fixture.cache, &stats));
+
+    const size_t expected = sizeof(requests) / sizeof(requests[0]);
+
     POUND_CHECK_EQ_U64(stats.live_blocks, 0U);
-    POUND_CHECK_EQ_U64(stats.allocations, 7U);
-    POUND_CHECK_EQ_U64(stats.frees, 7U);
+    POUND_CHECK_EQ_U64(stats.allocations, (uint64_t)expected);
+    POUND_CHECK_EQ_U64(stats.frees, (uint64_t)expected);
 
     fixture_close(&fixture);
 }
@@ -602,7 +605,7 @@ POUND_TEST(jit_ballistic, a_session_of_allocations_never_loses_a_byte)
                               alignment);
 
             memset(metadata[i], (int)round, size);
-        }
+                    }
 
         // One executable block per round, released on the same round. The full cycle
         // matters: write while writable, make executable, patch, make writable again,
@@ -614,9 +617,10 @@ POUND_TEST(jit_ballistic, a_session_of_allocations_never_loses_a_byte)
 
         POUND_REQUIRE_MSG(NULL != code.rw_pointer, "round %zu: the executable block was refused", round);
 
-        memset(code.rw_pointer, 0x90, code_bytes);
+                memset(code.rw_pointer, 0x90, code_bytes);
         fixture.allocator.protect_rx((bal_allocator_handle_t)&fixture.cache, code, code_bytes);
 
+        
         POUND_CHECK_MSG(jit_cache_is_executable(&fixture.cache, code.rw_pointer),
                         "round %zu: the block is not executable after protect_rx",
                         round);
@@ -631,7 +635,7 @@ POUND_TEST(jit_ballistic, a_session_of_allocations_never_loses_a_byte)
         fixture.allocator.protect_rx((bal_allocator_handle_t)&fixture.cache, code, code_bytes);
         fixture.allocator.free_executable((bal_allocator_handle_t)&fixture.cache, code, code_bytes);
 
-        for (size_t i = 0U; i < 8U; ++i)
+                for (size_t i = 0U; i < 8U; ++i)
         {
             fixture.allocator.free((bal_allocator_handle_t)&fixture.cache, metadata[i], 1U);
         }
