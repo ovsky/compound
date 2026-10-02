@@ -36,6 +36,8 @@ pound_error_to_string(error_t error)
 
         case POUND_ERROR_NOT_INITIALIZED:
             return "POUND_ERROR_NOT_INITIALIZED";
+        case POUND_ERROR_BUSY:
+            return "POUND_ERROR_BUSY";
 
         case POUND_ERROR_ALLOCATION_FAILED:
             return "POUND_ERROR_ALLOCATION_FAILED";
@@ -57,6 +59,9 @@ pound_error_to_string(error_t error)
 
         case POUND_ERROR_MALFORMED_HEADER:
             return "POUND_ERROR_MALFORMED_HEADER";
+
+        case POUND_ERROR_NOT_FOUND:
+            return "POUND_ERROR_NOT_FOUND";
 
         case POUND_ERROR_IO:
             return "POUND_ERROR_IO";

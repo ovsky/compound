@@ -30,6 +30,18 @@ typedef enum
     /// A subsystem entry point was called before its initialiser.
     POUND_ERROR_NOT_INITIALIZED,
 
+    /// The object is in use by someone else and the operation is not safe to
+    /// interleave with them.
+    ///
+    /// Distinct from `POUND_ERROR_ALREADY_INITIALIZED`, which reports that a
+    /// subsystem was initialised twice. This reports a *transient* conflict with a
+    /// live user of the object, which resolves on its own: the JIT metadata table
+    /// refuses to invalidate a guest code range while the CPU thread holds a lease
+    /// on a block inside it, because the alternative is pulling the host code out
+    /// from under an instruction that is about to jump to it. Retrying is correct
+    /// here; retrying an `ALREADY_INITIALIZED` is not.
+    POUND_ERROR_BUSY,
+
     // Allocator Errors
 
     /// A host allocation failed, or a fixed-size pool ran out of arena space.
@@ -59,6 +71,14 @@ typedef enum
 
     /// A header field held a value outside its documented range.
     POUND_ERROR_MALFORMED_HEADER,
+
+    /// A named file was not present in the container it was looked for in.
+    ///
+    /// Distinct from `POUND_ERROR_MALFORMED_HEADER` because absent is not corrupt: the
+    /// loader probes for optional files that only some titles ship, and a miss there is
+    /// an ordinary result that must not be reported as a broken image. A lookup that
+    /// fails with this never logs, because it is a question rather than a failure.
+    POUND_ERROR_NOT_FOUND,
 
     // Filesystem Errors
 
