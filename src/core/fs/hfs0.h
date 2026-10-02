@@ -349,17 +349,61 @@ error_t hfs0_hash_metadata(const hfs0_t *POUND_RESTRICT hfs0, uint8_t out[SHA256
 /// modified" need different responses, so both hex forms are in the message.
 error_t hfs0_verify_metadata(const hfs0_t *POUND_RESTRICT hfs0, const uint8_t expected[SHA256_DIGEST_SIZE]);
 
-/// Returns a reader over entry `index`'s bytes, sharing the partition's underlying source.
+/// A reader over one entry's bytes, sharing the partition's underlying source.
 ///
 /// This is what lets a nested parser be handed an HFS0's entry without that entry being
 /// read into memory: an XCI's HFS0 holds NCAs that are tens of gigabytes, and the NCA
-/// parser wants a reader, not a buffer. The returned reader refers to the same bytes as
-/// the partition's and must not outlive it.
+/// parser wants a reader rather than a buffer.
 ///
-/// Returns `POUND_ERROR_INVALID_ARGUMENT` if an argument is NULL, and
-/// `POUND_ERROR_NOT_FOUND` if `index` does not name a file in this partition.
+/// ## Why the context is allocated and owned here rather than borrowed
+///
+/// `fs_reader_t` is a plain struct with no destructor, and a reader over a sub-range needs
+/// somewhere to remember the parent reader and the base offset. The obvious move -- point
+/// `context` at the parent partition and stash the offset somewhere -- does not work,
+/// because `fs_reader_t` has no field to put the offset in, and adding one would change
+/// the type every parser in the project depends on.
+///
+/// The alternative that does work is to hide the offset inside a closure, which means
+/// allocating. So the ownership is made explicit instead of implicit: the caller owns the
+/// `hfs0_slice_t`, must call `hfs0_slice_close`, and passes `&slice->reader` to the next
+/// parser. A slice opened and never closed leaks exactly one small block; one that is
+/// closed and then used is caught by the use-after-free that follows, rather than by a
+/// silent read from a recycled allocation returning plausible bytes.
+///
+/// The allocation is one block per nesting level, and the chain is at most four deep
+/// (XCI -> HFS0 -> NCA -> PFS0), so this is not a performance concern.
+typedef struct
+{
+    /// The reader to hand to the next parser. Treat every other field as owned by the
+    /// slice and read through this.
+    fs_reader_t reader;
+
+    /// The state `reader.context` points at, or NULL if the slice was never opened.
+    ///
+    /// Kept here so `hfs0_slice_close` has something to free that is not the caller's own
+    /// struct, and so a caller that memsets the slice cannot lose track of an allocation.
+    void *context;
+} hfs0_slice_t;
+
+/// Opens entry `index` as a reader over the partition's source, without reading it.
+///
+/// The returned reader's `size` is the entry's size and its offsets are relative to the
+/// entry's first byte, so a nested parser sees its file starting at zero.
+///
+/// Returns `POUND_ERROR_INVALID_ARGUMENT` if an argument is NULL, `POUND_ERROR_NOT_FOUND`
+/// if `index` does not name a file in this partition, and `POUND_ERROR_ALLOCATION_FAILED`
+/// if the slice's context could not be allocated.
+///
+/// On failure the slice is left closed, so `hfs0_slice_close` is safe to call on it
+/// whether or not this succeeded.
 error_t hfs0_entry_reader(const hfs0_t *POUND_RESTRICT hfs0, const uint32_t index,
-                          fs_reader_t *POUND_RESTRICT out);
+                          hfs0_slice_t *POUND_RESTRICT out);
+
+/// Releases the slice's context and returns it to the closed state.
+///
+/// Safe on a zeroed struct and safe to call twice. Does nothing to the bytes the reader
+/// referred to -- it never owned them.
+void hfs0_slice_close(hfs0_slice_t *POUND_RESTRICT slice);
 
 /// Logs a summary of the partition: how many files, how many bytes of data, how large the
 /// metadata region, and the first few file names.
