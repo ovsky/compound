@@ -1218,6 +1218,110 @@ POUND_TEST(slab_allocator, object_liveness_tracks_state)
     slab_allocator_destroy(&allocator);
 }
 
+POUND_TEST(slab_allocator, headers_never_overlap_payloads_at_any_alignment)
+{
+    // The stride/header-stride coupling is invisible at the default alignment and
+    // only breaks where the header stride rounds up past the stride. This sweeps
+    // the shapes where it can break and asserts the property that matters: filling
+    // every payload must leave every object recognisable, because if a header had
+    // been written under a payload, the fill would have destroyed it.
+    static const size_t alignments[] = {8U, 16U, 32U, 64U, 128U, 256U};
+    static const size_t sizes[]      = {24U, 32U, 48U, 64U, 96U, 128U, 256U};
+
+    slab_allocator_t allocator;
+    void            *objects[128];
+
+    for (size_t a = 0U; a < (sizeof(alignments) / sizeof(alignments[0])); ++a)
+    {
+        for (size_t s = 0U; s < (sizeof(sizes) / sizeof(sizes[0])); ++s)
+        {
+            const size_t alignment   = alignments[a];
+            const size_t object_size = sizes[s];
+
+            POUND_REQUIRE(POUND_SUCCESS
+                          == slab_allocator_init(&allocator, slab_arena, sizeof(slab_arena), NULL));
+
+            // A slab small enough that every case spans several slabs, so the
+            // geometry is checked across carves and not just within the first.
+            const slab_cache_id_t id = add_cache(&allocator, "swept", object_size, alignment, 4096U);
+
+            POUND_REQUIRE_MSG(id != SLAB_CACHE_ID_NONE,
+                              "cache_create refused object_size=%zu alignment=%zu",
+                              object_size,
+                              alignment);
+
+            size_t count = 0U;
+
+            for (size_t i = 0U; i < 128U; ++i)
+            {
+                objects[i] = slab_allocator_alloc(&allocator, id);
+
+                if (NULL == objects[i])
+                {
+                    break;
+                }
+
+                count++;
+
+                POUND_CHECK_MSG(0U == ((uintptr_t)objects[i] % alignment),
+                                "object %zu is not %zu-byte aligned (size %zu)",
+                                i,
+                                alignment,
+                                object_size);
+            }
+
+            POUND_REQUIRE(count > 0U);
+
+            // Fill every payload with a distinct pattern. A header underneath a
+            // payload is overwritten here, and nothing notices until the checks
+            // below.
+            for (size_t i = 0U; i < count; ++i)
+            {
+                memset(objects[i], (int)(0x20U + (i % 0xDFU)), object_size);
+            }
+
+            // Every object must still be intact: its header survived the fill, its
+            // size is unchanged, and its payload still holds what was written.
+            for (size_t i = 0U; i < count; ++i)
+            {
+                POUND_CHECK_MSG(slab_allocator_object_is_live(&allocator, objects[i]),
+                                "object %zu of %zu lost its header (object_size=%zu alignment=%zu)",
+                                i,
+                                count,
+                                object_size,
+                                alignment);
+                POUND_CHECK_MSG(bytes_are(objects[i], object_size, (uint8_t)(0x20U + (i % 0xDFU))),
+                                "object %zu of %zu was clobbered by a neighbour "
+                                "(object_size=%zu alignment=%zu)",
+                                i,
+                                count,
+                                object_size,
+                                alignment);
+                POUND_CHECK_MSG(slab_allocator_get_usable_size(&allocator, objects[i]) == object_size,
+                                "object %zu of %zu reports the wrong size "
+                                "(object_size=%zu alignment=%zu)",
+                                i,
+                                count,
+                                object_size,
+                                alignment);
+            }
+
+            // And every one of them must free cleanly.
+            for (size_t i = 0U; i < count; ++i)
+            {
+                slab_allocator_free(&allocator, objects[i]);
+            }
+
+            POUND_CHECK_MSG(read_stats(&allocator).in_use == 0U,
+                            "object_size=%zu alignment=%zu leaked objects",
+                            object_size,
+                            alignment);
+
+            slab_allocator_destroy(&allocator);
+        }
+    }
+}
+
 POUND_TEST_SUITE(slab_allocator,
                 POUND_TEST_CASE(slab_allocator, init_rejects_invalid_arguments),
                 POUND_TEST_CASE(slab_allocator, init_accepts_a_null_config_for_defaults),
@@ -1245,6 +1349,8 @@ POUND_TEST_SUITE(slab_allocator,
                 POUND_TEST_CASE(slab_allocator, stats_agree_with_the_observable_state),
                 POUND_TEST_CASE(slab_allocator, reset_clears_caches_slabs_and_the_cursor),
                 POUND_TEST_CASE(slab_allocator, destroy_warns_about_live_objects_and_clears_the_structure),
-                POUND_TEST_CASE(slab_allocator, object_liveness_tracks_state))
+                POUND_TEST_CASE(slab_allocator, object_liveness_tracks_state),
+                POUND_TEST_CASE(slab_allocator,
+                                headers_never_overlap_payloads_at_any_alignment))
 
 /*** end of file ***/
