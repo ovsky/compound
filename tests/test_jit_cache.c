@@ -32,6 +32,7 @@
 #include "jit/jit_cache.h"
 #include "log.h"
 #include "platform.h"
+#include <stdio.h>
 
 // -----------------------------------------------------------------------------
 // Fixtures and helpers
@@ -473,7 +474,6 @@ POUND_TEST(jit_cache, data_blocks_honour_every_legal_alignment)
 POUND_TEST(jit_cache, allocation_refuses_impossible_requests)
 {
     jit_cache_t cache;
-    int         scratch = 0;
 
     init_cache(&cache, JIT_TEST_CHUNK, JIT_TEST_CEILING);
     pound_test_log_reset();
@@ -499,25 +499,33 @@ POUND_TEST(jit_cache, allocation_refuses_impossible_requests)
     POUND_CHECK_PTR_NULL(jit_cache_alloc_aligned(&cache, JIT_CACHE_MAX_ALIGNMENT * 2U, 64U));
     POUND_CHECK(pound_test_log_contains("is outside"));
 
-    // A request whose rounded size overflows, which must be refused rather than
-    // wrapping to a small value and handing back a block that overlaps its neighbours.
-    POUND_CHECK_PTR_NULL(jit_cache_alloc(&cache, SIZE_MAX));
-
-    // Every refusal is a log record too, never a silent NULL.
-    POUND_CHECK_MSG(0U != pound_test_log_count_at(LOG_LEVEL_ERROR),
-                    "the refusals above produced no error records");
-
     // A NULL cache is refused on every allocating entry point.
     POUND_CHECK_PTR_NULL(jit_cache_alloc(NULL, 64U));
     POUND_CHECK_PTR_NULL(jit_cache_alloc_aligned(NULL, 64U, 64U));
     POUND_CHECK_PTR_NULL(jit_cache_alloc_executable(NULL, 64U));
     POUND_CHECK_PTR_NULL(jit_cache_alloc_executable_aligned(NULL, 64U, 64U));
 
-    // None of that may have created or consumed anything.
-    POUND_CHECK_EQ_U64(read_stats(&cache).alloc_failures, 0U);
-    check_accounting(&cache, "after every refused request");
+    // Every refusal is a log record too, never a silent NULL.
+    POUND_CHECK_MSG(0U != pound_test_log_count_at(LOG_LEVEL_ERROR),
+                    "the refusals above produced no error records");
 
-    (void)scratch;
+    // None of those was an *allocation* failure: each was rejected before the cache
+    // went looking for room, so none reserved, counted, or left a fragment behind.
+    POUND_CHECK_MSG(0U == read_stats(&cache).alloc_failures,
+                    "%zu malformed requests were counted as allocation failures",
+                    read_stats(&cache).alloc_failures);
+    check_accounting(&cache, "after every malformed request");
+
+    // A request whose rounded size overflows is a different case: it is well formed
+    // enough to reach the allocator, so it is counted, and it must be refused rather
+    // than wrapping to a small value and handing back a block that overlaps its
+    // neighbours.
+    pound_test_log_reset();
+    POUND_CHECK_PTR_NULL(jit_cache_alloc(&cache, SIZE_MAX));
+    POUND_CHECK(pound_test_log_contains("overflows"));
+    POUND_CHECK_EQ_U64(read_stats(&cache).alloc_failures, 1U);
+    check_accounting(&cache, "after an overflowing request");
+
     jit_cache_destroy(&cache);
 }
 
@@ -934,54 +942,68 @@ POUND_TEST(jit_cache, reclaim_returns_only_trailing_empty_chunks)
 {
     jit_cache_t cache;
     void       *anchor;
+    void       *filler;
     void       *first;
     void       *second;
 
     init_cache(&cache, JIT_TEST_CHUNK, JIT_TEST_CEILING);
 
-    // Chunk 0 gets a block big enough that a second one cannot fit alongside it, so
-    // the next request has to grow.
-    anchor = jit_cache_alloc(&cache, JIT_TEST_CHUNK - 4096U);
+    // The oldest chunk gets two blocks that together leave a tail, so it stays both
+    // live and useful -- the two properties this case is about.
+    anchor = jit_cache_alloc(&cache, 2048U);
     POUND_REQUIRE_PTR_NON_NULL(anchor);
 
-    first = jit_cache_alloc(&cache, 4096U);
+    filler = jit_cache_alloc(&cache, 200U * 1024U);
+    POUND_REQUIRE_PTR_NON_NULL(filler);
+    POUND_CHECK_EQ_U64(read_stats(&cache).chunk_count, 1U);
+
+    // The next request does not fit in what is left of that chunk, so the cache grows.
+    first = jit_cache_alloc(&cache, 100U * 1024U);
     POUND_REQUIRE_PTR_NON_NULL(first);
     POUND_CHECK_EQ_U64(read_stats(&cache).chunk_count, 2U);
 
-    // A second block in the newest chunk, so that chunk holds a live block and cannot
-    // be given back even once it is the only trailing one.
+    // And a small one lands in the new chunk, which now holds two live blocks.
     second = jit_cache_alloc(&cache, 4096U);
     POUND_REQUIRE_PTR_NON_NULL(second);
     POUND_CHECK_EQ_U64(read_stats(&cache).chunk_count, 2U);
 
-    // The newest chunk is not trailing-empty, so nothing is returned. This is a
-    // legitimate answer and not a failure.
+    // The newest chunk is not empty, so nothing goes back. This is a legitimate answer
+    // and not a failure: the two blocks in it are still in use.
     POUND_CHECK_EQ_U64(jit_cache_reclaim(&cache), 0U);
     POUND_CHECK_EQ_U64(read_stats(&cache).chunk_count, 2U);
+    POUND_CHECK_MSG(jit_cache_usable_size(&cache, first) > 0U, "reclaim discarded a live block");
 
-    // Empty it. Now it is trailing and fully free, so the whole chunk goes back.
+    // Empty the newest chunk. Now it is trailing and fully free, so the whole chunk
+    // goes back -- and reclaim stops at the chunk behind it, which still holds two
+    // live blocks.
     jit_cache_free(&cache, first);
     jit_cache_free(&cache, second);
     POUND_CHECK_EQ_U64(jit_cache_reclaim(&cache), JIT_TEST_CHUNK);
     POUND_CHECK_EQ_U64(read_stats(&cache).chunk_count, 1U);
+    POUND_CHECK_EQ_U64(read_stats(&cache).reserved_bytes, JIT_TEST_CHUNK);
 
-    // The chunk that still holds `anchor` is not trailing, so it stays even though it
-    // is nearly empty. Returning it would mean the next request could not use the
-    // space below it.
+    // The retained chunk still holds the two original blocks, so it is not trailing and
+    // stays even though it is nearly empty. Returning it would strand the space above
+    // them, which is the reason for keeping it.
     POUND_CHECK_EQ_U64(jit_cache_reclaim(&cache), 0U);
     POUND_CHECK_EQ_U64(read_stats(&cache).chunk_count, 1U);
+    POUND_CHECK_MSG(jit_cache_usable_size(&cache, anchor) > 0U, "reclaim discarded a live block");
+    POUND_CHECK_MSG(jit_cache_usable_size(&cache, filler) > 0U, "reclaim discarded a live block");
 
-    // And the space above `anchor` is still usable, which is the reason for keeping
-    // the chunk at all.
+    // And that space above them is still usable, from the retained chunk.
     void *const above = jit_cache_alloc(&cache, 4096U);
     POUND_REQUIRE_PTR_NON_NULL(above);
-    POUND_CHECK_EQ_U64(read_stats(&cache).chunk_count, 1U);
+    POUND_CHECK_MSG(1U == read_stats(&cache).chunk_count,
+                    "the retained chunk could not serve a request and the cache grew instead");
     check_accounting(&cache, "after a partial reclaim");
 
+    // With every block gone, both conditions hold and the last chunk goes too.
     jit_cache_free(&cache, above);
+    jit_cache_free(&cache, filler);
     jit_cache_free(&cache, anchor);
     POUND_CHECK_EQ_U64(jit_cache_reclaim(&cache), JIT_TEST_CHUNK);
     POUND_CHECK_EQ_U64(read_stats(&cache).chunk_count, 0U);
+    POUND_CHECK_EQ_U64(read_stats(&cache).reserved_bytes, 0U);
 
     jit_cache_destroy(&cache);
 }
@@ -1470,11 +1492,15 @@ POUND_TEST(jit_cache, the_ceiling_is_enforced_and_reported)
 {
     jit_cache_t cache;
 
-    // Room for exactly two chunks, and nothing more.
+    // Room for exactly two chunks, and nothing more. The blocks are sized to leave a
+    // tail in each chunk, so the "space is still usable" half of this case is a real
+    // check rather than an accident of a full chunk.
+    const size_t block_bytes = 200U * 1024U;
+
     init_cache(&cache, JIT_TEST_CHUNK, JIT_TEST_CHUNK * 2U);
 
-    void *const first  = jit_cache_alloc(&cache, JIT_TEST_CHUNK);
-    void *const second = jit_cache_alloc(&cache, JIT_TEST_CHUNK);
+    void *const first  = jit_cache_alloc(&cache, block_bytes);
+    void *const second = jit_cache_alloc(&cache, block_bytes);
 
     POUND_REQUIRE_PTR_NON_NULL(first);
     POUND_REQUIRE_PTR_NON_NULL(second);
@@ -1489,7 +1515,7 @@ POUND_TEST(jit_cache, the_ceiling_is_enforced_and_reported)
     // than no ceiling, because the caller that set it is bounding the emulator's
     // footprint.
     pound_test_log_reset();
-    POUND_CHECK_PTR_NULL(jit_cache_alloc(&cache, JIT_TEST_CHUNK));
+    POUND_CHECK_PTR_NULL(jit_cache_alloc(&cache, block_bytes));
     POUND_CHECK(pound_test_log_contains("ceiling are already committed"));
 
     const jit_cache_stats_t after = read_stats(&cache);
@@ -1499,8 +1525,8 @@ POUND_TEST(jit_cache, the_ceiling_is_enforced_and_reported)
     POUND_CHECK_EQ_U64(after.chunk_count, 2U);
     POUND_CHECK_EQ_U64(after.reserved_bytes, JIT_TEST_CHUNK * 2U);
 
-    // And the space that is left in those two chunks is still usable, so the ceiling
-    // caps the footprint rather than the usefulness.
+    // And the tails in those two chunks are still usable, so the ceiling caps the
+    // footprint rather than the usefulness.
     void *const small = jit_cache_alloc(&cache, 1024U);
     POUND_REQUIRE_PTR_NON_NULL(small);
     POUND_CHECK_EQ_U64(read_stats(&cache).chunk_count, 2U);
@@ -1508,7 +1534,7 @@ POUND_TEST(jit_cache, the_ceiling_is_enforced_and_reported)
     // Releasing room lets the next growth through again.
     jit_cache_free(&cache, small);
     jit_cache_free(&cache, first);
-    POUND_CHECK_PTR_NON_NULL(jit_cache_alloc(&cache, JIT_TEST_CHUNK));
+    POUND_REQUIRE_PTR_NON_NULL(jit_cache_alloc(&cache, block_bytes));
     POUND_CHECK_EQ_U64(read_stats(&cache).chunk_count, 2U);
 
     check_accounting(&cache, "against the ceiling");
@@ -1846,37 +1872,49 @@ POUND_TEST(jit_cache, destroy_is_safe_with_live_blocks_and_closes_the_cache)
     POUND_CHECK(pound_test_log_contains("cache context is NULL"));
 }
 
-POUND_TEST(jit_cache, destroy_returns_every_byte_to_the_system)
+POUND_TEST(jit_cache, destroy_returns_every_chunk_to_the_system)
 {
     jit_cache_t cache;
+    void       *blocks[5];
 
     init_cache(&cache, JIT_TEST_CHUNK, JIT_TEST_CEILING);
 
-    void *blocks[4];
-
-    for (size_t i = 0U; i < 4U; ++i)
+    // Four of these fill a chunk exactly, so the fifth forces a second one. That makes
+    // the byte count below exact rather than dependent on how the chunk is carved.
+    for (size_t i = 0U; i < 5U; ++i)
     {
         blocks[i] = jit_cache_alloc(&cache, 64U * 1024U);
-        POUND_REQUIRE_PTR_NON_NULL(blocks[i]);
+        POUND_REQUIRE_MSG(NULL != blocks[i], "block %zu was refused", i);
     }
 
     const jit_cache_stats_t stats = read_stats(&cache);
 
-    POUND_CHECK_MSG(stats.chunk_count >= 4U, "expected at least 4 chunks, got %zu", stats.chunk_count);
+    POUND_CHECK_MSG(2U == stats.chunk_count, "expected 2 chunks, got %zu", stats.chunk_count);
 
-    // Releasing every block, then destroying with nothing live: the log line reports
-    // what went back, so the accounting is checkable from outside the module.
-    for (size_t i = 0U; i < 4U; ++i)
+    for (size_t i = 0U; i < 5U; ++i)
     {
         jit_cache_free(&cache, blocks[i]);
     }
 
+    // With nothing live, the teardown is clean and reports what it handed back, so the
+    // accounting is checkable from outside the module. The count is the interesting
+    // part: a chunk that leaked, or a report that overstated what was released, would
+    // both show up here.
+    char expected[64];
+
+    (void)snprintf(expected,
+                   sizeof(expected),
+                   "returning %zu bytes to the OS",
+                   (size_t)stats.chunk_count * JIT_TEST_CHUNK);
+
     pound_test_log_reset();
     jit_cache_destroy(&cache);
 
-    POUND_CHECK(pound_test_log_contains("returning"));
+    POUND_CHECK_MSG(pound_test_log_contains(expected), "the teardown did not report \"%s\"", expected);
     POUND_CHECK_MSG(0U == pound_test_log_count_at(LOG_LEVEL_WARN),
                     "a clean teardown logged a warning");
+    POUND_CHECK_MSG(0U == pound_test_log_count_at(LOG_LEVEL_ERROR),
+                    "a clean teardown logged an error");
 }
 
 POUND_TEST_SUITE(jit_cache,
@@ -1918,6 +1956,6 @@ POUND_TEST_SUITE(jit_cache,
                 POUND_TEST_CASE(jit_cache, reset_clears_the_cache_and_keeps_its_configuration),
                 POUND_TEST_CASE(jit_cache, reset_rejects_a_null_or_uninitialised_cache),
                 POUND_TEST_CASE(jit_cache, destroy_is_safe_with_live_blocks_and_closes_the_cache),
-                POUND_TEST_CASE(jit_cache, destroy_returns_every_byte_to_the_system))
+                POUND_TEST_CASE(jit_cache, destroy_returns_every_chunk_to_the_system))
 
 /*** end of file ***/
