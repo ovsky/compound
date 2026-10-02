@@ -334,6 +334,7 @@ add_library(PoundCore OBJECT
         src/core/memory/guest_memory.c
         src/core/memory/pool_allocator.c
         src/core/memory/slab_allocator.c
+        src/core/jit/jit_cache.c
         src/core/sync/mutex.c
         src/core/guest_state.c
         src/core/log.c
@@ -410,14 +411,24 @@ add_sanitizers(PoundGui)
 
 message(STATUS "[Pound] Configuring Pound Emulator...")
 
+# `jit_ballistic.c` is the only translation unit that includes the engine's headers,
+# so it is added only where the engine is actually linked. The code cache it binds
+# lives in PoundCore and is built everywhere, which is what lets the Android and
+# aarch64 lanes test the W^X allocator even with no ARM64 prebuild present.
+set(POUND_EMULATOR_SOURCES src/main.c)
+
+if (POUND_ENABLE_BALLISTIC)
+    list(APPEND POUND_EMULATOR_SOURCES src/core/jit/jit_ballistic.c)
+endif ()
+
 if (POUND_TARGET_IS_ANDROID)
     # SDL's Android entry point is not a process entry point. SDLActivity
     # dlopen()s libmain.so and calls the exported SDL_main() through JNI, and
     # src/main.c obtains that symbol by including <SDL3/SDL_main.h>.
-    add_library(${PROJECT_NAME} SHARED src/main.c)
+    add_library(${PROJECT_NAME} SHARED ${POUND_EMULATOR_SOURCES})
     set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "main")
 else ()
-    add_executable(${PROJECT_NAME} src/main.c)
+    add_executable(${PROJECT_NAME} ${POUND_EMULATOR_SOURCES})
 endif ()
 
 target_include_directories(${PROJECT_NAME} PRIVATE src/)
