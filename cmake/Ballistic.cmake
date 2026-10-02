@@ -181,6 +181,12 @@ if (POUND_ENABLE_BALLISTIC)
 
     target_link_libraries(Ballistic::Engine INTERFACE Ballistic::LuaJIT)
 
+    # The public headers travel with the prebuilt, and nothing else in the tree
+    # would put them on a consumer's include path. Propagating them here means
+    # `src/core/jit/jit_ballistic.c` compiles as part of any target that links the
+    # engine, with no per-target include juggling.
+    target_include_directories(Ballistic::Engine INTERFACE "${PROJECT_SOURCE_DIR}/extern/ballistic/include")
+
     ballistic_verify_imported_path(Ballistic::Engine IMPORTED_LOCATION)
     ballistic_verify_imported_path(Ballistic::LuaJIT IMPORTED_LOCATION)
 
