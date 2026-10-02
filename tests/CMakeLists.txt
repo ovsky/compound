@@ -25,6 +25,7 @@ set(POUND_TEST_SUITES
         pool_allocator
         mutex
         slab_allocator
+        jit_cache
         )
 
 set(POUND_TEST_SOURCES
@@ -36,7 +37,27 @@ set(POUND_TEST_SOURCES
         test_memory.c
         test_pool_allocator.c
         test_slab_allocator.c
+        test_jit_cache.c
         )
+
+# The Ballistic bridge is the only thing under test that needs the engine's headers,
+# and those headers are the only reason the bridge cannot be compiled where the engine
+# has no prebuild. It is compiled here, against the same source the emulator uses, so
+# a change to the `bal_allocator_t` layout or a callback signature is caught by a build
+# rather than by a runtime crash.
+#
+# The prebuilt library itself is deliberately not linked: nothing in the bridge calls
+# into the engine, only fills in a callback table, so linking it would add the
+# platform-specific artefact and its LuaJIT runtime to the test binary for no coverage.
+# The include directory is taken straight from the tree rather than from the imported
+# target, because that target's INTERFACE include only reaches a target that links it.
+if (POUND_ENABLE_BALLISTIC)
+    list(APPEND POUND_TEST_SOURCES
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src/core/jit/jit_ballistic.c
+            test_jit_ballistic.c
+            )
+    list(APPEND POUND_TEST_SUITES jit_ballistic)
+endif ()
 
 add_executable(PoundTests ${POUND_TEST_SOURCES})
 
@@ -49,6 +70,10 @@ target_include_directories(PoundTests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/core/memory
 )
+
+if (POUND_ENABLE_BALLISTIC)
+    target_include_directories(PoundTests PRIVATE ${PROJECT_SOURCE_DIR}/extern/ballistic/include)
+endif ()
 
 # The allocator is named explicitly rather than inherited. `PoundCore` is an
 # OBJECT library and therefore has no link step of its own, so its PRIVATE

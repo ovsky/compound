@@ -19,6 +19,15 @@ void pound_register_memory_tests(void);
 void pound_register_pool_allocator_tests(void);
 void pound_register_mutex_tests(void);
 void pound_register_slab_allocator_tests(void);
+void pound_register_jit_cache_tests(void);
+
+// Registered only by `tests/CMakeLists.txt` when the Ballistic engine is linked, and
+// therefore only defined there. The weak declaration is what lets one `main` serve
+// every configuration: a strong one here would be a duplicate symbol, and an
+// unconditional call would be an unresolved one on a lane with no prebuild.
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak)) void pound_register_jit_ballistic_tests(void);
+#endif
 
 static void
 print_usage(const char *argv0)
@@ -58,6 +67,14 @@ main(int argc, char **argv)
     pound_register_pool_allocator_tests();
     pound_register_mutex_tests();
     pound_register_slab_allocator_tests();
+    pound_register_jit_cache_tests();
+
+    // Absent on a lane with no Ballistic prebuild, in which case there is nothing to
+    // register and the suites above already cover the code cache underneath it.
+    if (NULL != pound_register_jit_ballistic_tests)
+    {
+        pound_register_jit_ballistic_tests();
+    }
 
     const char *filter      = (argc == 2) ? argv[1] : NULL;
     const int   exit_status = pound_test_run_all(filter);

@@ -157,6 +157,22 @@ ranges_overlap(const void *a, const size_t a_size, const void *b, const size_t b
     return (a_begin < (b_begin + b_size)) && (b_begin < (a_begin + a_size));
 }
 
+/// Returns a cache that has never been initialised.
+///
+/// Zeroed rather than left indeterminate, because "never initialised" is precisely the
+/// state a caller is in after a failed or skipped `jit_cache_init`: the field the API
+/// tests is `initialised`, and a zeroed struct is what that situation really looks
+/// like. Handing it indeterminate bytes would be testing the compiler's idea of an
+/// untouched local, not the refusal.
+static jit_cache_t
+unopened_cache(void)
+{
+    jit_cache_t cache;
+
+    memset(&cache, 0, sizeof(cache));
+    return cache;
+}
+
 // -----------------------------------------------------------------------------
 // A function that emits real host machine code
 // -----------------------------------------------------------------------------
@@ -1010,7 +1026,7 @@ POUND_TEST(jit_cache, reclaim_returns_only_trailing_empty_chunks)
 
 POUND_TEST(jit_cache, reclaim_rejects_a_null_or_uninitialised_cache)
 {
-    jit_cache_t cache;
+    jit_cache_t cache = unopened_cache();
 
     pound_test_log_reset();
     POUND_CHECK_EQ_U64(jit_cache_reclaim(NULL), 0U);
@@ -1026,10 +1042,10 @@ POUND_TEST(jit_cache, reclaim_rejects_a_null_or_uninitialised_cache)
 
 POUND_TEST(jit_cache, executable_blocks_own_whole_pages)
 {
-    jit_cache_t        cache;
-    const jit_cache_resolved_t resolved;
-    void               *blocks[8];
-    const size_t       page;
+    jit_cache_t          cache;
+    jit_cache_resolved_t resolved;
+    void                *blocks[8];
+    size_t               page;
 
     init_cache(&cache, JIT_TEST_CHUNK, JIT_TEST_CEILING);
 
@@ -1754,7 +1770,7 @@ POUND_TEST(jit_cache, statistics_track_the_cache)
 
 POUND_TEST(jit_cache, statistics_reject_null_arguments_and_an_uninitialised_cache)
 {
-    jit_cache_t       cache;
+    jit_cache_t       cache = unopened_cache();
     jit_cache_stats_t stats;
 
     pound_test_log_reset();
@@ -1824,7 +1840,7 @@ POUND_TEST(jit_cache, reset_clears_the_cache_and_keeps_its_configuration)
 
 POUND_TEST(jit_cache, reset_rejects_a_null_or_uninitialised_cache)
 {
-    jit_cache_t cache;
+    jit_cache_t cache = unopened_cache();
 
     pound_test_log_reset();
     jit_cache_reset(NULL);
