@@ -548,7 +548,7 @@ pfs0_open(pfs0_t *POUND_RESTRICT pfs0, const fs_reader_t *POUND_RESTRICT reader)
     // `fs_reader_copy` rather than a struct assignment: a buffer-backed reader points its
     // own `context` at itself, so a plain copy would leave `pfs0->reader` addressing the
     // caller's `reader`, and every later read would dereference a stack frame that has
-    // already returned.
+    // already returned. See the note in `fs_reader.h`.
     fs_reader_copy(&pfs0->reader, reader);
 
     return POUND_SUCCESS;
