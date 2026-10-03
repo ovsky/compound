@@ -207,6 +207,147 @@ POUND_TEST(fs_reader, a_read_with_no_destination_is_rejected)
     POUND_CHECK(POUND_ERROR_INVALID_ARGUMENT == fs_reader_read_at(NULL, 0U, source, 4U));
 }
 
+/// A reader built over a buffer whose fill pattern is `seed`, returned by value.
+///
+/// Every case below needs a reader that outlives the frame that made it, which is the
+/// whole subject. Reading the buffer directly rather than closing over it is what makes
+/// the frame's return observable: the caller's `fs_reader_t` is a local, and after this
+/// returns that stack slot is free.
+static fs_reader_t
+make_scoped_reader(uint8_t *POUND_RESTRICT source, const size_t size, const uint8_t seed)
+{
+    for (size_t i = 0U; i < size; ++i)
+    {
+        source[i] = (uint8_t)(seed + (uint8_t)i);
+    }
+
+    fs_reader_t reader;
+
+    fs_reader_from_buffer(&reader, source, size);
+
+    return reader;
+}
+
+POUND_TEST(fs_reader, a_copied_reader_keeps_reading_the_same_bytes)
+{
+    uint8_t     source[64];
+    fs_reader_t original = make_scoped_reader(source, sizeof(source), 0x11U);
+
+    // A buffer-backed reader points `context` at itself, so this assignment is what the
+    // plain struct copy in a parser's `open` used to be. It leaves `copy.context`
+    // addressing `original` -- and `original` is a local in the previous statement, dead
+    // the moment this block ends.
+    fs_reader_t copy;
+
+    POUND_REQUIRE(POUND_SUCCESS == fs_reader_read_at(&original, 0U, source, sizeof(source)));
+
+    fs_reader_copy(&copy, &original);
+
+    POUND_CHECK(copy.read_at != NULL);
+    POUND_CHECK(copy.size == original.size);
+    POUND_CHECK_PTR_EQ(copy.context, &copy);
+    POUND_CHECK_PTR_EQ(copy.buffer_data, original.buffer_data);
+
+    uint8_t read_back[64];
+
+    POUND_REQUIRE(POUND_SUCCESS == fs_reader_read_at(&copy, 0U, read_back, sizeof(read_back)));
+    POUND_CHECK(0 == memcmp(read_back, source, sizeof(source)));
+
+    // And at an offset, so the copy is checked against more than the base case.
+    POUND_REQUIRE(POUND_SUCCESS == fs_reader_read_at(&copy, 33U, read_back, 16U));
+    POUND_CHECK(0 == memcmp(read_back, &source[33], 16U));
+
+    // A read that the *original* could not do is still refused, so the copy has not lost
+    // the size check along with the self-reference.
+    POUND_CHECK(POUND_ERROR_IO == fs_reader_read_at(&copy, sizeof(source), read_back, 1U));
+}
+
+POUND_TEST(fs_reader, a_copied_reader_survives_the_frame_it_was_made_in)
+{
+    // This is the case that matters, and the reason the copy has to rebind rather than
+    // merely duplicate. `scoped` is a local in `make_scoped_reader`; its stack slot is
+    // reused by the loop below before the first read through the copy, so a copy whose
+    // context still pointed at it would read whatever the loop left there.
+    //
+    // The bytes are on the caller's stack, which is exactly the shape of the bug: a
+    // partition holds its reader by value, and the reader it was opened from is almost
+    // always a local.
+    uint8_t     source[128];
+    fs_reader_t scoped = make_scoped_reader(source, sizeof(source), 0x80U);
+
+    fs_reader_t copy;
+
+    fs_reader_copy(&copy, &scoped);
+
+    // Clobber the frame the original lived in, with a pattern chosen not to match.
+    uint8_t clobber[128];
+
+    for (size_t i = 0U; i < sizeof(clobber); ++i)
+    {
+        clobber[i] = 0xEEU;
+    }
+
+    uint8_t read_back[128];
+
+    POUND_REQUIRE(POUND_SUCCESS == fs_reader_read_at(&copy, 0U, read_back, sizeof(read_back)));
+    POUND_CHECK_MSG(0 != memcmp(read_back, clobber, sizeof(clobber)),
+                    "The copy returned the clobber pattern, which means it read through the "
+                    "dead frame rather than its own fields.");
+    POUND_CHECK(0 == memcmp(read_back, source, sizeof(source)));
+}
+
+POUND_TEST(fs_reader, a_copied_reader_keeps_a_context_that_is_not_itself)
+{
+    // The other half of the rule: only a self-reference is rebound. A reader whose
+    // context is a real allocation keeps it, because copying the pointer is the correct
+    // behaviour -- rebinding would make the copy's read function look for its state in a
+    // struct that does not hold it.
+    uint8_t source[16];
+
+    for (size_t i = 0U; i < sizeof(source); ++i)
+    {
+        source[i] = (uint8_t)i;
+    }
+
+    uint8_t state = 0x5AU;
+
+    fs_reader_t reader;
+
+    fs_reader_from_buffer(&reader, source, sizeof(source));
+    reader.context = &state;
+
+    fs_reader_t copy;
+
+    fs_reader_copy(&copy, &reader);
+
+    POUND_CHECK_PTR_EQ(copy.context, &state);
+    POUND_CHECK(copy.read_at == reader.read_at);
+}
+
+POUND_TEST(fs_reader, copying_from_nothing_leaves_a_reader_that_refuses_everything)
+{
+    fs_reader_t copy;
+
+    // Seeded from a real reader first, so a `copy` that merely kept whatever it already
+    // held would pass a check on a zeroed struct.
+    uint8_t     source[8];
+    fs_reader_t original = make_scoped_reader(source, sizeof(source), 0x40U);
+
+    fs_reader_copy(&copy, &original);
+    POUND_REQUIRE_PTR_NON_NULL(copy.read_at);
+
+    fs_reader_copy(&copy, NULL);
+
+    POUND_CHECK_PTR_NULL(copy.read_at);
+    POUND_CHECK_PTR_NULL(copy.buffer_data);
+    POUND_CHECK_EQ_U64(copy.size, 0U);
+
+    // A NULL destination is refused rather than written through, and says so.
+    pound_test_log_reset();
+    fs_reader_copy(NULL, &original);
+    POUND_CHECK(pound_test_log_count_at(LOG_LEVEL_ERROR) > 0U);
+}
+
 // ===================================================================================
 // keys
 // ===================================================================================
@@ -1901,7 +2042,11 @@ POUND_TEST_SUITE(fs_reader,
                 POUND_TEST_CASE(fs_reader, a_zero_length_read_at_the_end_of_the_source_succeeds),
                 POUND_TEST_CASE(fs_reader, a_reader_with_no_read_function_refuses_every_read),
                 POUND_TEST_CASE(fs_reader, a_rejected_buffer_leaves_a_reader_that_cannot_read),
-                POUND_TEST_CASE(fs_reader, a_read_with_no_destination_is_rejected))
+                POUND_TEST_CASE(fs_reader, a_read_with_no_destination_is_rejected),
+                POUND_TEST_CASE(fs_reader, a_copied_reader_keeps_reading_the_same_bytes),
+                POUND_TEST_CASE(fs_reader, a_copied_reader_survives_the_frame_it_was_made_in),
+                POUND_TEST_CASE(fs_reader, a_copied_reader_keeps_a_context_that_is_not_itself),
+                POUND_TEST_CASE(fs_reader, copying_from_nothing_leaves_a_reader_that_refuses_everything))
 
 POUND_TEST_SUITE(keys,
                 POUND_TEST_CASE(keys, a_key_file_loads_and_every_entry_can_be_read_back),

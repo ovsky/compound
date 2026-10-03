@@ -189,4 +189,28 @@ fs_reader_read_at(const fs_reader_t *POUND_RESTRICT reader, const uint64_t offse
     return reader->read_at(reader->context, offset, destination, size);
 }
 
+void
+fs_reader_copy(fs_reader_t *POUND_RESTRICT copy, const fs_reader_t *POUND_RESTRICT source)
+{
+    if (POUND_UNLIKELY(NULL == copy))
+    {
+        POUND_LOG_ERROR(&thread_logger, "Ignoring call: the destination reader is NULL.");
+        return;
+    }
+
+    if (POUND_UNLIKELY(NULL == source))
+    {
+        POUND_LOG_ERROR(&thread_logger, "Aborting function: the source reader is NULL.");
+        memset(copy, 0, sizeof(*copy));
+        return;
+    }
+
+    *copy = *source;
+
+    if (copy->context == (const void *)source)
+    {
+        copy->context = copy;
+    }
+}
+
 /*** end of file ***/

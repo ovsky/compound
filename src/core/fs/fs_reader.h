@@ -142,6 +142,7 @@ bool fs_reader_range_is_valid(const fs_reader_t *POUND_RESTRICT reader, const ui
 /// Logs and does nothing on a NULL `copy`. A NULL `source` leaves `copy` zeroed, which
 /// refuses every read rather than leaving a previous reader's bytes reachable.
 void fs_reader_copy(fs_reader_t *POUND_RESTRICT copy, const fs_reader_t *POUND_RESTRICT source);
+void fs_reader_copy(fs_reader_t *POUND_RESTRICT copy, const fs_reader_t *POUND_RESTRICT source);
 
 #endif // POUND_FS_FS_READER_H
 

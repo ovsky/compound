@@ -126,9 +126,9 @@ typedef struct
 /// Reads through a slice, rebasing the caller's offset onto the entry.
 ///
 /// Three checks in order, and the order matters: the range is validated against the
-/// entry's own length first, so a caller asking for past its end gets an answer about
-/// the entry rather than about the partition; the rebasing is proved not to wrap before
-/// the addition; and only then is the parent asked for the bytes.
+/// entry's own length first, so a caller asking for past its end gets an answer about the
+/// entry rather than about the partition; the rebasing is proved not to wrap before the
+/// addition; and only then is the parent asked for the bytes.
 ///
 /// The wrap check is on `offset` rather than on `offset + size`. An offset near the top of
 /// the address space rebased onto an entry based a few hundred bytes in wraps to a small
