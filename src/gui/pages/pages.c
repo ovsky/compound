@@ -317,12 +317,12 @@ static const struct
     /// that the build will not accept as implicit padding.
     char pad[4];
 } POUND_PAGE_LOG_LEVELS[] = {
-    { "Trace", LOG_LEVEL_TRACE },
-    { "Debug", LOG_LEVEL_DEBUG },
-    { "Info", LOG_LEVEL_INFO },
-    { "Warn", LOG_LEVEL_WARN },
-    { "Error", LOG_LEVEL_ERROR },
-    { "None", LOG_LEVEL_NONE },
+    { "Trace", LOG_LEVEL_TRACE, { 0 } },
+    { "Debug", LOG_LEVEL_DEBUG, { 0 } },
+    { "Info", LOG_LEVEL_INFO, { 0 } },
+    { "Warn", LOG_LEVEL_WARN, { 0 } },
+    { "Error", LOG_LEVEL_ERROR, { 0 } },
+    { "None", LOG_LEVEL_NONE, { 0 } },
 };
 
 #define POUND_PAGE_LOG_LEVEL_COUNT (sizeof(POUND_PAGE_LOG_LEVELS) / sizeof(POUND_PAGE_LOG_LEVELS[0]))
