@@ -109,6 +109,40 @@ error_t fs_reader_read_at(const fs_reader_t *POUND_RESTRICT reader, const uint64
 /// failed rather than once per rejected range.
 bool fs_reader_range_is_valid(const fs_reader_t *POUND_RESTRICT reader, const uint64_t offset, const size_t size);
 
+/// Copies `source` into `copy` such that `copy` remains usable after `source` is gone.
+///
+/// ## Why a struct assignment is not enough
+///
+/// A reader built by `fs_reader_from_buffer` points its own `context` at itself: the read
+/// function needs the reader to find `buffer_data` and `buffer_size`, and passing the
+/// reader as the context is how it gets them without an allocation. So
+///
+/// ```c
+/// copy = *source;
+/// ```
+///
+/// leaves `copy.context` addressing **`source`**. Every read through `copy` then
+/// dereferences the original. When `source` was a local in the caller's frame, that is a
+/// use-after-free the moment the call returns -- and it does not fail loudly. The stack
+/// slot usually still holds the reader, so reads succeed and return the right bytes right
+/// up until the frame is reused, at which point a partition starts returning whatever else
+/// has since been written there.
+///
+/// This is the only correct form of "copy a reader", so it exists here rather than being
+/// open-coded at each parser: a parser that stores a reader has to call this, and the
+/// comment above is what tells the next one.
+///
+/// ## What it deliberately does not touch
+///
+/// Only a `context` that points at `source` is rebound. A reader whose `context` is a
+/// real allocation or a file handle keeps it: that memory is owned by whoever made it and
+/// copying the pointer is correct. Detecting the difference is exactly the self-reference
+/// test, so there is nothing else to decide.
+///
+/// Logs and does nothing on a NULL `copy`. A NULL `source` leaves `copy` zeroed, which
+/// refuses every read rather than leaving a previous reader's bytes reachable.
+void fs_reader_copy(fs_reader_t *POUND_RESTRICT copy, const fs_reader_t *POUND_RESTRICT source);
+
 #endif // POUND_FS_FS_READER_H
 
 /*** end of file ***/
