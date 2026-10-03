@@ -19,7 +19,7 @@
 
 **🌟 Open-Source and the World's First Nintendo Switch 2 Emulator**
 
-*It is the Nintendo Switch 1 Emulator too.*
+It is the Nintendo Switch 1 Emulator too!
 
 **Ultra-high-fidelity system emulation. Highly experimental, but steadily growing.**
 
@@ -34,7 +34,7 @@
 
 ## 🎬 Preview
 
-<details>
+<details open>
 <summary><b>📸 Screenshots & Gameplay</b></summary>
 
 > Click to expand and view the latest emulation screenshots
