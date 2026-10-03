@@ -109,6 +109,8 @@ error_t fs_reader_read_at(const fs_reader_t *POUND_RESTRICT reader, const uint64
 /// failed rather than once per rejected range.
 bool fs_reader_range_is_valid(const fs_reader_t *POUND_RESTRICT reader, const uint64_t offset, const size_t size);
 
+void fs_reader_copy(fs_reader_t *POUND_RESTRICT copy, const fs_reader_t *POUND_RESTRICT source);
+
 #endif // POUND_FS_FS_READER_H
 
 /*** end of file ***/

@@ -544,7 +544,12 @@ pfs0_open(pfs0_t *POUND_RESTRICT pfs0, const fs_reader_t *POUND_RESTRICT reader)
 
     // Published last, once every entry is known good. A caller cannot observe a
     // half-built table.
-    pfs0->reader = *reader;
+    //
+    // `fs_reader_copy` rather than a struct assignment: a buffer-backed reader points its
+    // own `context` at itself, so a plain copy would leave `pfs0->reader` addressing the
+    // caller's `reader`, and every later read would dereference a stack frame that has
+    // already returned.
+    fs_reader_copy(&pfs0->reader, reader);
 
     return POUND_SUCCESS;
 }

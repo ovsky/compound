@@ -30,6 +30,7 @@ set(POUND_TEST_SUITES
         fs_reader
         keys
         pfs0
+        hfs0
         metadata
         )
 
@@ -45,6 +46,7 @@ set(POUND_TEST_SOURCES
         test_jit_cache.c
         test_sha256.c
         test_fs.c
+        test_hfs0.c
         test_jit_metadata.c
         )
 

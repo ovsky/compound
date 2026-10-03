@@ -340,6 +340,8 @@ add_library(PoundCore OBJECT
         src/core/fs/fs_reader.c
         src/core/fs/keys.c
         src/core/fs/pfs0.c
+        src/core/fs/hfs0.c
+        src/core/config/config.c
         src/core/sync/mutex.c
         src/core/sync/thread.c
         src/core/guest_state.c
@@ -360,6 +362,7 @@ if (POUND_LINK_GUI_STATICALLY)
             src/gui/gui.c
             src/gui/gui_hot_reload.c
             src/gui/gui_layout.c
+            src/gui/theme/theme.c
             src/gui/debug/debug_memory_data.c
             src/gui/debug/debug_memory_render.c
     )
@@ -371,6 +374,7 @@ else ()
             src/gui/gui.c
             src/gui/gui_hot_reload.c
             src/gui/gui_layout.c
+            src/gui/theme/theme.c
             src/gui/debug/debug_memory_data.c
             src/gui/debug/debug_memory_render.c
     )
