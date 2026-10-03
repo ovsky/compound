@@ -342,6 +342,7 @@ add_library(PoundCore OBJECT
         src/core/fs/pfs0.c
         src/core/fs/hfs0.c
         src/core/config/config.c
+        src/core/log_ring.c
         src/core/sync/mutex.c
         src/core/sync/thread.c
         src/core/guest_state.c
@@ -363,6 +364,14 @@ if (POUND_LINK_GUI_STATICALLY)
             src/gui/gui_hot_reload.c
             src/gui/gui_layout.c
             src/gui/theme/theme.c
+            src/gui/theme/theme_imgui.c
+            src/gui/theme/fonts.c
+            src/gui/pages/pages.c
+            src/gui/pages/page_library.c
+            src/gui/pages/page_memory.c
+            src/gui/pages/page_logs.c
+            src/gui/pages/page_settings.c
+            src/gui/pages/page_about.c
             src/gui/debug/debug_memory_data.c
             src/gui/debug/debug_memory_render.c
     )
@@ -375,6 +384,14 @@ else ()
             src/gui/gui_hot_reload.c
             src/gui/gui_layout.c
             src/gui/theme/theme.c
+            src/gui/theme/theme_imgui.c
+            src/gui/theme/fonts.c
+            src/gui/pages/pages.c
+            src/gui/pages/page_library.c
+            src/gui/pages/page_memory.c
+            src/gui/pages/page_logs.c
+            src/gui/pages/page_settings.c
+            src/gui/pages/page_about.c
             src/gui/debug/debug_memory_data.c
             src/gui/debug/debug_memory_render.c
     )
@@ -389,6 +406,11 @@ else ()
 endif ()
 
 target_include_directories(PoundGui PUBLIC src/gui src/core)
+
+# The version string the About page shows. Taken from `project(... VERSION ...)` at
+# the top of this file so the number a user reads out of a bug report and the number
+# a package is labelled with are the same number by construction.
+target_compile_definitions(PoundGui PRIVATE POUND_VERSION="${PROJECT_VERSION}")
 
 # `PoundGui` calls into core -- `thread_logger`, `pound_log_message`,
 # `memory_subsystem_get_memory_used_by_bucket`, `safe_math_error_string` -- so it
@@ -409,7 +431,7 @@ target_include_directories(PoundGui PUBLIC src/gui src/core)
 # Windows loads PoundGui before the EXE finishes its own imports. Listing
 # mimalloc ahead of imgui keeps mimalloc-redirect ahead of ucrt in PoundGui's
 # import table.
-target_link_libraries(PoundGui PRIVATE ${POUND_MIMALLOC_TARGET} imgui PoundCore)
+target_link_libraries(PoundGui PRIVATE ${POUND_MIMALLOC_TARGET} imgui PoundCore SDL3::SDL3)
 
 if (MSVC)
     target_link_options(PoundGui PRIVATE "/INCLUDE:mi_version")
