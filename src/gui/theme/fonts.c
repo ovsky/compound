@@ -59,32 +59,42 @@ pound_font_role_is_valid(const int role)
     return (role >= 0) && (role < (int)POUND_FONT_ROLE_COUNT);
 }
 
-/// Builds an `ImFontConfig` for one size.
+/// Builds an `ImFontConfig` for one size, owned by the caller.
 ///
-/// Zeroed rather than left to ImGui's defaulting: `AddFontFromFileTTF` only fills
-/// in the fields the caller left at a sentinel, and a struct that was never
-/// initialised happens to satisfy most of those and silently not the rest.
-static ImFontConfig pound_font_make_config(const float size_pixels, const char *POUND_RESTRICT name)
+/// Built through ImGui's own constructor rather than by zeroing a local: in this
+/// ImGui the config carries defaults that zero is *not* -- a rasteriser density of
+/// 1 and a rasteriser multiply of 1 among them -- and a zeroed struct trips the
+/// atlas's own "is this config correctly initialised?" assertion. Asking ImGui for
+/// its defaults means a field added by a future version arrives correct instead of
+/// as zero.
+///
+/// The caller must release the result with `ImFontConfig_destroy`.
+static ImFontConfig *pound_font_make_config(const float size_pixels, const char *POUND_RESTRICT name)
 {
-    ImFontConfig config;
-    memset(&config, 0, sizeof(config));
+    ImFontConfig *const config = ImFontConfig_ImFontConfig();
+
+    if (NULL == config)
+    {
+        POUND_LOG_ERROR(&thread_logger, "Aborting function: ImGui could not allocate a font config.");
+        return NULL;
+    }
 
     if (NULL != name)
     {
         // `Name` is a fixed 40-byte field that exists purely so a font is readable
         // in a debugger, hence the bounded copy: `strncpy` alone would not
         // terminate a name longer than the field.
-        const size_t limit  = sizeof(config.Name) - 1U;
+        const size_t limit  = sizeof(config->Name) - 1U;
         const size_t length = strlen(name);
 
-        memcpy(config.Name, name, (length < limit) ? length : limit);
-        config.Name[limit] = '\0';
+        memcpy(config->Name, name, (length < limit) ? length : limit);
+        config->Name[limit] = '\0';
     }
 
-    config.SizePixels  = size_pixels;
-    config.OversampleH = 2;
-    config.OversampleV = 1;
-    config.PixelSnapH  = false;
+    config->SizePixels  = size_pixels;
+    config->OversampleH = 2;
+    config->OversampleV = 1;
+    config->PixelSnapH  = false;
 
     return config;
 }
@@ -178,9 +188,21 @@ pound_fonts_setup(pound_fonts_t *POUND_RESTRICT out_fonts, const float scale)
 
     for (size_t i = 0; i < POUND_FONT_CANDIDATE_COUNT; i++)
     {
-        ImFontConfig  config    = pound_font_make_config(POUND_FONT_BASE_SIZE, "Pound Body");
+        ImFontConfig *const config = pound_font_make_config(POUND_FONT_BASE_SIZE, "Pound Body");
+
+        if (NULL == config)
+        {
+            // No config means no candidate can even be attempted; fall through to
+            // the embedded font, which is built below with a config of its own.
+            POUND_LOG_ERROR(&thread_logger,
+                            "Aborting the system-font search: no font config could be allocated.");
+            break;
+        }
+
         ImFont *const candidate = ImFontAtlas_AddFontFromFileTTF(
-            atlas, POUND_FONT_CANDIDATES[i], POUND_FONT_BASE_SIZE, &config, NULL);
+            atlas, POUND_FONT_CANDIDATES[i], POUND_FONT_BASE_SIZE, config, NULL);
+
+        ImFontConfig_destroy(config);
 
         if (NULL != candidate)
         {
@@ -198,8 +220,19 @@ pound_fonts_setup(pound_fonts_t *POUND_RESTRICT out_fonts, const float scale)
                        "laid out for.",
                        POUND_FONT_CANDIDATE_COUNT);
 
-        ImFontConfig config = pound_font_make_config(POUND_FONT_BASE_SIZE, "Pound Embedded");
-        base_font           = ImFontAtlas_AddFontDefault(atlas, &config);
+        ImFontConfig *const embedded_config
+            = pound_font_make_config(POUND_FONT_BASE_SIZE, "Pound Embedded");
+
+        if (NULL == embedded_config)
+        {
+            POUND_LOG_ERROR(&thread_logger,
+                            "Aborting function: no font config could be allocated for the embedded "
+                            "font.");
+            return POUND_ERROR_ALLOCATION_FAILED;
+        }
+
+        base_font = ImFontAtlas_AddFontDefault(atlas, embedded_config);
+        ImFontConfig_destroy(embedded_config);
 
         if (POUND_UNLIKELY(NULL == base_font))
         {

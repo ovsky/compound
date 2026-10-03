@@ -103,6 +103,42 @@ fs_reader_range_is_valid(const fs_reader_t *POUND_RESTRICT reader, const uint64_
     return (size <= (size_t)(reader->size - offset));
 }
 
+void
+fs_reader_copy(fs_reader_t *POUND_RESTRICT copy, const fs_reader_t *POUND_RESTRICT source)
+{
+    if (POUND_UNLIKELY(NULL == copy))
+    {
+        POUND_LOG_ERROR(&thread_logger, "Ignoring call: the destination reader is NULL.");
+        return;
+    }
+
+    if (POUND_UNLIKELY(NULL == source))
+    {
+        POUND_LOG_ERROR(&thread_logger, "Aborting function: the source reader is NULL.");
+
+        // Zeroed rather than left alone. A destination that still held a previous
+        // reader's pointer would keep that reader's bytes reachable, which is the exact
+        // failure this function exists to make impossible.
+        memset(copy, 0, sizeof(*copy));
+        return;
+    }
+
+    *copy = *source;
+
+    // The self-reference test, and the whole of the fix. `fs_reader_from_buffer` sets
+    // `context` to the reader it was handed so that `buffer_read_at` can find the buffer;
+    // a struct assignment copies that pointer across unchanged, leaving the destination
+    // addressing the source. Rebinding it here is what makes the copy independent.
+    //
+    // Nothing else is touched. A reader whose context is an allocation or a file handle
+    // keeps it, because that memory belongs to whoever created it and the copy is meant
+    // to refer to the same bytes.
+    if (copy->context == (const void *)source)
+    {
+        copy->context = copy;
+    }
+}
+
 error_t
 fs_reader_read_at(const fs_reader_t *POUND_RESTRICT reader, const uint64_t offset,
                   void *POUND_RESTRICT destination, const size_t size)
