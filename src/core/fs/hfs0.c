@@ -97,7 +97,8 @@ range_within(const uint64_t offset, const uint64_t size, const uint64_t base, co
     return (size <= (length - relative));
 }
 
-/// The state a slice's reader carries: which parent, and where inside it the entry starts.
+/// The state a slice's reader carries: which parent, where inside it the entry starts, and
+/// how long the entry is.
 ///
 /// Kept private to this file, and reached only through `slice_read_at`, which is the whole
 /// reason `hfs0_slice_t` has to own an allocation -- see the note in `hfs0.h`.
@@ -110,26 +111,57 @@ typedef struct
 
     /// Absolute offset of the entry's first byte within the parent's source.
     uint64_t base;
+
+    /// Length of the entry, which is the bound the slice enforces.
+    ///
+    /// Not derivable from the parent, and not something the parent's own range check can
+    /// catch: an entry is one region inside a partition's data, and a read that leaves it
+    /// but stays inside the parent lands squarely in the next file's bytes. The parent
+    /// would return them as a success, which is the worst possible outcome for a nested
+    /// parser -- an NCA header read out of the neighbouring NCA's payload is plausible
+    /// enough to be acted on.
+    uint64_t size;
 } hfs0_slice_context_t;
 
 /// Reads through a slice, rebasing the caller's offset onto the entry.
 ///
-/// The size check happens before the addition so the rebased offset cannot wrap, and the
-/// parent is asked to do the range check for us rather than repeating it here.
+/// Three checks in order, and the order matters: the range is validated against the
+/// entry's own length first, so a caller asking for past its end gets an answer about
+/// the entry rather than about the partition; the rebasing is proved not to wrap before
+/// the addition; and only then is the parent asked for the bytes.
+///
+/// The wrap check is on `offset` rather than on `offset + size`. An offset near the top of
+/// the address space rebased onto an entry based a few hundred bytes in wraps to a small
+/// offset that names another file entirely, and a size-only test would not notice: eight
+/// bytes at `UINT64_MAX - 2` on an entry based at 0x2D0 becomes a read of eight bytes at
+/// 0x2CE, which is inside the parent and succeeds.
 static error_t
 slice_read_at(void *POUND_RESTRICT context, const uint64_t offset, void *POUND_RESTRICT destination, const size_t size)
 {
     const hfs0_slice_context_t *const slice = context;
 
-    if (size > (UINT64_MAX - slice->base))
+    if (POUND_UNLIKELY(!range_within(offset, size, 0U, slice->size)))
     {
         POUND_LOG_ERROR(&thread_logger,
-                        "Aborting read: a %zu-byte read at offset 0x%llx inside an entry starting "
-                        "at 0x%llx would push the offset past the address space.",
+                        "Aborting read: a %zu-byte read at offset 0x%llx is outside this entry, "
+                        "which is %llu byte(s) long starting at 0x%llx of its source. The parent "
+                        "partition may well have bytes there, but they belong to a different "
+                        "file.",
                         size,
                         (unsigned long long)offset,
+                        (unsigned long long)slice->size,
                         (unsigned long long)slice->base);
-        return POUND_ERROR_GUEST_ADDRESS_OVERFLOW;
+        return POUND_ERROR_IO;
+    }
+
+    if (POUND_UNLIKELY(offset > (UINT64_MAX - slice->base)))
+    {
+        POUND_LOG_ERROR(&thread_logger,
+                        "Aborting read: an offset of 0x%llx inside an entry beginning at 0x%llx "
+                        "does not rebase to an address.",
+                        (unsigned long long)offset,
+                        (unsigned long long)slice->base);
+        return POUND_ERROR_IO;
     }
 
     return fs_reader_read_at(&slice->parent, slice->base + offset, destination, size);
@@ -341,7 +373,10 @@ hfs0_open(hfs0_t *POUND_RESTRICT hfs0, const fs_reader_t *POUND_RESTRICT reader)
         return POUND_ERROR_ALLOCATION_FAILED;
     }
 
-    uint8_t *const strings = NULL;
+    // Not `const`: both tables are filled by the reads below and released on every
+    // failure path, and a pointer that had to be cast away to release would be a worse
+    // trade than the single reassignment.
+    uint8_t *strings = NULL;
 
     if (POUND_UNLIKELY(0U != string_size))
     {
@@ -495,17 +530,32 @@ hfs0_open(hfs0_t *POUND_RESTRICT hfs0, const fs_reader_t *POUND_RESTRICT reader)
             break;
         }
 
-        if (POUND_UNLIKELY(!range_within(entry_offset, entry_size, data_offset, reader->size - data_offset)))
+        // Read the name as characters from here on. The table is a byte array because
+        // that is what it is on disk and it is scanned for a terminator, but every use
+        // after this point is a string operation, and the length is now known to be both
+        // terminated and non-zero -- which is the precondition `strcmp` needs and the
+        // reason the cast cannot make anything worse.
+        const char *const name = (const char *)name_bytes;
+
+        // The stored offset is relative to the start of the data region, so it is checked
+        // against that region's length rather than against the source -- and the value
+        // published below adds the base, because `hfs0_entry_t::offset` is documented as
+        // an absolute offset a caller can hand straight to `fs_reader_read_at`. Getting
+        // this wrong in either direction is not a clean failure: an entry checked as
+        // absolute rejects every real partition whose first file is at relative zero, and
+        // one published as relative reads the *header* when the caller asks for the file.
+        if (POUND_UNLIKELY(!range_within(entry_offset, entry_size, 0U, reader->size - data_offset)))
         {
             POUND_LOG_ERROR(&thread_logger,
-                            "Entry %u of %u occupies bytes [%llu, %llu), which is outside the data "
-                            "region [%llu, %llu) of a %llu-byte source.",
+                            "Entry %u of %u occupies bytes [%llu, %llu) of a data region %llu "
+                            "byte(s) long starting at %llu, which does not fit inside a "
+                            "%llu-byte source.",
                             i,
                             file_count,
                             (unsigned long long)entry_offset,
                             (unsigned long long)(entry_offset + entry_size),
+                            (unsigned long long)(reader->size - data_offset),
                             (unsigned long long)data_offset,
-                            (unsigned long long)reader->size,
                             (unsigned long long)reader->size);
             status = POUND_ERROR_MALFORMED_HEADER;
             break;
@@ -518,7 +568,7 @@ hfs0_open(hfs0_t *POUND_RESTRICT hfs0, const fs_reader_t *POUND_RESTRICT reader)
         // pass and not something to make clever later.
         for (uint32_t j = 0U; j < i; ++j)
         {
-            if (POUND_UNLIKELY(0U == strcmp(entries[j].name, name_bytes)))
+            if (POUND_UNLIKELY(0U == strcmp(entries[j].name, name)))
             {
                 POUND_LOG_ERROR(&thread_logger,
                                 "Entries %u and %u are both named '%s'. A lookup by name would be "
@@ -526,7 +576,7 @@ hfs0_open(hfs0_t *POUND_RESTRICT hfs0, const fs_reader_t *POUND_RESTRICT reader)
                                 "loaded.",
                                 j,
                                 i,
-                                name_bytes);
+                                name);
                 status = POUND_ERROR_MALFORMED_HEADER;
                 break;
             }
@@ -537,9 +587,9 @@ hfs0_open(hfs0_t *POUND_RESTRICT hfs0, const fs_reader_t *POUND_RESTRICT reader)
             break;
         }
 
-        memcpy(entries[i].name, name_bytes, name_length);
+        memcpy(entries[i].name, name, name_length);
         entries[i].name[name_length] = '\0';
-        entries[i].offset            = entry_offset;
+        entries[i].offset            = data_offset + entry_offset;
         entries[i].size              = entry_size;
     }
 
@@ -547,7 +597,11 @@ hfs0_open(hfs0_t *POUND_RESTRICT hfs0, const fs_reader_t *POUND_RESTRICT reader)
     {
         // Publish last, so that everything above ran against a closed partition and a
         // failure at any point leaves nothing that a caller could mistake for open.
-        hfs0->reader              = *reader;
+        // `fs_reader_copy` rather than a struct assignment. A buffer-backed reader's
+        // `context` points at the reader struct itself, so a plain copy would leave the
+        // partition's reader addressing the caller's `reader` -- and every later read
+        // would go through a pointer into a frame that has already returned.
+        fs_reader_copy(&hfs0->reader, reader);
         hfs0->entries             = entries;
         hfs0->hashed_sizes        = hashed_sizes;
         hfs0->count               = file_count;
@@ -958,8 +1012,14 @@ hfs0_entry_reader(const hfs0_t *POUND_RESTRICT hfs0, const uint32_t index, hfs0_
         return POUND_ERROR_ALLOCATION_FAILED;
     }
 
-    context->parent = hfs0->reader;
-    context->base   = entry->offset;
+    // Copied rather than assigned for the same reason `hfs0_open` copies: the parent's
+    // `context` points at its own struct, and a plain copy of it would make the slice
+    // read through the partition's field. Rebinding makes the slice's parent refer to
+    // itself, which is heap memory with exactly the slice's lifetime -- and is why the
+    // slice outliving the partition is safe while the underlying bytes are not.
+    fs_reader_copy(&context->parent, &hfs0->reader);
+    context->base = entry->offset;
+    context->size = entry->size;
 
     out->context                  = context;
     out->reader.context           = context;
