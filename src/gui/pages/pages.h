@@ -132,8 +132,14 @@ typedef struct
     /// Scroll position and log filter. The shell owns the storage.
     pound_pages_view_t *POUND_RESTRICT view;
 
-    /// Set to true by a page that has changed `config` in a way that should be
-    /// written to disk. The shell saves at the end of the frame and clears it.
+    /// Set to true by a page that has changed the config's appearance -- the theme
+    /// or the interface scale -- in a way the running interface must pick up. The
+    /// shell re-applies the palette and the type scale at the top of the next frame
+    /// and clears it.
+    ///
+    /// Distinct from persistence: writing the file is explicit, done by the Settings
+    /// page's Save button, so a colour the user is still deciding between does not
+    /// get committed behind them.
     bool *POUND_RESTRICT config_dirty;
 } pound_page_context_t;
 
