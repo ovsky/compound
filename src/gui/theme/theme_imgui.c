@@ -59,7 +59,7 @@ pound_theme_imgui_apply(const pound_theme_t *POUND_RESTRICT theme)
     style->ItemInnerSpacing.y = theme->spacing.xs;
     style->CellPadding.x      = theme->spacing.xs;
     style->CellPadding.y      = theme->spacing.xs;
-    style->IndentSpacing.x    = theme->spacing.lg;
+    style->IndentSpacing    = theme->spacing.lg;
     style->ScrollbarSize      = theme->spacing.lg;
     style->GrabMinSize        = theme->spacing.lg;
     style->SeparatorTextBorderSize
@@ -156,18 +156,14 @@ pound_theme_imgui_apply(const pound_theme_t *POUND_RESTRICT theme)
     colors[ImGuiCol_TableRowBgAlt]      = (ImVec4){ 0.0F, 0.0F, 0.0F, 0.0F };
     colors[ImGuiCol_TextSelectedBg]     = pound_theme_slot(theme, POUND_THEME_ACCENT_MUTED);
     colors[ImGuiCol_TextLink]           = pound_theme_slot(theme, POUND_THEME_ACCENT);
-    colors[ImGuiCol_TextSelectedBgFocused] = pound_theme_slot(theme, POUND_THEME_ACCENT_MUTED);
 
-    colors[ImGuiCol_DragAverage]             = pound_theme_slot(theme, POUND_THEME_ACCENT);
-    colors[ImGuiCol_DragAverageActive]       = pound_theme_slot(theme, POUND_THEME_ACCENT_HOVER);
     colors[ImGuiCol_DragDropTarget]          = pound_theme_slot(theme, POUND_THEME_ACCENT_HOVER);
     colors[ImGuiCol_NavCursor]               = pound_theme_slot(theme, POUND_THEME_BORDER_STRONG);
     colors[ImGuiCol_NavWindowingHighlight]   = pound_theme_slot(theme, POUND_THEME_ACCENT);
     colors[ImGuiCol_NavWindowingDimBg]       = (ImVec4){ 0.0F, 0.0F, 0.0F, 0.0F };
-    colors[ImGuiCol_ModalWindowDimBg]
-        = { 0.0F, 0.0F, 0.0F, 0.55F }; // Dimming the whole viewport for a modal is the one
-                                        // place a literal is right: it is not a palette
-                                        // colour, it is an amount of veil.
+    colors[ImGuiCol_ModalWindowDimBg]        = (ImVec4){ 0.0F, 0.0F, 0.0F, 0.55F }; // Dimming the whole viewport for a modal is the one
+                                                                                    // place a literal is right: it is not a palette
+                                                                                    // colour, it is an amount of veil.
 
     return POUND_SUCCESS;
 }
