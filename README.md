@@ -119,16 +119,16 @@ Compound is in **early-stage, active development**. The emulator has:
 - [ ] Hardened validation paths
 
 ### 📁 Phase 2: Filesystem & Cryptography
-- [ ] HFS0 filesystem parser
-- [ ] Filesystem reader abstraction
-- [ ] SHA256 and crypto primitives
+- [x] HFS0 filesystem parser
+- [x] Filesystem reader abstraction
+- [x] SHA256 and crypto primitives
 - [ ] Verification and signature handling
 
 ### ⚡ Phase 3: JIT & Execution Engine
-- [ ] Ballistic ARM64 code cache allocator
-- [ ] JIT metadata manager
-- [ ] Error logging and diagnostics
-- [ ] Execution loop integration
+- [x] Ballistic ARM64 code cache allocator
+- [x] JIT metadata manager
+- [x] Error logging and diagnostics
+- [x] Execution loop integration
 
 ### 🖥️ Phase 4: Guest CPU & OS Emulation
 - [ ] ARM64 CPU instruction dispatch

@@ -336,6 +336,7 @@ add_library(PoundCore OBJECT
         src/core/memory/slab_allocator.c
         src/core/jit/jit_cache.c
         src/core/jit/jit_metadata.c
+        src/core/jit/jit_execution.c
         src/core/crypto/sha256.c
         src/core/fs/fs_reader.c
         src/core/fs/keys.c

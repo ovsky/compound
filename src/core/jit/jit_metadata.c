@@ -647,7 +647,7 @@ jit_metadata_init(jit_metadata_t *POUND_RESTRICT manager, const jit_metadata_con
                    sizeof(jit_metadata_entry_t),
                    table_bytes,
                    (unsigned long long)manager->generation,
-                   JIT_METADATA_MAP_SLOTS);
+                   (size_t)JIT_METADATA_MAP_SLOTS);
 
     return POUND_SUCCESS;
 }

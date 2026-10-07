@@ -561,6 +561,11 @@ run_to(engine_fixture_t *fixture, const uint64_t stop_after)
 
     thread_t thread;
 
+    // `thread_t` documents `NULL` as the pre-start state, and `thread_start`
+    // refuses a handle it cannot account for, so an uninitialised `thread_t` is a
+    // refusal no matter the stack's luck. The zero write is the contract.
+    memset(&thread, 0, sizeof(thread));
+
     const error_t started = thread_start(&thread, run_worker, &request);
 
     if (POUND_SUCCESS != started)

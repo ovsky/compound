@@ -26,6 +26,7 @@ void pound_register_keys_tests(void);
 void pound_register_pfs0_tests(void);
 void pound_register_hfs0_tests(void);
 void pound_register_metadata_tests(void);
+void pound_register_execution_tests(void);
 
 // Registered only by `tests/CMakeLists.txt` when the Ballistic engine is linked, and
 // therefore only defined there. The weak declaration is what lets one `main` serve
@@ -81,6 +82,7 @@ main(int argc, char **argv)
     pound_register_pfs0_tests();
     pound_register_hfs0_tests();
     pound_register_metadata_tests();
+    pound_register_execution_tests();
     pound_register_ballistic_engine_tests();
 
     // Absent on a lane with no Ballistic prebuild, in which case there is nothing to

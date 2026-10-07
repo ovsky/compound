@@ -295,6 +295,65 @@ the loader then looks for a file that does not exist next to the executable.
 
 ---
 
+## JIT execution loop — `src/core/jit/jit_execution.{h,c}`
+
+The execution loop is the user of every other JIT module: `jit_metadata` says
+whether host code exists for a guest address, `jit_cache` owns the executable
+bytes, and this module actually **runs** the guest — it reads the guest PC,
+finds or translates the block that PC starts, hands the guest register file to
+the block, and reports an exit reason to the runtime.
+
+The block ABI is one host function pointer:
+
+```c
+void (*)(guest_state_t *state)
+```
+
+A single object passed by address, which is exactly the shape of Ballistic's
+`bal_jit_block_t`; when the ARM64 translator is bound below this loop, the
+blocks it publishes are just the addresses of compiled host code.
+
+`jit_execution_step` runs exactly one block: consume any stop request, check the
+configured `halt_pc`, then look the PC up in the metadata table
+(`jit_metadata_find_ready`). On a hit it acquires a lease, runs the block, and
+drops the lease. On a miss it interns the address, claims the slot for
+translation (`jit_metadata_intern` + `jit_metadata_try_begin`), calls the
+configured `translate` callback into a freshly allocated cache block, makes the
+block executable, publishes it, and runs it. A miss that keeps vanishing
+mid-dispatch reloads up to `JIT_EXECUTION_MAX_RELOADS` (4) times before the
+loop refuses.
+
+Normal exits travel in `jit_execution_exit_t` — `NONE`, `SYSCALL`, `HALTED`,
+`STOPPED`, `QUOTA`, `CONTENTION` — and hard failures (`FAILED`, `ERROR`) travel
+as the return value. `jit_execution_run` is `step` in a loop until an exit
+reason or the configured block quota (`max_blocks_per_run`), and returns
+`POUND_SUCCESS` with the reason in `*out_exit`.
+
+The claim is the only source of blocking. When two dispatcher threads reach the
+same cold address, the loser resolves the contention per
+`jit_execution_contention_policy_t`:
+
+- **Spin** — re-dispatch for `claim_spin_budget` (default 4096) iterations; the
+  other thread's publication makes the block `READY` and the spin wins, else the
+  loop reports `POUND_ERROR_BUSY` with exit `CONTENTION`.
+- **Interpret** — run one block interpretively through the `interpret` hook;
+  with no hook installed this degrades to Defer with a warning.
+- **Defer** — return immediately with exit `CONTENTION` and let the runtime
+  decide when to come back.
+
+Invalidation is two steps and this module owns the second one:
+`jit_metadata_invalidate_range` moves cleared blocks to `VACANT` but does not
+free their host code (the documented contract that makes a raced invalidation
+safe). The loop keeps a registry of every block it published — `{guest_pc,
+guest_size, code}` — grown by doubling from the initial 128 entries, and
+`jit_execution_invalidate_range` frees and forgets every registered block the
+range would have cleared **only after** the metadata side reports success.
+`jit_execution_reset` is the full tear-down order: invalidate and free every
+owned block, then `jit_metadata_reset`, then reset the code cache and clear the
+dispatcher's counters.
+
+---
+
 ## Android
 
 Pound is not an executable on Android. `SDLActivity` `dlopen()`s `libmain.so`
