@@ -1316,7 +1316,7 @@ POUND_TEST(execution, invalidation_frees_the_code_this_dispatcher_owns)
         // The freed block is no longer backed by the cache...
         POUND_CHECK(JIT_BLOCK_STATE_FREE == jit_cache_block_state(&h.cache, first.host_code));
 
-        // ...and the metadata table agrees the address is gone.
+        // The metadata table agrees the address is gone.
         size_t gone = 0U;
 
         POUND_CHECK(POUND_ERROR_NOT_FOUND == jit_metadata_find_ready(&h.metadata, 0xC000U, &gone));
@@ -1511,7 +1511,7 @@ POUND_TEST(execution, a_reset_clears_every_block_and_starts_clean)
     POUND_REQUIRE(POUND_SUCCESS == jit_metadata_get_stats(&h.metadata, &meta));
     POUND_CHECK(0U == meta.interned);
 
-    // ...the dispatcher's counters restarted...
+    // The dispatcher's counters restarted as well.
     jit_execution_stats_t stats;
 
     POUND_REQUIRE(POUND_SUCCESS == jit_execution_get_stats(&h.exec, &stats));
@@ -1520,7 +1520,7 @@ POUND_TEST(execution, a_reset_clears_every_block_and_starts_clean)
     POUND_CHECK(0U == stats.blocks_freed);
     POUND_CHECK(0U == stats.invalidations);
 
-    // ...and a PC that had a block before is a miss again.
+    // A PC that had a block before is a miss again.
     h.state.pc = 0xF000U;
     {
         exit_t e = JIT_EXECUTION_EXIT_ERROR;

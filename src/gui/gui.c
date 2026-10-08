@@ -5,7 +5,6 @@
 #include "log.h"
 #include "log_ring.h"
 #include "memory/memory.h"
-#include "mimalloc-override.h"
 #include "theme/fonts.h"
 #include "theme/theme.h"
 #include "theme/theme_imgui.h"
