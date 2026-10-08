@@ -1249,7 +1249,7 @@ jit_cache_destroy(jit_cache_t *POUND_RESTRICT cache)
 
     memset(cache, 0, sizeof(*cache));
 
-    POUND_LOG_DEBUG(&thread_logger,
+    POUND_LOG_INFO(&thread_logger,
                     "Code cache destroyed, returning %zu bytes to the OS.",
                     released);
 }
@@ -1765,9 +1765,9 @@ transition_block(jit_cache_t *POUND_RESTRICT cache,
         // Idempotent by design. A JIT that re-protects a block it already protected
         // has done nothing wrong, and reporting an error would only train callers to
         // ignore this function.
-        mutex_unlock(&cache->lock);
-        POUND_LOG_DEBUG(&thread_logger, "%s on %p was a no-op; already in that state.", path, pointer);
-        return POUND_SUCCESS;
+mutex_unlock(&cache->lock);
+    POUND_LOG_INFO(&thread_logger, "%s on %p was a no-op; already in that state.", path, pointer);
+    return POUND_SUCCESS;
     }
 
     void *const range    = (void *)(chunk->base + block->offset);

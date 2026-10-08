@@ -64,7 +64,7 @@ POUND_TEST(guest_memory, init_rejects_a_misaligned_host_base)
     POUND_CHECK_EQ_I64(guest_memory_init(&region, misaligned, GUEST_TEST_HOST_SIZE, 0U),
                        POUND_ERROR_MEMORY_ALIGNMENT);
 
-    // ... and an alignment that *is* valid must still be accepted.
+    // An alignment that *is* valid must still be accepted.
     POUND_CHECK_EQ_I64(
         guest_memory_init(&region, g_host_buffer + 16U, GUEST_TEST_HOST_SIZE - 16U, 0U),
         POUND_SUCCESS);
