@@ -37,6 +37,7 @@ set(POUND_TEST_SUITES
         hos_kernel
         hos_syscall
         hos_scheduler
+        hos_memory_layout
         sm86
         )
 
@@ -59,6 +60,7 @@ set(POUND_TEST_SOURCES
         test_hos_kernel.c
         test_hos_syscall.c
         test_hos_scheduler.c
+        test_hos_memory_layout.c
         test_sm86.c
         )
 

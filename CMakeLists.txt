@@ -349,6 +349,7 @@ add_library(PoundCore OBJECT
         src/core/guest_state.c
         src/core/cpu/interpreter.c
         src/core/hos/kernel.c
+        src/core/hos/memory_layout.c
         src/core/hos/syscall.c
         src/core/hos/scheduler.c
         src/core/gpu/sm86/generated/opcodes.c

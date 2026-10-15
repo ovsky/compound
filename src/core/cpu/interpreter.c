@@ -1058,9 +1058,14 @@ error_t interpreter_run(guest_state_t *POUND_RESTRICT state, guest_memory_t *POU
 
     for (uint32_t i = 0U; i < budget; ++i)
     {
-        size_t         readable = 0;
-        const uint8_t *const host = guest_memory_translate_read(memory, state->pc, &readable);
-        if ((NULL == host) || (readable < 4U))
+        // Fetch is gated on execute permission, not read permission: a region
+        // the guest may read but not run from must refuse its bytes here, the
+        // way a hardware MMU refuses an instruction fetch from a non-executable
+        // page. With no region table installed this is the same pointer the
+        // read translation would have produced.
+        size_t                executable = 0;
+        const uint8_t *const host = guest_memory_translate_execute(memory, state->pc, &executable);
+        if ((NULL == host) || (executable < 4U))
         {
             return POUND_ERROR_MEMORY_FAULT;
         }

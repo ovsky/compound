@@ -31,13 +31,38 @@
 //!
 //! # Where an answer goes
 //!
-//! Switch system calls do not all answer in `X0`. A call that carries a `Result`
-//! puts it in `W0`; a call that returns an *output parameter* -- the ready index of
-//! `svcWaitSynchronization`, the handle of `svcCreateThread` -- leaves a pointer in
-//! `X0` and the callee writes through it. That makes `X0` overloaded: on entry it
-//! is the pointer, and on return it is the `Result` that replaced it. This module
-//! writes those pointers *before* it overwrites `X0`, since afterwards the address
-//! is gone. A call that returns nothing at all (`svcExitThread`, `svcSleepThread`,
+//! Switch system calls do not all answer in `X0`, and there are three places an
+//! answer can land:
+//!
+//! - **`W0`, as a `Result`.** Every synchronous call carries one.
+//! - **A register, usually `W1`/`X1`.** `svcGetThreadId` answers `X1`,
+//!   `svcSetHeapSize` answers `X1`, `svcQueryMemory` answers `W1`. The *guest's
+//!   own stub* stores that register through the out-pointer the caller gave it:
+//!   libnx's `svcCreateThread` is `str x0, [sp, #-16]!; svc 0x8; ldr x2, [sp], #16;
+//!   str w1, [x2]`. The kernel is not given the pointer and does not write it, so
+//!   this module must set the register or the stub stores whatever `X1` happened
+//!   to hold. It fails silently: the guest gets a plausible-looking handle or id
+//!   that is really stale register contents.
+//! - **Through a pointer in `X0`.** This is the case for a call whose out
+//!   parameter the *kernel* writes -- `svcQueryMemory`'s `MemoryInfo`, for
+//!   instance -- where the wiki documents `X0` as an input pointer. `X0` is then
+//!   overloaded: on entry it is the pointer, and on return it is the `Result` that
+//!   replaced it, so this module writes through the pointer *before* it overwrites
+//!   `X0`, since afterwards the address is gone.
+//!
+//! The register-out and pointer-out forms are both present on some calls
+//! (`svcQueryMemory` writes `MemoryInfo` through `X0` *and* answers `W1`), and a
+//! call may have both without either being redundant: the kernel's write and the
+//! stub's store target different places for different callers. Pound also writes
+//! the register-out answers through `X0` where hardware leaves that to the stub, so
+//! a guest that reads an out-parameter either way sees the same value twice; that
+//! is a deliberate belt-and-braces on top of the register, not a claim about what
+//! the kernel itself does. Where Pound cannot know what hardware leaves in a
+//! register on a *failure* path -- nothing documents it -- it leaves that register
+//! untouched rather than inventing a value, and the stub's store is the guest's
+//! problem, exactly as on hardware.
+//!
+//! A call that returns nothing at all (`svcExitThread`, `svcSleepThread`,
 //! `svcFlushEntireDataCache`) must leave `X0` exactly as the guest left it.
 //!
 //! # Blocking
@@ -65,11 +90,20 @@
 //! # What is not here, and why
 //!
 //! Process objects (`svcGetProcessId`, `svcGetInfo`) need a process model beyond
-//! the handle table. Memory-layout calls (`svcSetHeapSize`, `svcMapMemory`,
-//! `svcQueryMemory`) belong to the memory-layout slice. IPC (`svcSendSyncRequest`,
-//! `svcReplyAndReceive`) needs the CMIF wire format and the thread-local command
-//! buffer at `TPIDR_EL0 + 0x80`. Each returns `POUND_ERROR_UNSUPPORTED_SYSCALL`
-//! and says so in the log.
+//! the handle table. The remaining memory-layout calls (`svcMapMemory`,
+//! `svcUnmapMemory`, `svcSetMemoryPermission`, `svcSetMemoryAttribute`) need the
+//! same region table `svcQueryMemory` reads and are the next slice of it. IPC
+//! (`svcSendSyncRequest`, `svcReplyAndReceive`) needs the CMIF wire format and
+//! the thread-local command buffer at `TPIDR_EL0 + 0x80`. Each returns
+//! `POUND_ERROR_UNSUPPORTED_SYSCALL` and says so in the log.
+//!
+//! `svcSetHeapSize` and `svcQueryMemory` are here, and they change the shape of a
+//! refusal in one place worth naming. `hos_memory_layout_t`, above, partitions
+//! the address space; a context that was never given one has an unpartitioned
+//! window, and these two calls are refused with `POUND_ERROR_UNSUPPORTED_SYSCALL`
+//! exactly as if they were not implemented, rather than answering from a layout
+//! that does not exist. That is the same rule as the scheduler: a feature that is
+//! absent is refused, never approximated.
 //!
 //! # Result values
 //!
@@ -89,6 +123,7 @@
 #include "errors.h"
 #include "guest_state.h"
 #include "hos/kernel.h"
+#include "hos/memory_layout.h"
 #include "hos/scheduler.h"
 #include "memory/guest_memory.h"
 #include <stdbool.h>
@@ -105,10 +140,20 @@
 /// what Pound answers.
 typedef enum
 {
+    /// Grows or shrinks the calling process's heap, answering its base address in
+    /// `X1`. Needs a memory layout; refused without one.
+    HOS_SVC_SET_HEAP_SIZE = 0x01,
+
+    /// Reports what the address space holds at an address, writing a `MemoryInfo`
+    /// through the pointer in `X0` and the page flags in `W1`. Needs a memory
+    /// layout; refused without one.
+    HOS_SVC_QUERY_MEMORY = 0x06,
+
     /// Ends the calling process. Returns nothing.
     HOS_SVC_EXIT_PROCESS = 0x07,
 
-    /// Creates a thread and returns a handle to it through the pointer in `X0`.
+    /// Creates a thread and returns a handle to it in `W1` (the caller's stub
+    /// stores that register through the pointer in `X0`).
     HOS_SVC_CREATE_THREAD = 0x08,
 
     /// Starts a thread, making it schedulable.
@@ -120,7 +165,8 @@ typedef enum
     /// Yields, or (for a positive duration) sleeps. Returns nothing.
     HOS_SVC_SLEEP_THREAD = 0x0B,
 
-    /// Answers a thread's priority through the pointer in `X0`.
+    /// Answers a thread's priority in `W1` (the caller's stub stores that register
+    /// through the pointer in `X0`).
     HOS_SVC_GET_THREAD_PRIORITY = 0x0C,
 
     /// Changes a thread's priority.
@@ -141,17 +187,19 @@ typedef enum
     /// Clears an event, reporting whether it was signaled.
     HOS_SVC_RESET_SIGNAL = 0x17,
 
-    /// Waits for one of several handles, writing the ready index through the pointer in
-    /// `X0`. Polls, and with a scheduler parks the caller when nothing is ready.
+    /// Waits for one of several handles, answering the ready index in `W1` (the
+    /// caller's stub stores that register through the pointer in `X0`). Polls, and
+    /// with a scheduler parks the caller when nothing is ready.
     HOS_SVC_WAIT_SYNCHRONIZATION = 0x18,
 
     /// Answers the system tick counter.
     HOS_SVC_GET_SYSTEM_TICK = 0x1E,
 
-    /// Opens a session on a named service, by name.
+    /// Opens a session on a named service, by name, answering its handle in `W1`.
     HOS_SVC_CONNECT_TO_NAMED_PORT = 0x1F,
 
-    /// Answers a thread's kernel-wide identifier through the pointer in `X0`.
+    /// Answers a thread's kernel-wide identifier in `X1` (the caller's stub stores
+    /// that register through the pointer in `X0`).
     HOS_SVC_GET_THREAD_ID = 0x25,
 
     /// Stops the guest deliberately, so a debugger can attach. Returns nothing.
@@ -193,6 +241,19 @@ typedef enum
 /// The object is in a state this call cannot act on: `svcResetSignal` on an event
 /// that is not signaled, or on a readable event rather than a writable one.
 #define HOS_RESULT_INVALID_STATE 0x0000FA01U
+
+/// `svcSetHeapSize` was asked for a size that is not a multiple of 2MB, or that is
+/// larger than 4GB. Horizon's own name for this is `ResultInvalidSize`.
+#define HOS_RESULT_INVALID_SIZE 0x0000CA01U
+
+/// `svcSetHeapSize` was asked for a size larger than the heap region. Horizon's
+/// own name for this is `ResultOutOfMemory`.
+#define HOS_RESULT_OUT_OF_MEMORY 0x0000D001U
+
+/// The kernel's fixed pool of memory-block descriptors is exhausted. Horizon
+/// reports this for `svcSetHeapSize`; Pound's region table is its memory-block
+/// pool, so it answers the same word when the table has no room for the split.
+#define HOS_RESULT_SLAB_EXHAUSTED 0x0000CE01U
 
 // -----------------------------------------------------------------------------
 // Limits
@@ -263,6 +324,15 @@ POUND_ALIGNED(64) typedef struct
     /// that has not happened.
     hos_scheduler_t *scheduler;
 
+    /// The address space this process runs in, or NULL.
+    ///
+    /// Optional, and set with `hos_syscall_context_set_layout`. Without it the
+    /// memory calls have no regions to describe, so `svcSetHeapSize` and
+    /// `svcQueryMemory` are refused rather than answered from a layout that does
+    /// not exist. `memory` is the raw window; this is what says how it is
+    /// partitioned, so both are needed for a memory call to mean anything.
+    hos_memory_layout_t *layout;
+
     /// What `svcGetSystemTick` reports. The caller advances this, because the tick
     /// is the emulator's clock and this module has no clock of its own.
     uint64_t system_tick;
@@ -275,7 +345,7 @@ POUND_ALIGNED(64) typedef struct
     /// checking it cannot see a previous call's exit.
     hos_syscall_outcome_t outcome;
 
-    char pad[16];
+    char pad[8];
 } hos_syscall_context_t;
 
 /// The symbolic name of a system call, for logs and for tests.
@@ -305,14 +375,32 @@ void hos_syscall_context_init(hos_syscall_context_t *POUND_RESTRICT context,
 void hos_syscall_context_set_scheduler(hos_syscall_context_t *POUND_RESTRICT context,
                                        hos_scheduler_t *POUND_RESTRICT      scheduler);
 
+/// Points `context` at the address-space layout the memory calls describe.
+///
+/// Deliberately separate from `hos_syscall_context_init`, for the same reason the
+/// scheduler is: a layout is optional, and a caller that only exercises the thread
+/// calls leaves it unset. Without one, `svcSetHeapSize` and `svcQueryMemory` are
+/// refused with `POUND_ERROR_UNSUPPORTED_SYSCALL` rather than answered from a
+/// layout that does not exist. Passing NULL puts the context back to that state.
+///
+/// The layout must outlive every call made through `context`, and it must already
+/// have been initialised against `context`'s memory: it owns the region table that
+/// window's access gate reads.
+void hos_syscall_context_set_layout(hos_syscall_context_t *POUND_RESTRICT context,
+                                     hos_memory_layout_t *POUND_RESTRICT   layout);
+
 /// Finishes a blocked system call after the scheduler woke the thread that made it.
 ///
 /// Called with the thread's register file exactly as `hos_syscall_dispatch` left it when
 /// it reported `HOS_SYSCALL_BLOCKED`, so the pointer the suspended call needs is still in
 /// `X0`. `wake` says what ended the wait and that is what chooses the answer:
 ///
-/// - `HOS_WAKE_SIGNALED` -- one of the waited handles became ready. Its index is written
-///   through the pointer in `X0`, and then `X0` is replaced with `HOS_RESULT_SUCCESS`.
+/// - `HOS_WAKE_SIGNALED` -- one of the waited handles became ready. Its index is
+///   written through the pointer in `X0`, and then `X0` is replaced with
+///   `HOS_RESULT_SUCCESS`. `W1` is set to the same index, because the caller's stub
+///   answers the wait with `W1` (the index is what `str w1, [x2]` stores), and a
+///   waking `svcWaitSynchronization` that left `W1` stale would hand the guest an
+///   index it never reported.
 /// - `HOS_WAKE_TIMED_OUT` -- nothing was ready before the deadline. `X0` becomes
 ///   `HOS_RESULT_TIMEOUT`, and the pointer is not written: a timeout has no index to
 ///   report.

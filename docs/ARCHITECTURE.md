@@ -122,6 +122,16 @@ window. Because every JIT backend and system module reads through this one
 struct, a bounds mistake here is a guest-controlled out-of-bounds access on the
 host — hence the strict validation and the tests pinning the boundaries.
 
+The translation is also where the *region gate* lives. When the `guest_memory_t`
+carries a region table (a `guest_memory_region_t` array installed by
+`hos/memory_layout.{h,c}`), every read, write and instruction fetch is checked
+against the region containing the address, and an access the region does not
+permit is refused exactly as an out-of-window one is. A `guest_memory_t` with no
+table has no gate and accepts any access in its window, which is what keeps the
+translation layer usable on its own. `guest_memory_translate_execute` is the
+fetch-side entry point the interpreter and JIT use, so a page mapped
+non-executable faults on fetch rather than on load.
+
 ### Guest state — `src/core/guest_state.{h,c}`
 
 The emulated register file:
@@ -274,6 +284,38 @@ scheduler is one guest core driven by one host thread, and stepping it from two 
 at once is a caller's bug that a mutex here would not make correct.
 `tests/test_hos_scheduler.c` covers it with 22 cases.
 
+### Horizon OS memory layout — `src/core/hos/memory_layout.{h,c}`
+
+`guest_memory.{h,c}` is one flat host buffer with no inherent structure: any address in
+the window translates to any byte. Horizon is the opposite. A process's address space is
+carved into regions whose *state* (`Free`, `Code`, `Normal`, `Inaccessible`, …) and
+*permission* decide what the guest may do where, and `svcQueryMemory` exists precisely so a
+guest can ask. This module owns that table, and it is the single writer of the
+`guest_memory_region_t` array that `guest_memory_t` points at — so the access gate inside
+`guest_memory.c` and the `svcQueryMemory` answer built from the same structs cannot disagree
+about where a region starts, ends, or what it permits.
+
+The layout is optional, and that is deliberate. A `guest_memory_t` with no region table
+accepts any access in its window, which is what the earlier slices and their tests assume;
+installing a table turns the gate on and every access is checked against the region
+containing it. `hos_memory_layout_init` occupies the window with two `Free` regions split at
+its midpoint — a map region and a heap region — and refuses a window too small to hold both
+as whole pages, because a layout that could not place its own split is not one to hand out.
+`hos_memory_layout_map` carves a `Free` region into a used one, splitting around it, and
+refuses anything the loader must not do: a range that is not page-aligned, one that leaves
+the window or wraps, one that overlaps the heap region (which belongs to `svcSetHeapSize`),
+or one that is not wholly inside a single `Free` region. A range that is refused is refused
+before the table is touched, so a failed map leaves the address space exactly as it was.
+
+`hos_memory_layout_set_heap_size` resizes the heap region, and the refusal vocabulary is
+Horizon's rather than an invented one: a size that is not a whole number of 2 MiB pages or
+that exceeds 4 GiB is `0xCA01`, a size larger than the heap region is `0xD001`. When the
+region cannot be grown because the region table itself is full, the module reports
+`POUND_ERROR_ALLOCATION_FAILED`, which the syscall layer maps to `0xCE01` — the one place a
+slab-style refusal is reachable, and the only honest one, since it is a real host-side
+exhaustion rather than a fabricated `Result`. `tests/test_hos_memory_layout.c` covers it
+with 9 cases, including fetching through the gate from the interpreter.
+
 ### Horizon OS system calls — `src/core/hos/syscall.{h,c}`
 
 An A64 `SVC` is a trap to a numbered kernel entry point: the immediate is the number,
@@ -290,22 +332,32 @@ keeps an emulator honest. A call can fail in two entirely different ways:
   The call *completes*: `X0` gets that value, `pc` steps over the trap, and the guest
   branches on it exactly as it would on a Switch.
 - **Pound has not implemented it.** `svcSendSyncRequest` needs the CMIF wire format and
-  the thread-local IPC buffer; `svcSetHeapSize` needs the memory layout. Neither exists.
-  These do not complete: the call returns `POUND_ERROR_UNSUPPORTED_SYSCALL`, logs the
-  number *and its name* (`svcSendSyncRequest (0x21)`), and leaves `X0` and `pc` alone so
-  the trap is still standing to be looked at.
+  the thread-local IPC buffer, and `svcMapMemory` needs an unmap path the layout does not
+  have yet. Neither exists. These do not complete: the call returns
+  `POUND_ERROR_UNSUPPORTED_SYSCALL`, logs the number *and its name*
+  (`svcSendSyncRequest (0x21)`), and leaves `X0` and `pc` alone so the trap is still
+  standing to be looked at.
 
 Collapsing the second into the first is the one thing this module must not do. A plausible
 `Result` for a call nobody wrote makes a title take a branch on an answer Pound invented,
 and the emulator looks like firmware that replied. A refusal is a fact about Pound; a
 `Result` is a fact about the guest.
 
-The same reasoning shapes the calls that answer through memory. Switch system calls do not
-all answer in `X0`: a call that returns a `Result` puts it in `W0`, but a call that returns
-an *output parameter* — the ready index of `svcWaitSynchronization`, the handle of
-`svcConnectToNamedPort` — leaves a pointer in `X0` and writes through it. `X0` is therefore
-overloaded: a pointer on entry and a `Result` on return. This module writes through the
-pointer *before* it replaces `X0`, because afterwards the address is gone. A call that
+Switch system calls do not all answer in `X0`, and there are three places an answer can
+land. The `Result` is always `W0`. But an *output parameter* has two more homes: a
+**register** — `svcWaitSynchronization`'s ready index is `W1`, `svcSetHeapSize`'s heap base
+is `X1`, `svcGetThreadId`'s identifier is `X1` — and, for the calls where the *kernel*
+writes it, **through a pointer in `X0`**, as `svcQueryMemory`'s `MemoryInfo` is.
+
+The register is what actually reaches a real guest: the kernel leaves the value in `W1`,
+and the caller's own stub stores it through the out-pointer it passed (libnx's `svc.s` does
+`str x0, [sp, #-16]!; svc …; ldr x2, [sp], #16; str w1, [x2]`). This module sets that
+register. It *also* writes the slot through `X0` directly for the calls whose out-pointer
+Pound's guests read that way, and where the kernel itself writes `X0`'s target — as with
+`MemoryInfo` — it writes the whole structure in one piece so a bad pointer cannot
+half-update it, and it does so *before* replacing `X0`, because afterwards the address is
+gone. Where hardware's value in a register on a *failure* path is not established, the
+register is left as the guest left it rather than given an invented value. A call that
 returns nothing at all — `svcExitThread`, `svcSleepThread`, `svcFlushEntireDataCache` —
 leaves `X0` exactly as the guest left it.
 
@@ -316,8 +368,8 @@ that finds nothing — completes with the `Result` the hardware would. Only a po
 nothing parks the caller and returns `HOS_SYSCALL_BLOCKED`, leaving `pc` on the `SVC` and
 the pointer in `X0` intact: the call is suspended, not finished. The scheduler owns the
 wake, and the run loop finishes the call with `hos_syscall_complete_block`, which writes the
-ready index through the pointer for `HOS_WAKE_SIGNALED`, puts `0xEA01` in `X0` for
-`HOS_WAKE_TIMED_OUT`, and touches nothing for `HOS_WAKE_SLEPT`, because a sleep returns
+ready index through the pointer and into `W1` for `HOS_WAKE_SIGNALED`, puts `0xEA01` in `X0`
+for `HOS_WAKE_TIMED_OUT`, and touches nothing for `HOS_WAKE_SLEPT`, because a sleep returns
 nothing. Only then does `pc` step past the `SVC`. The wake reason alone says which call was
 parked, so the scheduler never has to remember a system call's registers.
 
@@ -334,16 +386,32 @@ inventing one would look like an answer.
 
 A wait over several handles treats a session as a legitimate object that is simply never
 the ready one, rather than as an error: a title waiting on a session and an event at once
-is a normal shape for a main loop, and nothing queues a message in this slice. Memory-layout
-calls, IPC, and the process queries are out of scope and refused by name.
+is a normal shape for a main loop, and nothing queues a message in this slice. The
+memory-layout calls that need an unmap path (`svcMapMemory`, `svcUnmapMemory`,
+`svcSetMemoryPermission`, `svcSetMemoryAttribute`), IPC, and the process queries are out of
+scope and refused by name.
+
+Two calls answer from the region table and so need a layout the same way a blocking call
+needs a scheduler. `svcSetHeapSize` resizes the heap region at the top of the address space
+and, on success, answers the heap base in `X1`; its refusals are the ones Horizon
+documents — misaligned or larger than 4 GiB is `0xCA01`, a valid size larger than the heap
+region is `0xD001`, and a size the underlying allocator cannot satisfy is `0xCE01`.
+`svcQueryMemory` walks the same region table and, for an address inside the address space,
+reports the region containing it: base, size, state, attribute, permission and the two IPC
+counts. For an address *outside* the address space the kernel still succeeds, returning a
+fabricated `Inaccessible` block whose base is the end of the address space and whose size
+reaches the top of memory — because a title uses exactly that answer to find where its
+address space ends. A context with no layout cannot answer either call, so both are refused
+rather than answered from an address space that does not exist.
 
 The module adds `POUND_ERROR_UNSUPPORTED_SYSCALL` for a well-formed `svc` whose number or
 feature the OS layer has not implemented — distinct from
 `POUND_ERROR_UNSUPPORTED_INSTRUCTION`, which is a fact about the decoder. The dispatch
 context carries the kernel, the process, the guest memory, the caller's clock and core
-number, and — through `hos_syscall_context_set_scheduler` — the scheduler that parks a
-blocked thread, rather than reading a global, so a test can drive any of them.
-`tests/test_hos_syscall.c` covers it with 33 cases.
+number, and — through `hos_syscall_context_set_scheduler` and
+`hos_syscall_context_set_layout` — the scheduler that parks a blocked thread and the address
+space that answers the memory calls, rather than reading a global, so a test can drive any
+of them. `tests/test_hos_syscall.c` covers it with 37 cases.
 
 ---
 

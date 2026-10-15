@@ -30,6 +30,8 @@ typedef struct
 // -----------------------------------------------------------------------------
 
 static error_t svc_exit_process(hos_syscall_context_t *context, guest_state_t *state);
+static error_t svc_set_heap_size(hos_syscall_context_t *context, guest_state_t *state);
+static error_t svc_query_memory(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_create_thread(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_start_thread(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_exit_thread(hos_syscall_context_t *context, guest_state_t *state);
@@ -57,6 +59,8 @@ static error_t svc_sleep_system(hos_syscall_context_t *context, guest_state_t *s
 
 static const hos_syscall_entry_t HOS_SYSCALLS[] = {
     // Implemented.
+    { HOS_SVC_SET_HEAP_SIZE, "svcSetHeapSize", svc_set_heap_size },
+    { HOS_SVC_QUERY_MEMORY, "svcQueryMemory", svc_query_memory },
     { HOS_SVC_EXIT_PROCESS, "svcExitProcess", svc_exit_process },
     { HOS_SVC_CREATE_THREAD, "svcCreateThread", svc_create_thread },
     { HOS_SVC_START_THREAD, "svcStartThread", svc_start_thread },
@@ -81,11 +85,9 @@ static const hos_syscall_entry_t HOS_SYSCALLS[] = {
 
     // Known, named, and deliberately not implemented. Each of these is waiting on a
     // slice that does not exist yet, and each says which one in the header.
-    { 0x01U, "svcSetHeapSize", NULL },
     { 0x02U, "svcSetMemoryPermission", NULL },
     { 0x04U, "svcMapMemory", NULL },
     { 0x05U, "svcUnmapMemory", NULL },
-    { 0x06U, "svcQueryMemory", NULL },
     { 0x13U, "svcMapSharedMemory", NULL },
     { 0x14U, "svcUnmapSharedMemory", NULL },
     { 0x15U, "svcCreateTransferMemory", NULL },
@@ -177,6 +179,29 @@ read_u32(const uint8_t *POUND_RESTRICT bytes)
            ((uint32_t)bytes[3] << 24);
 }
 
+/// Stores the little-endian 32-bit word `value` at `bytes`, the counterpart to
+/// `read_u32`. Used to assemble a structure off to the side before it is handed to the
+/// guest in one piece.
+static void
+store_u32(uint8_t *POUND_RESTRICT bytes, const uint32_t value)
+{
+    bytes[0] = (uint8_t)value;
+    bytes[1] = (uint8_t)(value >> 8);
+    bytes[2] = (uint8_t)(value >> 16);
+    bytes[3] = (uint8_t)(value >> 24);
+}
+
+/// Stores the little-endian 64-bit word `value` at `bytes`, the counterpart to a 64-bit
+/// `read_u32` sequence.
+static void
+store_u64(uint8_t *POUND_RESTRICT bytes, const uint64_t value)
+{
+    for (size_t index = 0U; index < sizeof(uint64_t); index++)
+    {
+        bytes[index] = (uint8_t)(value >> (8U * index));
+    }
+}
+
 /// Returns the handle an argument register carries.
 ///
 /// Handles are 32 bits and arrive in the low half of a 64-bit register, so the upper
@@ -236,6 +261,203 @@ write_guest_u64(const hos_syscall_context_t *POUND_RESTRICT context, uint64_t ad
     }
 
     return true;
+}
+
+/// Writes `size` plain bytes to guest memory at `address`.
+///
+/// The counterpart to `read_guest`, for a whole structure rather than a word. It exists
+/// so a call that has already assembled an answer can hand it over in one piece: a
+/// pointer that is not fully writable must leave the guest's memory untouched, and a
+/// field-by-field write would have written half the struct before noticing. Returns
+/// false when the whole span is not writable.
+static bool
+write_guest_bytes(const hos_syscall_context_t *POUND_RESTRICT context,
+                  uint64_t                                    address,
+                  const uint8_t *POUND_RESTRICT               bytes,
+                  size_t                                      size)
+{
+    size_t available = 0U;
+
+    if (size == 0U)
+    {
+        return true;
+    }
+
+    uint8_t *pointer = guest_memory_translate_write(context->memory, address, &available);
+
+    if ((pointer == NULL) || (available < size))
+    {
+        return false;
+    }
+
+    memcpy(pointer, bytes, size);
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Memory calls
+// -----------------------------------------------------------------------------
+//
+// These describe the address space the process runs in. They need the layout: without
+// one, there are no regions and no heap region, and an answer assembled from nothing
+// would be an invented one. A context with no layout refuses them exactly as it refuses
+// a thread call with no scheduler.
+
+/// The size of a Horizon `MemoryInfo`, which `svcQueryMemory` writes through the pointer
+/// in `X0`. Eight bytes of base, eight of size, then five 32-bit fields and padding:
+/// `base`, `size`, `state`, `attribute`, `permission`, `ipc` count, `device` count, pad.
+#define HOS_MEMORY_INFO_SIZE 0x28U
+
+/// Reports whether a memory call must be refused because the context has no layout.
+///
+/// True means the caller should return `POUND_ERROR_UNSUPPORTED_SYSCALL`, and the log line
+/// naming the call has already been written.
+static bool
+memory_call_needs_layout(const hos_syscall_context_t *POUND_RESTRICT context, const char *POUND_RESTRICT call)
+{
+    if (context->layout != NULL)
+    {
+        return false;
+    }
+
+    POUND_LOG_ERROR(&thread_logger,
+                    "Refusing %s: the context has no memory layout, so there are no regions to describe "
+                    "and no heap region to resize.",
+                    call);
+    return true;
+}
+
+static error_t
+svc_set_heap_size(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *POUND_RESTRICT state)
+{
+    if (memory_call_needs_layout(context, "svcSetHeapSize"))
+    {
+        return POUND_ERROR_UNSUPPORTED_SYSCALL;
+    }
+
+    // Horizon's signature: X1 is the requested size, and there is no X0 argument. The
+    // answer is the register X1, which the caller's stub stores through the out-pointer it
+    // saved before the trap -- libnx's is
+    // `str x0, [sp, #-16]!; svc 0x1; ldr x2, [sp], #16; str x1, [x2]`. A kernel that
+    // answered only through X0's pointer would leave a real guest storing whatever X1
+    // happened to hold.
+    const uint64_t size = state->x[1];
+
+    // Horizon's two documented refusals for the request itself: `0xCA01` is "not a multiple
+    // of 2MB" or "larger than 4GB", and `0xD001` is "larger than the heap region". Where
+    // both could apply, the request is checked before the region, matching the wrapper.
+    if (((size % HOS_MEMORY_HEAP_GRANULARITY) != 0U) || (size > HOS_MEMORY_HEAP_SIZE_MAX))
+    {
+        state->x[0] = HOS_RESULT_INVALID_SIZE;
+        return POUND_SUCCESS;
+    }
+
+    if (size > context->layout->heap_region_size)
+    {
+        state->x[0] = HOS_RESULT_OUT_OF_MEMORY;
+        return POUND_SUCCESS;
+    }
+
+    const error_t error = hos_memory_layout_set_heap_size(context->layout, size);
+
+    if (error == POUND_ERROR_ALLOCATION_FAILED)
+    {
+        // Pound's region table is its memory-block pool, and running out of descriptors is
+        // exactly what Horizon reports as `0xCE01` for this call. Refusing with an emulator
+        // error here would wedge a guest that mapped enough of its address space to fill the
+        // table, which on hardware it would have survived.
+        state->x[0] = HOS_RESULT_SLAB_EXHAUSTED;
+        return POUND_SUCCESS;
+    }
+
+    if (error != POUND_SUCCESS)
+    {
+        // Unreachable from here: the size was checked against the heap region above, which
+        // is the only refusal the layout has left. Reported rather than hidden, because a
+        // silently ignored failure would leave `heap_size` a lie.
+        return error;
+    }
+
+    // The heap base is fixed for the life of the process, so every grow and shrink answers
+    // the same address. It goes in `X1`, not `X0`, for the same reason as above.
+    state->x[1] = context->layout->heap_base;
+    state->x[0] = HOS_RESULT_SUCCESS;
+    return POUND_SUCCESS;
+}
+
+static error_t
+svc_query_memory(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *POUND_RESTRICT state)
+{
+    if (memory_call_needs_layout(context, "svcQueryMemory"))
+    {
+        return POUND_ERROR_UNSUPPORTED_SYSCALL;
+    }
+
+    // Horizon's signature: X0 is the `MemoryInfo` the kernel fills in, X1 is the caller's
+    // `PageInfo` pointer (the kernel does not touch it; the stub stores W1 through it), and
+    // X2 is the address being asked about. The register answer is `W1`.
+    const uint64_t info_address = state->x[0];
+    const uint64_t address      = state->x[2];
+
+    // The lowest page-aligned mapping containing the address. The table tiles the address
+    // space without gaps, so an address inside it lands in exactly one region and one
+    // outside lands in none.
+    const guest_memory_region_t *const region = hos_memory_layout_find(context->layout, address);
+
+    // What a non-region address is reported as. This is not a placeholder: it is the block
+    // `KPageTableBase::QueryInfo` fabricates for any address it does not contain -- above
+    // the end *or* below the start -- with base at the end of the address space and a size
+    // that reaches the top of memory, as `Inaccessible`, and with a success `Result`. A
+    // guest that queries an address it never mapped sees exactly this, so answering
+    // anything else would be the lie.
+    uint64_t base         = context->layout->address_space_end;
+    uint64_t size         = 0U - context->layout->address_space_end;
+    uint32_t mem_state    = (uint32_t)HOS_MEMORY_STATE_INACCESSIBLE;
+    uint32_t attribute    = 0U;
+    uint32_t permission   = 0U;
+    uint32_t ipc_count    = 0U;
+    uint32_t device_count = 0U;
+
+    if (region != NULL)
+    {
+        base         = region->base;
+        size         = region->size;
+        mem_state    = region->state;
+        attribute    = region->attribute;
+        permission   = region->permission;
+        ipc_count    = region->ipc_count;
+        device_count = region->device_count;
+    }
+
+    // Assembled off to the side and written in one piece, so a guest pointer that turns out
+    // not to be writable leaves the guest's memory untouched rather than half-updated.
+    uint8_t info[HOS_MEMORY_INFO_SIZE];
+
+    memset(info, 0, sizeof(info));
+    store_u64(&info[0x00], base);
+    store_u64(&info[0x08], size);
+    store_u32(&info[0x10], mem_state);
+    store_u32(&info[0x14], attribute);
+    store_u32(&info[0x18], permission);
+    store_u32(&info[0x1C], ipc_count);
+    store_u32(&info[0x20], device_count);
+    // 0x24 is the struct's padding and stays zero.
+
+    if (!write_guest_bytes(context, info_address, info, sizeof(info)))
+    {
+        // Horizon's own `Result` for an unwritable `MemoryInfo` pointer is not one Pound has
+        // established, so the module's documented convention for an unwritable out-pointer
+        // applies, and `W1` is left as the guest left it rather than given an invented value.
+        state->x[0] = HOS_RESULT_INVALID_ADDRESS;
+        return POUND_SUCCESS;
+    }
+
+    // `W1` is Horizon's `(Out) W1 PageInfo`, always zero: the kernel reports no page-level
+    // detail here. The caller's stub stores it through the `PageInfo` pointer it passed in
+    // X1, so it must be set even though Pound itself has nothing to say with it.
+    state->x[0] = HOS_RESULT_SUCCESS;
+    state->x[1] = 0U;
+    return POUND_SUCCESS;
 }
 
 // -----------------------------------------------------------------------------
@@ -442,8 +664,18 @@ svc_wait_synchronization(hos_syscall_context_t *POUND_RESTRICT context, guest_st
     {
         // The common case, and the one that must never park a thread: a wait that can be
         // satisfied now is answered now, which is what a poll is.
-        state->x[0] =
-            write_guest_u32(context, out_index_address, ready_index) ? HOS_RESULT_SUCCESS : HOS_RESULT_INVALID_ADDRESS;
+        const bool delivered = write_guest_u32(context, out_index_address, ready_index);
+
+        if (delivered)
+        {
+            // Horizon answers the index in `W1`, and the caller's stub stores that register
+            // through the out-pointer (`str w1, [x2]`). Setting it is what makes a real
+            // guest see the index; the write above only covers a guest that reads the slot
+            // through `X0` directly.
+            state->x[1] = ready_index;
+        }
+
+        state->x[0] = delivered ? HOS_RESULT_SUCCESS : HOS_RESULT_INVALID_ADDRESS;
         return POUND_SUCCESS;
     }
 
@@ -530,19 +762,28 @@ svc_connect_to_named_port(hos_syscall_context_t *POUND_RESTRICT context, guest_s
 
     if (error == POUND_SUCCESS)
     {
-        // The handle goes through the pointer Horizon leaves in X0; writing it into X1
-        // instead would put it where the guest is not looking and leave the `Result` in
-        // X0 to be read as the handle.
+        // The handle is answered in `W1`, which is where Horizon documents it, and the
+        // caller's stub is what stores it: libnx's `svcConnectToNamedPort` is
+        // `str x0, [sp, #-16]!; svc 0x1F; ldr x2, [sp], #16; str w1, [x2]`. A kernel that
+        // never set `W1` would have that stub store stale register contents as the session
+        // handle.
+        //
+        // The handle is also written through the pointer `X0` held on entry. Hardware does
+        // not do this -- the stub does -- but Pound's guests read out-parameters through
+        // `X0`, so writing it keeps both conventions agreeing on the same handle. A guest
+        // that only reads `W1` is unaffected by the extra write.
         if (!write_guest_u32(context, state->x[0], handle))
         {
             // The session was opened, but the guest cannot be told its handle. The handle
             // is taken straight back so the process does not keep a session it can never
-            // name, and the bad pointer is reported exactly as Horizon would.
+            // name, and the bad pointer is reported exactly as Horizon would. `W1` is left
+            // untouched: hardware's value here has not been established.
             hos_process_close_handle(context->process, handle);
             state->x[0] = HOS_RESULT_INVALID_ADDRESS;
             return POUND_SUCCESS;
         }
 
+        state->x[1] = handle;
         state->x[0] = HOS_RESULT_SUCCESS;
         return POUND_SUCCESS;
     }
@@ -745,12 +986,18 @@ svc_create_thread(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *
     if (!write_guest_u32(context, out_handle_address, handle))
     {
         // Created but undeliverable: give the handle straight back so the process does not
-        // hold a thread it can never name.
+        // hold a thread it can never name. `W1` is left untouched, since hardware's value on
+        // this failure has not been established.
         hos_process_close_handle(context->process, handle);
         state->x[0] = HOS_RESULT_INVALID_ADDRESS;
         return POUND_SUCCESS;
     }
 
+    // Horizon answers the handle in `W1` and the caller's stub stores that register through
+    // the out-pointer; `X1` held the entry point on entry, but it was snapshotted above, so
+    // it is free to carry the answer now. The write above keeps a guest that reads the slot
+    // through `X0` working too.
+    state->x[1] = handle;
     state->x[0] = HOS_RESULT_SUCCESS;
     return POUND_SUCCESS;
 }
@@ -888,8 +1135,17 @@ svc_get_thread_priority(hos_syscall_context_t *POUND_RESTRICT context, guest_sta
         return error;
     }
 
-    state->x[0] = write_guest_u32(context, out_priority_address, priority) ? HOS_RESULT_SUCCESS
-                                                                         : HOS_RESULT_INVALID_ADDRESS;
+    // Horizon answers the priority in `W1`, which the caller's stub stores through the
+    // out-pointer; `X1` held the handle on entry, but it was snapshotted above. The write
+    // through `X0` also happens, for a guest that reads the slot directly.
+    const bool delivered = write_guest_u32(context, out_priority_address, priority);
+
+    if (delivered)
+    {
+        state->x[1] = priority;
+    }
+
+    state->x[0] = delivered ? HOS_RESULT_SUCCESS : HOS_RESULT_INVALID_ADDRESS;
     return POUND_SUCCESS;
 }
 
@@ -973,8 +1229,17 @@ svc_get_thread_id(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *
         return error;
     }
 
-    state->x[0] =
-        write_guest_u64(context, out_thread_id_address, id) ? HOS_RESULT_SUCCESS : HOS_RESULT_INVALID_ADDRESS;
+    // Horizon's `(Out) X1 ThreadId` is 64 bits, and the caller's stub stores X1 through the
+    // out-pointer (`str x1, [x2]`); `X1` held the handle on entry, snapshotted above. The
+    // write through `X0` also happens, for a guest that reads the slot directly.
+    const bool delivered = write_guest_u64(context, out_thread_id_address, id);
+
+    if (delivered)
+    {
+        state->x[1] = id;
+    }
+
+    state->x[0] = delivered ? HOS_RESULT_SUCCESS : HOS_RESULT_INVALID_ADDRESS;
     return POUND_SUCCESS;
 }
 
@@ -1107,6 +1372,17 @@ hos_syscall_context_set_scheduler(hos_syscall_context_t *POUND_RESTRICT context,
     context->scheduler = scheduler;
 }
 
+void
+hos_syscall_context_set_layout(hos_syscall_context_t *POUND_RESTRICT context, hos_memory_layout_t *POUND_RESTRICT layout)
+{
+    if (context == NULL)
+    {
+        return;
+    }
+
+    context->layout = layout;
+}
+
 error_t
 hos_syscall_complete_block(hos_syscall_context_t *POUND_RESTRICT context,
                            guest_state_t *POUND_RESTRICT        state,
@@ -1121,12 +1397,24 @@ hos_syscall_complete_block(hos_syscall_context_t *POUND_RESTRICT context,
     switch (wake->reason)
     {
         case HOS_WAKE_SIGNALED:
+        {
             // A handle the thread was waiting on became ready. The index goes through the
             // pointer the blocking call left in X0, and only then is X0 replaced by the
             // `Result`: afterwards the address is gone.
-            state->x[0] = write_guest_u32(context, state->x[0], wake->ready_index) ? HOS_RESULT_SUCCESS
-                                                                                  : HOS_RESULT_INVALID_ADDRESS;
+            const bool delivered = write_guest_u32(context, state->x[0], wake->ready_index);
+
+            if (delivered)
+            {
+                // `W1` is Horizon's `(Out) W1 HandleIndex`, and the stub that resumes the
+                // wait stores it through the out-pointer. The wait was parked with the
+                // handle array in X1, so the register has to be set here or the stub reads
+                // back the array address as the index.
+                state->x[1] = wake->ready_index;
+            }
+
+            state->x[0] = delivered ? HOS_RESULT_SUCCESS : HOS_RESULT_INVALID_ADDRESS;
             break;
+        }
 
         case HOS_WAKE_TIMED_OUT:
             // Nothing became ready before the deadline. A timeout carries no index, so the

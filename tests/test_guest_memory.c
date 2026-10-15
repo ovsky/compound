@@ -245,8 +245,8 @@ POUND_TEST(guest_memory, translation_rejects_out_of_window_addresses)
     // security-relevant event in this module, so each refusal names the
     // address and the window it missed.
     POUND_CHECK_EQ_U64(pound_test_log_count_at(LOG_LEVEL_ERROR), 4U);
-    POUND_CHECK(pound_test_log_contains("Read fault"));
-    POUND_CHECK(pound_test_log_contains("Write fault"));
+    POUND_CHECK(pound_test_log_contains("Guest read fault"));
+    POUND_CHECK(pound_test_log_contains("Guest write fault"));
 }
 
 POUND_TEST(guest_memory, translation_rejects_null_arguments)

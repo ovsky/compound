@@ -26,6 +26,7 @@
 
 #include "guest_state.h"
 #include "hos/kernel.h"
+#include "hos/memory_layout.h"
 #include "hos/syscall.h"
 #include "log.h"
 #include "memory/guest_memory.h"
@@ -45,13 +46,16 @@
 #define TEST_HANDLES_ADDRESS (TEST_GUEST_BASE + 0x2000ULL)
 #define TEST_STRING_ADDRESS (TEST_GUEST_BASE + 0x3000ULL)
 
-/// Where a call that returns *through a pointer in `X0`* leaves its answer.
+/// Where a call that answers an out-parameter leaves its answer in guest memory.
 ///
-/// This is the shape that matters most in this file: `svcWaitSynchronization` writes the
-/// ready index there, and `svcConnectToNamedPort`, `svcCreateThread`, `svcGetThreadPriority`
-/// and `svcGetThreadId` write their one answer there. A case that read the answer out of a
-/// register would pass against a layer that had the pointer and the `Result` the wrong way
-/// round, which is exactly the bug these slots exist to catch.
+/// Horizon answers these calls twice, and this file checks both places. The *kernel's*
+/// answer is a register -- `svcWaitSynchronization`'s ready index is its `(Out) W1`, and
+/// `svcConnectToNamedPort`, `svcCreateThread`, `svcGetThreadPriority` and `svcGetThreadId`
+/// answer in `W1`/`X1` the same way -- and the caller's *stub* is what stores that register
+/// through the out-pointer the caller passed (libnx's `svc.s` does `str x0, [sp, #-16]!;
+/// svc ...; ldr x2, [sp], #16; str w1, [x2]`). Pound sets the register *and* writes the
+/// slot directly, so a case that read only one of the two would pass against a layer that
+/// answered in the wrong place for the other convention. These slots are the second place.
 #define TEST_OUT_SLOT_0 (TEST_GUEST_BASE + 0x4000ULL)
 #define TEST_OUT_SLOT_1 (TEST_GUEST_BASE + 0x4008ULL)
 
@@ -66,6 +70,7 @@ static hos_kernel_t          g_kernel;
 static hos_process_t         g_process;
 static hos_syscall_context_t g_context;
 static hos_scheduler_t       g_scheduler;
+static hos_memory_layout_t   g_layout;
 
 /// The thread the blocking cases run, and its kernel-wide identifier.
 static hos_handle_t g_thread;
@@ -101,6 +106,14 @@ read_u64_at(const uint64_t guest_address)
     return value;
 }
 
+/// Reads the little-endian 32-bit word a call left at `guest_address`.
+static uint32_t
+read_u32_at(const uint64_t guest_address)
+{
+    const uint8_t *bytes = host_at(guest_address);
+    return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) | ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
+}
+
 /// Brings up a kernel, a process, a guest window and a context over all three.
 static void
 machine_reset(void)
@@ -110,6 +123,7 @@ machine_reset(void)
     memset(&g_process, 0, sizeof(g_process));
     memset(&g_context, 0, sizeof(g_context));
     memset(&g_scheduler, 0, sizeof(g_scheduler));
+    memset(&g_layout, 0, sizeof(g_layout));
 
     g_thread       = HOS_HANDLE_INVALID;
     g_thread_id    = 0U;
@@ -155,6 +169,36 @@ machine_add_scheduler(void)
     POUND_REQUIRE(POUND_SUCCESS == hos_scheduler_init(&g_scheduler, &g_kernel));
     POUND_REQUIRE(POUND_SUCCESS == hos_scheduler_set_quantum(&g_scheduler, 4096U));
     hos_syscall_context_set_scheduler(&g_context, &g_scheduler);
+}
+
+/// Gives the machine an address-space layout over its whole window, and binds it.
+///
+/// The window is the same flat buffer `machine_reset` installed, now carved into a map
+/// region and a heap region, both `Free`. That means the gate is on: a case that wants to
+/// point the guest at writable memory has to map it first with
+/// `hos_memory_layout_map`. Separate from `machine_reset` for the same reason the
+/// scheduler is: the refusal a context with no layout produces is itself under test.
+static void
+machine_add_layout(void)
+{
+    POUND_REQUIRE(POUND_SUCCESS ==
+                  hos_memory_layout_init(&g_layout, &g_memory_region, TEST_GUEST_BASE, TEST_GUEST_BASE + TEST_GUEST_SIZE));
+    hos_syscall_context_set_layout(&g_context, &g_layout);
+}
+
+/// Maps one page of the window read|write, so a call may write an answer into it.
+///
+/// The layout's heap region is the upper half of the window, and the out-slots are in the
+/// lower half, so a page there is in the map region and Free until this is called.
+static void
+map_output_page(const uint64_t page_base)
+{
+    POUND_REQUIRE(POUND_SUCCESS == hos_memory_layout_map(&g_layout,
+                                                         page_base,
+                                                         HOS_MEMORY_PAGE_SIZE,
+                                                         (uint32_t)HOS_MEMORY_STATE_NORMAL,
+                                                         (GUEST_MEMORY_PERM_READ | GUEST_MEMORY_PERM_WRITE),
+                                                         0U));
 }
 
 /// Creates, starts and admits one thread, ready to be run.
@@ -748,11 +792,13 @@ POUND_TEST(hos_syscall, wait_synchronization_polls_the_handles)
     POUND_CHECK_EQ_U64(call(HOS_SVC_WAIT_SYNCHRONIZATION), POUND_SUCCESS);
     POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_SUCCESS);
 
-    // The index of the handle that was ready, counted from zero in the array -- and it
-    // arrived *through the pointer in X0*, not in a register. Horizon's first argument is a
-    // pointer to the index, and X0 is the `Result` on the way back out; a layer that wrote
-    // the index into X1 would leave the guest reading its own array address.
+    // The index of the handle that was ready, counted from zero in the array. It lands in
+    // two places: the slot through the pointer in X0 (Pound's belt-and-braces), and the
+    // register W1, which is Horizon's actual `(Out)` and which the caller's stub stores
+    // through that pointer itself. Both are asserted, because a layer that set only one
+    // would satisfy one convention and silently break the other.
     POUND_CHECK_EQ_U64(read_u64_at(TEST_OUT_SLOT_0), 1U);
+    POUND_CHECK_EQ_U64(g_state.x[1], 1U);
 
     // An auto-reset event is handed to exactly one waiter, so the wait consumed it and
     // the next one over the same array has nothing left to find.
@@ -768,12 +814,14 @@ POUND_TEST(hos_syscall, wait_synchronization_polls_the_handles)
     g_state.x[3] = 0U;
 
     // Poisoned first, to prove a timeout writes no index at all: a stale one would point
-    // the guest at a handle it never asked about.
+    // the guest at a handle it never asked about. W1 keeps the handle-array address it had
+    // on entry, because a timeout has no index to answer with.
     memset(host_at(TEST_OUT_SLOT_0), 0xAA, sizeof(uint64_t));
 
     POUND_CHECK_EQ_U64(call(HOS_SVC_WAIT_SYNCHRONIZATION), POUND_SUCCESS);
     POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_TIMEOUT);
     POUND_CHECK_EQ_U64(read_u64_at(TEST_OUT_SLOT_0), 0xAAAAAAAAAAAAAAAAULL);
+    POUND_CHECK_EQ_U64(g_state.x[1], TEST_HANDLES_ADDRESS);
 
     machine_teardown();
 }
@@ -896,12 +944,13 @@ POUND_TEST(hos_syscall, connect_to_named_port_returns_a_session)
     POUND_CHECK_EQ_U64(call(HOS_SVC_CONNECT_TO_NAMED_PORT), POUND_SUCCESS);
     POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_SUCCESS);
 
-    // The handle arrives *through the pointer in X0*, which is where Horizon puts it: X0
-    // is the output argument on entry and the `Result` on return. A layer that wrote the
-    // handle into X1 -- where the name pointer came in -- would leave the guest reading its
-    // own name address as a handle.
+    // The handle lands in two places: the register W1 (Horizon's `(Out)`, and what the
+    // caller's stub stores through the pointer in X0), and the slot through that pointer
+    // directly (Pound's belt-and-braces). The slot is read here, and W1 is asserted too --
+    // a layer that answered in only one of the two would break the other convention.
     const hos_handle_t session = (hos_handle_t)(uint32_t)read_u64_at(TEST_OUT_SLOT_0);
     POUND_CHECK(session != HOS_HANDLE_INVALID);
+    POUND_CHECK_EQ_U64((uint32_t)g_state.x[1], (uint32_t)session);
     POUND_CHECK_EQ_U64(hos_process_handle_count(&g_process), 1U);
 
     hos_object_type_t type = HOS_OBJECT_EVENT;
@@ -1026,6 +1075,7 @@ POUND_TEST(hos_syscall, complete_block_writes_what_each_wake_means)
     hos_wake_t wake = { HOS_WAKE_SIGNALED, 3U };
     POUND_CHECK_EQ_U64(hos_syscall_complete_block(&g_context, &g_state, &wake), POUND_SUCCESS);
     POUND_CHECK_EQ_U64(read_u64_at(TEST_OUT_SLOT_0), 3U);
+    POUND_CHECK_EQ_U64(g_state.x[1], 3U);
     POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_SUCCESS);
     POUND_CHECK_EQ_U64(g_state.pc, TEST_GUEST_BASE + 4U);
     POUND_CHECK_EQ_U64(g_context.outcome, HOS_SYSCALL_COMPLETED);
@@ -1246,6 +1296,10 @@ POUND_TEST(hos_syscall, create_start_and_query_a_thread)
     const hos_handle_t thread = (hos_handle_t)(uint32_t)read_u64_at(TEST_OUT_SLOT_0);
     POUND_CHECK(thread != HOS_HANDLE_INVALID);
 
+    // The handle is also the register answer `W1`, which is where a libnx stub reads it
+    // from before storing it through the pointer in X0.
+    POUND_CHECK_EQ_U64((uint32_t)g_state.x[1], (uint32_t)thread);
+
     uint64_t id = 0U;
     POUND_REQUIRE(POUND_SUCCESS == hos_process_thread_id(&g_process, thread, &id));
 
@@ -1270,14 +1324,17 @@ POUND_TEST(hos_syscall, create_start_and_query_a_thread)
     POUND_CHECK_EQ_U64(call(HOS_SVC_GET_THREAD_PRIORITY), POUND_SUCCESS);
     POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_SUCCESS);
     POUND_CHECK_EQ_U64((uint32_t)read_u64_at(TEST_OUT_SLOT_0), HOS_THREAD_PRIORITY_DEFAULT);
+    POUND_CHECK_EQ_U64((uint32_t)g_state.x[1], HOS_THREAD_PRIORITY_DEFAULT);
 
     // svcGetThreadId: pointer in X0, handle in X1. The answer is the kernel-wide id, which
-    // is what the scheduler runs on and not the handle the guest used to ask.
+    // is what the scheduler runs on and not the handle the guest used to ask. It is 64 bits
+    // and answers in X1, unlike the 32-bit W1 of the other calls.
     g_state.x[0] = TEST_OUT_SLOT_1;
     g_state.x[1] = thread;
     POUND_CHECK_EQ_U64(call(HOS_SVC_GET_THREAD_ID), POUND_SUCCESS);
     POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_SUCCESS);
     POUND_CHECK_EQ_U64(read_u64_at(TEST_OUT_SLOT_1), id);
+    POUND_CHECK_EQ_U64(g_state.x[1], id);
 
     // svcStartThread: the handle in X0 and nothing else. Now it is schedulable.
     g_state.x[0] = thread;
@@ -1305,6 +1362,7 @@ POUND_TEST(hos_syscall, create_start_and_query_a_thread)
     g_state.x[1] = thread;
     POUND_CHECK_EQ_U64(call(HOS_SVC_GET_THREAD_PRIORITY), POUND_SUCCESS);
     POUND_CHECK_EQ_U64((uint32_t)read_u64_at(TEST_OUT_SLOT_0), 0x10U);
+    POUND_CHECK_EQ_U64((uint32_t)g_state.x[1], 0x10U);
 
     machine_teardown();
 }
@@ -1380,6 +1438,159 @@ POUND_TEST(hos_syscall, exit_thread_finishes_the_calling_thread)
 }
 
 // -----------------------------------------------------------------------------
+// Memory calls: svcSetHeapSize and svcQueryMemory
+// -----------------------------------------------------------------------------
+//
+// These answer from the region table, so a case has to give the machine a layout first.
+// The window is small -- 64 KiB -- which is enough to exercise the shape of every answer
+// and every refusal without pretending to be a real heap: the heap region is 32 KiB, so
+// the only *size* `svcSetHeapSize` can accept here is zero, and every non-zero aligned
+// request is the documented "larger than the heap region" refusal.
+
+POUND_TEST(hos_syscall, set_heap_size_needs_a_layout)
+{
+    machine_reset();
+
+    // No layout: there is no heap region to resize, so the call is refused as an
+    // unimplemented feature rather than answered from an address space that does not exist.
+    g_state.x[1] = 0U;
+    pound_test_log_reset();
+
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SET_HEAP_SIZE), POUND_ERROR_UNSUPPORTED_SYSCALL);
+    POUND_CHECK(pound_test_log_contains("no memory layout"));
+    POUND_CHECK_EQ_U64(g_state.pc, TEST_GUEST_BASE);
+    POUND_CHECK_EQ_U64(g_state.x[0], UINT64_C(0));
+
+    machine_teardown();
+}
+
+POUND_TEST(hos_syscall, set_heap_size_answers_the_heap_base_and_its_refusals)
+{
+    machine_reset();
+    machine_add_layout();
+
+    const uint64_t heap_base = TEST_GUEST_BASE + (TEST_GUEST_SIZE / 2U);
+
+    // Not a multiple of 2MB: 0xCA01, the request refused before the region is consulted.
+    g_state.pc   = TEST_GUEST_BASE;
+    g_state.x[1] = HOS_MEMORY_HEAP_GRANULARITY / 2U;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SET_HEAP_SIZE), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_SIZE);
+    POUND_CHECK_EQ_U64(g_state.pc, TEST_GUEST_BASE + 4U);
+
+    // Larger than 4GB, but aligned: still 0xCA01.
+    g_state.pc   = TEST_GUEST_BASE;
+    g_state.x[1] = HOS_MEMORY_HEAP_SIZE_MAX + HOS_MEMORY_HEAP_GRANULARITY;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SET_HEAP_SIZE), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_SIZE);
+
+    // Aligned and within 4GB, but larger than the 32 KiB heap region: 0xD001.
+    g_state.pc   = TEST_GUEST_BASE;
+    g_state.x[1] = HOS_MEMORY_HEAP_GRANULARITY;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SET_HEAP_SIZE), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_OUT_OF_MEMORY);
+    POUND_CHECK_EQ_U64(g_layout.heap_size, 0U);
+
+    // Zero is a legitimate size, and the only one this window accepts. The answer is the
+    // base address in X1 -- Horizon's `(Out) X1 HeapAddress` -- not in X0.
+    g_state.pc   = TEST_GUEST_BASE;
+    g_state.x[1] = 0U;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SET_HEAP_SIZE), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[1], heap_base);
+    POUND_CHECK_EQ_U64(g_state.pc, TEST_GUEST_BASE + 4U);
+    POUND_CHECK_EQ_U64(g_layout.heap_size, 0U);
+
+    machine_teardown();
+}
+
+POUND_TEST(hos_syscall, query_memory_needs_a_layout)
+{
+    machine_reset();
+
+    g_state.x[0] = TEST_OUT_SLOT_0;
+    g_state.x[2] = TEST_GUEST_BASE;
+    pound_test_log_reset();
+
+    POUND_CHECK_EQ_U64(call(HOS_SVC_QUERY_MEMORY), POUND_ERROR_UNSUPPORTED_SYSCALL);
+    POUND_CHECK(pound_test_log_contains("no memory layout"));
+    POUND_CHECK_EQ_U64(g_state.pc, TEST_GUEST_BASE);
+
+    machine_teardown();
+}
+
+POUND_TEST(hos_syscall, query_memory_reports_a_region_and_fabricates_one_outside)
+{
+    machine_reset();
+    machine_add_layout();
+
+    // Map the page the out-slot lives in, read|write, so the MemoryInfo has somewhere to go.
+    map_output_page(TEST_GUEST_BASE + 0x4000U);
+
+    // A mapped region: the answer is that region, field for field.
+    g_state.pc   = TEST_GUEST_BASE;
+    g_state.x[0] = TEST_OUT_SLOT_0;
+    g_state.x[2] = TEST_GUEST_BASE + 0x4000U;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_QUERY_MEMORY), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[1], 0U); // Horizon's `(Out) W1 PageInfo`, always zero
+    POUND_CHECK_EQ_U64(read_u64_at(TEST_OUT_SLOT_0), TEST_GUEST_BASE + 0x4000U);
+    POUND_CHECK_EQ_U64(read_u64_at(TEST_OUT_SLOT_0 + 8U), 0x1000U);
+    POUND_CHECK_EQ_U64(read_u32_at(TEST_OUT_SLOT_0 + 0x10U), HOS_MEMORY_STATE_NORMAL);
+    POUND_CHECK_EQ_U64(read_u32_at(TEST_OUT_SLOT_0 + 0x14U), 0U);
+    POUND_CHECK_EQ_U64(read_u32_at(TEST_OUT_SLOT_0 + 0x18U), GUEST_MEMORY_PERM_READ | GUEST_MEMORY_PERM_WRITE);
+    POUND_CHECK_EQ_U64(read_u32_at(TEST_OUT_SLOT_0 + 0x1CU), 0U);
+    POUND_CHECK_EQ_U64(read_u32_at(TEST_OUT_SLOT_0 + 0x20U), 0U);
+
+    // A Free region inside the address space: reported as itself, with no permission.
+    g_state.pc   = TEST_GUEST_BASE;
+    g_state.x[0] = TEST_OUT_SLOT_0;
+    g_state.x[2] = TEST_GUEST_BASE + 0x1000U;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_QUERY_MEMORY), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[1], 0U);
+    POUND_CHECK_EQ_U64(read_u64_at(TEST_OUT_SLOT_0), TEST_GUEST_BASE);
+    POUND_CHECK_EQ_U64(read_u64_at(TEST_OUT_SLOT_0 + 8U), 0x4000U);
+    POUND_CHECK_EQ_U64(read_u32_at(TEST_OUT_SLOT_0 + 0x10U), HOS_MEMORY_STATE_FREE);
+    POUND_CHECK_EQ_U64(read_u32_at(TEST_OUT_SLOT_0 + 0x18U), 0U);
+
+    // An address outside the address space gets Horizon's fabricated `Inaccessible` block:
+    // base at the end of the address space, a size reaching the top of memory, and success.
+    g_state.pc   = TEST_GUEST_BASE;
+    g_state.x[0] = TEST_OUT_SLOT_0;
+    g_state.x[2] = TEST_GUEST_BASE + TEST_GUEST_SIZE;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_QUERY_MEMORY), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[1], 0U);
+    POUND_CHECK_EQ_U64(read_u64_at(TEST_OUT_SLOT_0), TEST_GUEST_BASE + TEST_GUEST_SIZE);
+    POUND_CHECK_EQ_U64(read_u64_at(TEST_OUT_SLOT_0 + 8U), (uint64_t)0U - (TEST_GUEST_BASE + TEST_GUEST_SIZE));
+    POUND_CHECK_EQ_U64(read_u32_at(TEST_OUT_SLOT_0 + 0x10U), HOS_MEMORY_STATE_INACCESSIBLE);
+
+    // Below the address space gets the same block. The kernel's containment check is
+    // `start <= addr < end`, so "below" is simply not contained.
+    g_state.pc   = TEST_GUEST_BASE;
+    g_state.x[0] = TEST_OUT_SLOT_0;
+    g_state.x[2] = TEST_GUEST_BASE - 0x1000U;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_QUERY_MEMORY), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_SUCCESS);
+    POUND_CHECK_EQ_U64(read_u64_at(TEST_OUT_SLOT_0), TEST_GUEST_BASE + TEST_GUEST_SIZE);
+    POUND_CHECK_EQ_U64(read_u32_at(TEST_OUT_SLOT_0 + 0x10U), HOS_MEMORY_STATE_INACCESSIBLE);
+
+    // An unwritable MemoryInfo pointer: the region is Free, so the write is refused and the
+    // call reports a bad address rather than half-writing the struct. X1 is left as the
+    // guest left it, since hardware's value on this failure is not established.
+    g_state.pc   = TEST_GUEST_BASE;
+    g_state.x[0] = TEST_GUEST_BASE + 0x1000U; // Free, inside the window
+    g_state.x[1] = 0xABCDEFU;
+    g_state.x[2] = TEST_GUEST_BASE + 0x4000U;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_QUERY_MEMORY), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_ADDRESS);
+    POUND_CHECK_EQ_U64(g_state.x[1], 0xABCDEFU);
+
+    machine_teardown();
+}
+
+// -----------------------------------------------------------------------------
 
 POUND_TEST_SUITE(hos_syscall,
                  POUND_TEST_CASE(hos_syscall, name_table),
@@ -1414,6 +1625,10 @@ POUND_TEST_SUITE(hos_syscall,
                  POUND_TEST_CASE(hos_syscall, create_start_and_query_a_thread),
                  POUND_TEST_CASE(hos_syscall, thread_calls_report_an_invalid_handle),
                  POUND_TEST_CASE(hos_syscall, an_out_of_range_priority_is_refused_not_answered),
-                 POUND_TEST_CASE(hos_syscall, exit_thread_finishes_the_calling_thread))
+                 POUND_TEST_CASE(hos_syscall, exit_thread_finishes_the_calling_thread),
+                 POUND_TEST_CASE(hos_syscall, set_heap_size_needs_a_layout),
+                 POUND_TEST_CASE(hos_syscall, set_heap_size_answers_the_heap_base_and_its_refusals),
+                 POUND_TEST_CASE(hos_syscall, query_memory_needs_a_layout),
+                 POUND_TEST_CASE(hos_syscall, query_memory_reports_a_region_and_fabricates_one_outside))
 
 /*** end of file ***/
