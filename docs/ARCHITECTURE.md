@@ -313,8 +313,30 @@ that exceeds 4 GiB is `0xCA01`, a size larger than the heap region is `0xD001`. 
 region cannot be grown because the region table itself is full, the module reports
 `POUND_ERROR_ALLOCATION_FAILED`, which the syscall layer maps to `0xCE01` — the one place a
 slab-style refusal is reachable, and the only honest one, since it is a real host-side
-exhaustion rather than a fabricated `Result`. `tests/test_hos_memory_layout.c` covers it
-with 9 cases, including fetching through the gate from the interpreter.
+exhaustion rather than a fabricated `Result`.
+
+Two more operations change a region that already exists rather than carve out a new one, and
+they are where the layout stops modelling only the *shape* of the address space and starts
+modelling Horizon's own *rules* for changing it. `hos_memory_layout_set_permission` is
+`svcSetMemoryPermission` and `hos_memory_layout_set_attribute` is `svcSetMemoryAttribute`.
+Both take a half-open range and apply it exactly: a range that covers only part of a region
+splits the region, so the bytes outside it are untouched, and a range that already has the
+configuration asked for is answered without splitting, because Horizon short-circuits it
+before allocating anything.
+
+The rules are the kernel's `CheckMemoryState`. A range must lie inside the address space and
+be *homogeneous* — every region it covers must agree with the others about state, permission
+and attribute — so a range straddling a boundary between two differently-configured regions
+is refused whole rather than half-changed. A region may be reprotected only if it carries
+`FlagCanReprotect` (`0x100`) and no attribute: `Code` does not carry the flag, so making it
+writable is refused rather than done, and a region carrying an attribute the caller is not
+masking — a locked page, say — is not eligible either. An attribute change may set or clear
+exactly the uncached bit (`0x8`), and only on a region carrying `FlagCanChangeAttribute`
+(`0x1000000`); Pound's host memory has no separate cached view, so the bit lives in the table
+and comes back out through `svcQueryMemory` exactly as it went in. Splitting for either
+operation pre-checks the table and reports `POUND_ERROR_ALLOCATION_FAILED` — `0xCE01` again —
+rather than half-making the change. `tests/test_hos_memory_layout.c` covers the module with
+16 cases, including fetching through the gate from the interpreter.
 
 ### Horizon OS system calls — `src/core/hos/syscall.{h,c}`
 
@@ -387,11 +409,10 @@ inventing one would look like an answer.
 A wait over several handles treats a session as a legitimate object that is simply never
 the ready one, rather than as an error: a title waiting on a session and an event at once
 is a normal shape for a main loop, and nothing queues a message in this slice. The
-memory-layout calls that need an unmap path (`svcMapMemory`, `svcUnmapMemory`,
-`svcSetMemoryPermission`, `svcSetMemoryAttribute`), IPC, and the process queries are out of
-scope and refused by name.
+memory-layout calls that need an alias path (`svcMapMemory` and `svcUnmapMemory`), IPC, and
+the process queries are out of scope and refused by name.
 
-Two calls answer from the region table and so need a layout the same way a blocking call
+Four calls answer from the region table and so need a layout the same way a blocking call
 needs a scheduler. `svcSetHeapSize` resizes the heap region at the top of the address space
 and, on success, answers the heap base in `X1`; its refusals are the ones Horizon
 documents — misaligned or larger than 4 GiB is `0xCA01`, a valid size larger than the heap
@@ -404,6 +425,16 @@ reaches the top of memory — because a title uses exactly that answer to find w
 address space ends. A context with no layout cannot answer either call, so both are refused
 rather than answered from an address space that does not exist.
 
+Two more answer from the table by changing it. `svcSetMemoryPermission` and
+`svcSetMemoryAttribute` validate their arguments in the syscall layer, where Horizon does —
+a misaligned address is `0xCC01`, a size that is zero or not a whole number of pages is
+`0xCA01`, an unacceptable permission is `0xD801`, an attribute mask and value that do not
+nest or reach outside the one changeable bit are `0xE801` — and hand an aligned range to the
+layout, whose two refusals ("not in the address space" and "a region in it may not be
+changed") both collapse to the kernel's single `0xD401`, and whose table-full exhaustion is
+`0xCE01`. Because both calls write the same table `svcQueryMemory` reads, a change made by
+one is visible in the other.
+
 The module adds `POUND_ERROR_UNSUPPORTED_SYSCALL` for a well-formed `svc` whose number or
 feature the OS layer has not implemented — distinct from
 `POUND_ERROR_UNSUPPORTED_INSTRUCTION`, which is a fact about the decoder. The dispatch
@@ -411,7 +442,7 @@ context carries the kernel, the process, the guest memory, the caller's clock an
 number, and — through `hos_syscall_context_set_scheduler` and
 `hos_syscall_context_set_layout` — the scheduler that parks a blocked thread and the address
 space that answers the memory calls, rather than reading a global, so a test can drive any
-of them. `tests/test_hos_syscall.c` covers it with 37 cases.
+of them. `tests/test_hos_syscall.c` covers it with 41 cases.
 
 ---
 

@@ -31,6 +31,8 @@ typedef struct
 
 static error_t svc_exit_process(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_set_heap_size(hos_syscall_context_t *context, guest_state_t *state);
+static error_t svc_set_memory_permission(hos_syscall_context_t *context, guest_state_t *state);
+static error_t svc_set_memory_attribute(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_query_memory(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_create_thread(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_start_thread(hos_syscall_context_t *context, guest_state_t *state);
@@ -60,6 +62,8 @@ static error_t svc_sleep_system(hos_syscall_context_t *context, guest_state_t *s
 static const hos_syscall_entry_t HOS_SYSCALLS[] = {
     // Implemented.
     { HOS_SVC_SET_HEAP_SIZE, "svcSetHeapSize", svc_set_heap_size },
+    { HOS_SVC_SET_MEMORY_PERMISSION, "svcSetMemoryPermission", svc_set_memory_permission },
+    { HOS_SVC_SET_MEMORY_ATTRIBUTE, "svcSetMemoryAttribute", svc_set_memory_attribute },
     { HOS_SVC_QUERY_MEMORY, "svcQueryMemory", svc_query_memory },
     { HOS_SVC_EXIT_PROCESS, "svcExitProcess", svc_exit_process },
     { HOS_SVC_CREATE_THREAD, "svcCreateThread", svc_create_thread },
@@ -85,7 +89,6 @@ static const hos_syscall_entry_t HOS_SYSCALLS[] = {
 
     // Known, named, and deliberately not implemented. Each of these is waiting on a
     // slice that does not exist yet, and each says which one in the header.
-    { 0x02U, "svcSetMemoryPermission", NULL },
     { 0x04U, "svcMapMemory", NULL },
     { 0x05U, "svcUnmapMemory", NULL },
     { 0x13U, "svcMapSharedMemory", NULL },
@@ -140,7 +143,7 @@ hos_syscall_name(uint32_t number)
 /// Translates `size` contiguous readable guest bytes at `address`.
 ///
 /// Returns false when the span is not fully mapped, which every caller turns into the
-/// kernel's own `HOS_RESULT_INVALID_ADDRESS` rather than into an emulator error: a guest
+/// kernel's own `HOS_RESULT_INVALID_POINTER` rather than into an emulator error: a guest
 /// pointer that is not mapped is something Horizon itself reports, and a guest is
 /// allowed to make that mistake without stopping the machine.
 static bool
@@ -218,7 +221,7 @@ handle_argument(uint64_t value)
 /// The counterpart to `read_guest`, and the reason the out-parameter calls write through
 /// the pointer in `X0` before they replace `X0` with their `Result`: once the `Result` is
 /// in the register, the address is gone. Returns false when the four bytes are not
-/// writable, which every caller turns into `HOS_RESULT_INVALID_ADDRESS`.
+/// writable, which every caller turns into `HOS_RESULT_INVALID_POINTER`.
 static bool
 write_guest_u32(const hos_syscall_context_t *POUND_RESTRICT context, uint64_t address, uint32_t value)
 {
@@ -327,6 +330,49 @@ memory_call_needs_layout(const hos_syscall_context_t *POUND_RESTRICT context, co
     return true;
 }
 
+/// Translates a failure from the region table into the `Result` the two
+/// reprotection calls report, and says whether it could.
+///
+/// Both calls answer the same word -- Horizon's `ResultInvalidCurrentMemory`,
+/// `0xD401` -- for "the range is not in the address space" and for "a region in
+/// it may not be changed", so the layout's two errors collapse to one here. An
+/// error with no documented `Result` is left for the caller to propagate rather
+/// than invented into one.
+static bool
+memory_layout_error_to_result(error_t error, uint32_t *POUND_RESTRICT out_result)
+{
+    switch (error)
+    {
+        case POUND_SUCCESS:
+            *out_result = HOS_RESULT_SUCCESS;
+            return true;
+
+        case POUND_ERROR_GUEST_ADDRESS_OUT_OF_BOUNDS:
+        case POUND_ERROR_INVALID_ARGUMENT:
+            *out_result = HOS_RESULT_INVALID_CURRENT_MEMORY;
+            return true;
+
+        case POUND_ERROR_ALLOCATION_FAILED:
+            *out_result = HOS_RESULT_SLAB_EXHAUSTED;
+            return true;
+
+        default:
+            return false;
+    }
+}
+
+/// The permissions `svcSetMemoryPermission` accepts: no access, read-only and
+/// read-write.
+///
+/// The kernel refuses write-only, and refuses execute here because that is
+/// `svcSetProcessMemoryPermission`'s job, so exactly three words are valid.
+static bool
+memory_permission_is_settable(const uint32_t permission)
+{
+    return (permission == 0U) || (permission == (uint32_t)GUEST_MEMORY_PERM_READ) ||
+           (permission == (uint32_t)(GUEST_MEMORY_PERM_READ | GUEST_MEMORY_PERM_WRITE));
+}
+
 static error_t
 svc_set_heap_size(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *POUND_RESTRICT state)
 {
@@ -382,6 +428,115 @@ svc_set_heap_size(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *
     // the same address. It goes in `X1`, not `X0`, for the same reason as above.
     state->x[1] = context->layout->heap_base;
     state->x[0] = HOS_RESULT_SUCCESS;
+    return POUND_SUCCESS;
+}
+
+static error_t
+svc_set_memory_permission(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *POUND_RESTRICT state)
+{
+    if (memory_call_needs_layout(context, "svcSetMemoryPermission"))
+    {
+        return POUND_ERROR_UNSUPPORTED_SYSCALL;
+    }
+
+    // Horizon's signature: X0 is the address, X1 the size, W2 the permission. There is no
+    // out-pointer; the whole answer is `W0`.
+    const uint64_t address    = state->x[0];
+    const uint64_t size       = state->x[1];
+    const uint32_t permission = (uint32_t)state->x[2];
+
+    // The checks are Horizon's, in its order: the address first (`0xCC01`), then the size
+    // (`0xCA01`, which covers zero), then the permission (`0xD801`). The overflow guard is
+    // the kernel's own `addr < addr + size`; a range that wraps is not in the address
+    // space, which is `0xD401`.
+    if ((address % HOS_MEMORY_PAGE_SIZE) != 0U)
+    {
+        state->x[0] = HOS_RESULT_INVALID_ADDRESS;
+        return POUND_SUCCESS;
+    }
+
+    if ((size == 0U) || ((size % HOS_MEMORY_PAGE_SIZE) != 0U))
+    {
+        state->x[0] = HOS_RESULT_INVALID_SIZE;
+        return POUND_SUCCESS;
+    }
+
+    if (address > (UINT64_MAX - size))
+    {
+        state->x[0] = HOS_RESULT_INVALID_CURRENT_MEMORY;
+        return POUND_SUCCESS;
+    }
+
+    if (!memory_permission_is_settable(permission))
+    {
+        state->x[0] = HOS_RESULT_INVALID_NEW_PERMISSION;
+        return POUND_SUCCESS;
+    }
+
+    uint32_t      result = HOS_RESULT_SUCCESS;
+    const error_t error  = hos_memory_layout_set_permission(context->layout, address, size, permission);
+
+    if (!memory_layout_error_to_result(error, &result))
+    {
+        return error;
+    }
+
+    state->x[0] = result;
+    return POUND_SUCCESS;
+}
+
+static error_t
+svc_set_memory_attribute(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *POUND_RESTRICT state)
+{
+    if (memory_call_needs_layout(context, "svcSetMemoryAttribute"))
+    {
+        return POUND_ERROR_UNSUPPORTED_SYSCALL;
+    }
+
+    // Horizon's signature: X0 the address, X1 the size, W2 the mask, W3 the value.
+    const uint64_t address = state->x[0];
+    const uint64_t size    = state->x[1];
+    const uint32_t mask    = (uint32_t)state->x[2];
+    const uint32_t value   = (uint32_t)state->x[3];
+
+    if ((address % HOS_MEMORY_PAGE_SIZE) != 0U)
+    {
+        state->x[0] = HOS_RESULT_INVALID_ADDRESS;
+        return POUND_SUCCESS;
+    }
+
+    if ((size == 0U) || ((size % HOS_MEMORY_PAGE_SIZE) != 0U))
+    {
+        state->x[0] = HOS_RESULT_INVALID_SIZE;
+        return POUND_SUCCESS;
+    }
+
+    if (address > (UINT64_MAX - size))
+    {
+        state->x[0] = HOS_RESULT_INVALID_CURRENT_MEMORY;
+        return POUND_SUCCESS;
+    }
+
+    // The value must be a subset of the mask -- a bit a caller gives a value for must also
+    // be one it is asking to change -- and neither may reach outside the single attribute
+    // Pound can change. Anything else is the kernel's `0xE801`.
+    const uint32_t supported = HOS_MEMORY_ATTRIBUTE_UNCACHED;
+
+    if (((mask | value) != mask) || ((mask | value | supported) != supported))
+    {
+        state->x[0] = HOS_RESULT_INVALID_COMBINATION;
+        return POUND_SUCCESS;
+    }
+
+    uint32_t      result = HOS_RESULT_SUCCESS;
+    const error_t error  = hos_memory_layout_set_attribute(context->layout, address, size, mask, value);
+
+    if (!memory_layout_error_to_result(error, &result))
+    {
+        return error;
+    }
+
+    state->x[0] = result;
     return POUND_SUCCESS;
 }
 
@@ -448,7 +603,7 @@ svc_query_memory(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *P
         // Horizon's own `Result` for an unwritable `MemoryInfo` pointer is not one Pound has
         // established, so the module's documented convention for an unwritable out-pointer
         // applies, and `W1` is left as the guest left it rather than given an invented value.
-        state->x[0] = HOS_RESULT_INVALID_ADDRESS;
+        state->x[0] = HOS_RESULT_INVALID_POINTER;
         return POUND_SUCCESS;
     }
 
@@ -626,7 +781,7 @@ svc_wait_synchronization(hos_syscall_context_t *POUND_RESTRICT context, guest_st
 
     if (!read_guest(context, handles_address, (size_t)(uint32_t)count * sizeof(uint32_t), &bytes))
     {
-        state->x[0] = HOS_RESULT_INVALID_ADDRESS;
+        state->x[0] = HOS_RESULT_INVALID_POINTER;
         return POUND_SUCCESS;
     }
 
@@ -675,7 +830,7 @@ svc_wait_synchronization(hos_syscall_context_t *POUND_RESTRICT context, guest_st
             state->x[1] = ready_index;
         }
 
-        state->x[0] = delivered ? HOS_RESULT_SUCCESS : HOS_RESULT_INVALID_ADDRESS;
+        state->x[0] = delivered ? HOS_RESULT_SUCCESS : HOS_RESULT_INVALID_POINTER;
         return POUND_SUCCESS;
     }
 
@@ -726,7 +881,7 @@ svc_connect_to_named_port(hos_syscall_context_t *POUND_RESTRICT context, guest_s
 
     if (!read_guest(context, state->x[1], HOS_SYSCALL_SERVICE_NAME_MAX, &bytes))
     {
-        state->x[0] = HOS_RESULT_INVALID_ADDRESS;
+        state->x[0] = HOS_RESULT_INVALID_POINTER;
         return POUND_SUCCESS;
     }
 
@@ -779,7 +934,7 @@ svc_connect_to_named_port(hos_syscall_context_t *POUND_RESTRICT context, guest_s
             // name, and the bad pointer is reported exactly as Horizon would. `W1` is left
             // untouched: hardware's value here has not been established.
             hos_process_close_handle(context->process, handle);
-            state->x[0] = HOS_RESULT_INVALID_ADDRESS;
+            state->x[0] = HOS_RESULT_INVALID_POINTER;
             return POUND_SUCCESS;
         }
 
@@ -838,7 +993,7 @@ svc_flush_data_cache(hos_syscall_context_t *POUND_RESTRICT context, guest_state_
     // this is the last place it is cheap to notice.
     if (!read_guest(context, state->x[0], (size_t)size, &bytes))
     {
-        state->x[0] = HOS_RESULT_INVALID_ADDRESS;
+        state->x[0] = HOS_RESULT_INVALID_POINTER;
         return POUND_SUCCESS;
     }
 
@@ -869,7 +1024,7 @@ svc_output_debug_string(hos_syscall_context_t *POUND_RESTRICT context, guest_sta
 
     if (!read_guest(context, state->x[0], (size_t)size, &bytes))
     {
-        state->x[0] = HOS_RESULT_INVALID_ADDRESS;
+        state->x[0] = HOS_RESULT_INVALID_POINTER;
         return POUND_SUCCESS;
     }
 
@@ -989,7 +1144,7 @@ svc_create_thread(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *
         // hold a thread it can never name. `W1` is left untouched, since hardware's value on
         // this failure has not been established.
         hos_process_close_handle(context->process, handle);
-        state->x[0] = HOS_RESULT_INVALID_ADDRESS;
+        state->x[0] = HOS_RESULT_INVALID_POINTER;
         return POUND_SUCCESS;
     }
 
@@ -1145,7 +1300,7 @@ svc_get_thread_priority(hos_syscall_context_t *POUND_RESTRICT context, guest_sta
         state->x[1] = priority;
     }
 
-    state->x[0] = delivered ? HOS_RESULT_SUCCESS : HOS_RESULT_INVALID_ADDRESS;
+    state->x[0] = delivered ? HOS_RESULT_SUCCESS : HOS_RESULT_INVALID_POINTER;
     return POUND_SUCCESS;
 }
 
@@ -1239,7 +1394,7 @@ svc_get_thread_id(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *
         state->x[1] = id;
     }
 
-    state->x[0] = delivered ? HOS_RESULT_SUCCESS : HOS_RESULT_INVALID_ADDRESS;
+    state->x[0] = delivered ? HOS_RESULT_SUCCESS : HOS_RESULT_INVALID_POINTER;
     return POUND_SUCCESS;
 }
 
@@ -1412,7 +1567,7 @@ hos_syscall_complete_block(hos_syscall_context_t *POUND_RESTRICT context,
                 state->x[1] = wake->ready_index;
             }
 
-            state->x[0] = delivered ? HOS_RESULT_SUCCESS : HOS_RESULT_INVALID_ADDRESS;
+            state->x[0] = delivered ? HOS_RESULT_SUCCESS : HOS_RESULT_INVALID_POINTER;
             break;
         }
 

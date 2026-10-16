@@ -511,7 +511,7 @@ POUND_TEST(hos_syscall, cache_flushes_validate_the_range_they_are_given)
     g_state.x[0] = TEST_GUEST_BASE + 0x100ULL;
     g_state.x[1] = TEST_GUEST_SIZE;
     POUND_CHECK_EQ_U64(call(HOS_SVC_FLUSH_DATA_CACHE), POUND_SUCCESS);
-    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_ADDRESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_POINTER);
     POUND_CHECK_EQ_U64(g_state.pc, TEST_GUEST_BASE + 16U);
 
     machine_teardown();
@@ -542,7 +542,7 @@ POUND_TEST(hos_syscall, output_debug_string_writes_to_the_log)
     g_state.x[0] = TEST_UNMAPPED_ADDRESS;
     g_state.x[1] = 8U;
     POUND_CHECK_EQ_U64(call(HOS_SVC_OUTPUT_DEBUG_STRING), POUND_SUCCESS);
-    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_ADDRESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_POINTER);
 
     machine_teardown();
 }
@@ -872,7 +872,7 @@ POUND_TEST(hos_syscall, wait_synchronization_rejects_what_it_cannot_do)
     // An array the guest does not own.
     g_state.x[1] = TEST_UNMAPPED_ADDRESS;
     POUND_CHECK_EQ_U64(call(HOS_SVC_WAIT_SYNCHRONIZATION), POUND_SUCCESS);
-    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_ADDRESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_POINTER);
 
     // More handles than the kernel takes.
     g_state.x[1] = TEST_HANDLES_ADDRESS;
@@ -1002,7 +1002,7 @@ POUND_TEST(hos_syscall, connect_to_named_port_reports_an_unwritable_out_pointer)
     g_state.x[1] = TEST_NAME_ADDRESS;
 
     POUND_CHECK_EQ_U64(call(HOS_SVC_CONNECT_TO_NAMED_PORT), POUND_SUCCESS);
-    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_ADDRESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_POINTER);
     POUND_CHECK_EQ_U64(hos_process_handle_count(&g_process), 0U);
     POUND_CHECK_EQ_U64(hos_kernel_object_count(&g_kernel), 0U);
 
@@ -1048,7 +1048,7 @@ POUND_TEST(hos_syscall, connect_to_named_port_rejects_a_nameless_port)
     // And a name the guest does not own is reported the way the kernel reports it.
     g_state.x[1] = TEST_UNMAPPED_ADDRESS;
     POUND_CHECK_EQ_U64(call(HOS_SVC_CONNECT_TO_NAMED_PORT), POUND_SUCCESS);
-    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_ADDRESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_POINTER);
 
     machine_teardown();
 }
@@ -1584,8 +1584,175 @@ POUND_TEST(hos_syscall, query_memory_reports_a_region_and_fabricates_one_outside
     g_state.x[1] = 0xABCDEFU;
     g_state.x[2] = TEST_GUEST_BASE + 0x4000U;
     POUND_CHECK_EQ_U64(call(HOS_SVC_QUERY_MEMORY), POUND_SUCCESS);
-    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_ADDRESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_POINTER);
     POUND_CHECK_EQ_U64(g_state.x[1], 0xABCDEFU);
+
+    machine_teardown();
+}
+
+// -----------------------------------------------------------------------------
+// Memory calls: svcSetMemoryPermission and svcSetMemoryAttribute
+// -----------------------------------------------------------------------------
+//
+// These reprotect a range that is already mapped, so a case maps a page first. The
+// window is the same 64 KiB one, and the page they touch is in the map region.
+
+POUND_TEST(hos_syscall, set_memory_permission_needs_a_layout)
+{
+    machine_reset();
+
+    g_state.pc   = TEST_GUEST_BASE;
+    g_state.x[0] = TEST_GUEST_BASE;
+    g_state.x[1] = HOS_MEMORY_PAGE_SIZE;
+    g_state.x[2] = GUEST_MEMORY_PERM_READ;
+
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SET_MEMORY_PERMISSION), POUND_ERROR_UNSUPPORTED_SYSCALL);
+    POUND_CHECK(pound_test_log_contains("no memory layout"));
+    POUND_CHECK_EQ_U64(g_state.pc, TEST_GUEST_BASE);
+
+    machine_teardown();
+}
+
+POUND_TEST(hos_syscall, set_memory_attribute_needs_a_layout)
+{
+    machine_reset();
+
+    g_state.pc   = TEST_GUEST_BASE;
+    g_state.x[0] = TEST_GUEST_BASE;
+    g_state.x[1] = HOS_MEMORY_PAGE_SIZE;
+    g_state.x[2] = HOS_MEMORY_ATTRIBUTE_UNCACHED;
+    g_state.x[3] = HOS_MEMORY_ATTRIBUTE_UNCACHED;
+
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SET_MEMORY_ATTRIBUTE), POUND_ERROR_UNSUPPORTED_SYSCALL);
+    POUND_CHECK(pound_test_log_contains("no memory layout"));
+    POUND_CHECK_EQ_U64(g_state.pc, TEST_GUEST_BASE);
+
+    machine_teardown();
+}
+
+POUND_TEST(hos_syscall, set_memory_permission_reports_its_refusals_and_reprotects)
+{
+    machine_reset();
+    machine_add_layout();
+
+    const uint64_t normal_base = TEST_GUEST_BASE + 0x1000U;
+    map_output_page(normal_base);
+
+    // The checks are Horizon's, in its order: address, then size, then permission.
+    g_state.pc   = TEST_GUEST_BASE;
+    g_state.x[0] = normal_base + 1U; // misaligned address
+    g_state.x[1] = HOS_MEMORY_PAGE_SIZE;
+    g_state.x[2] = GUEST_MEMORY_PERM_READ;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SET_MEMORY_PERMISSION), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_ADDRESS);
+
+    g_state.x[0] = normal_base;
+    g_state.x[1] = 0U; // zero size
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SET_MEMORY_PERMISSION), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_SIZE);
+
+    g_state.x[0] = normal_base;
+    g_state.x[1] = HOS_MEMORY_PAGE_SIZE + 1U; // misaligned size
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SET_MEMORY_PERMISSION), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_SIZE);
+
+    // Write-only, and read|execute: neither is a permission this call takes.
+    g_state.x[0] = normal_base;
+    g_state.x[1] = HOS_MEMORY_PAGE_SIZE;
+    g_state.x[2] = GUEST_MEMORY_PERM_WRITE;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SET_MEMORY_PERMISSION), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_NEW_PERMISSION);
+
+    g_state.x[0] = normal_base;
+    g_state.x[2] = GUEST_MEMORY_PERM_READ | GUEST_MEMORY_PERM_EXEC;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SET_MEMORY_PERMISSION), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_NEW_PERMISSION);
+
+    // A range outside the address space, and a Free region inside it that may not be
+    // reprotected: both are the kernel's `0xD401`.
+    g_state.x[2] = GUEST_MEMORY_PERM_READ;
+    g_state.x[0] = TEST_GUEST_BASE + TEST_GUEST_SIZE;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SET_MEMORY_PERMISSION), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_CURRENT_MEMORY);
+
+    g_state.x[0] = TEST_GUEST_BASE; // Free
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SET_MEMORY_PERMISSION), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_CURRENT_MEMORY);
+
+    // Success: the mapped page becomes read-only, and the gate agrees.
+    g_state.x[0] = normal_base;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SET_MEMORY_PERMISSION), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_SUCCESS);
+
+    const guest_memory_region_t *region = hos_memory_layout_find(&g_layout, normal_base);
+    POUND_REQUIRE(region != NULL);
+    POUND_CHECK_EQ_U64(region->permission, GUEST_MEMORY_PERM_READ);
+
+    size_t bytes = 0U;
+    POUND_CHECK_PTR_NON_NULL(guest_memory_translate_read(&g_memory_region, normal_base, &bytes));
+    POUND_CHECK_PTR_NULL(guest_memory_translate_write(&g_memory_region, normal_base, &bytes));
+
+    machine_teardown();
+}
+
+POUND_TEST(hos_syscall, set_memory_attribute_reports_its_refusals_and_changes_the_bit)
+{
+    machine_reset();
+    machine_add_layout();
+
+    const uint64_t normal_base = TEST_GUEST_BASE + 0x1000U;
+    map_output_page(normal_base);
+
+    // Only the uncached bit may be changed: a mask reaching for the locked bit is the
+    // kernel's `0xE801`, even before the range is looked at.
+    g_state.pc   = TEST_GUEST_BASE;
+    g_state.x[0] = normal_base;
+    g_state.x[1] = HOS_MEMORY_PAGE_SIZE;
+    g_state.x[2] = HOS_MEMORY_ATTRIBUTE_LOCKED;
+    g_state.x[3] = HOS_MEMORY_ATTRIBUTE_LOCKED;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SET_MEMORY_ATTRIBUTE), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_COMBINATION);
+
+    // A value that is not a subset of the mask is refused the same way.
+    g_state.x[0] = normal_base;
+    g_state.x[2] = HOS_MEMORY_ATTRIBUTE_UNCACHED;
+    g_state.x[3] = HOS_MEMORY_ATTRIBUTE_LOCKED;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SET_MEMORY_ATTRIBUTE), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_COMBINATION);
+
+    // Address and size come before the region.
+    g_state.x[2] = HOS_MEMORY_ATTRIBUTE_UNCACHED;
+    g_state.x[3] = HOS_MEMORY_ATTRIBUTE_UNCACHED;
+    g_state.x[0] = normal_base + 1U;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SET_MEMORY_ATTRIBUTE), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_ADDRESS);
+
+    g_state.x[0] = normal_base;
+    g_state.x[1] = 0U;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SET_MEMORY_ATTRIBUTE), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_SIZE);
+
+    // A Free region carries no change flag.
+    g_state.x[1] = HOS_MEMORY_PAGE_SIZE;
+    g_state.x[0] = TEST_GUEST_BASE;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SET_MEMORY_ATTRIBUTE), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_CURRENT_MEMORY);
+
+    // Success: the uncached bit is set, and the table says so.
+    g_state.x[0] = normal_base;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SET_MEMORY_ATTRIBUTE), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_SUCCESS);
+
+    const guest_memory_region_t *region = hos_memory_layout_find(&g_layout, normal_base);
+    POUND_REQUIRE(region != NULL);
+    POUND_CHECK_EQ_U64(region->attribute, HOS_MEMORY_ATTRIBUTE_UNCACHED);
+
+    // Clearing it again succeeds and is visible in the table.
+    g_state.x[0] = normal_base;
+    g_state.x[3] = 0U;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SET_MEMORY_ATTRIBUTE), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_SUCCESS);
+    POUND_CHECK_EQ_U64(region->attribute, 0U);
 
     machine_teardown();
 }
@@ -1629,6 +1796,10 @@ POUND_TEST_SUITE(hos_syscall,
                  POUND_TEST_CASE(hos_syscall, set_heap_size_needs_a_layout),
                  POUND_TEST_CASE(hos_syscall, set_heap_size_answers_the_heap_base_and_its_refusals),
                  POUND_TEST_CASE(hos_syscall, query_memory_needs_a_layout),
-                 POUND_TEST_CASE(hos_syscall, query_memory_reports_a_region_and_fabricates_one_outside))
+                 POUND_TEST_CASE(hos_syscall, query_memory_reports_a_region_and_fabricates_one_outside),
+                 POUND_TEST_CASE(hos_syscall, set_memory_permission_needs_a_layout),
+                 POUND_TEST_CASE(hos_syscall, set_memory_permission_reports_its_refusals_and_reprotects),
+                 POUND_TEST_CASE(hos_syscall, set_memory_attribute_needs_a_layout),
+                 POUND_TEST_CASE(hos_syscall, set_memory_attribute_reports_its_refusals_and_changes_the_bit))
 
 /*** end of file ***/

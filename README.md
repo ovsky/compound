@@ -293,7 +293,7 @@ Native support for Linux, macOS, Windows, Android, and ARM64 architectures.
 
 - **Memory System**: `mimalloc` allocator with host accounting and ownership tracking
 - **JIT Engine**: Ballistic ARM64 recompiler for high-performance execution
-- **Guest OS**: Horizon OS kernel objects, per-process handles, named services, SVC dispatch, a priority round-robin thread scheduler with blocking waits, and a partitioned address space whose region table gates guest access and answers `svcQueryMemory`
+- **Guest OS**: Horizon OS kernel objects, per-process handles, named services, SVC dispatch, a priority round-robin thread scheduler with blocking waits, and a partitioned address space whose region table gates guest access, answers `svcQueryMemory`, and reprotects an existing region with `svcSetMemoryPermission`/`svcSetMemoryAttribute`
 - **Debug Tools**: GUI with live reload, comprehensive logging, and profiling
 - **Validation**: Extensive unit tests and runtime checks
 - **Filesystem**: Experimental HFS0 parser and reader abstraction
@@ -318,14 +318,14 @@ under the terms of the GPL v3.
 
 - 🧱 **Foundation strengthening**: Memory systems and runtime validation
 - ⚡ **JIT experimentation**: Ballistic ARM64 integration progress
-- 🖥️ **Guest CPU and OS**: A64 interpreter subset, a Horizon OS handle/service kernel, SVC dispatch, a thread scheduler with blocking waits, and a memory-layout slice that partitions the guest address space and answers `svcSetHeapSize`/`svcQueryMemory`
+- 🖥️ **Guest CPU and OS**: A64 interpreter subset, a Horizon OS handle/service kernel, SVC dispatch, a thread scheduler with blocking waits, and a memory-layout slice that partitions the guest address space, answers `svcSetHeapSize`/`svcQueryMemory`, and reprotects regions with `svcSetMemoryPermission`/`svcSetMemoryAttribute`
 - 📁 **Filesystem work**: HFS0 parser development (experimental branches)
 - 🔐 **Crypto primitives**: SHA256 and verification systems (experimental)
 - 🐛 **Testing**: Expanded unit test coverage and CI reliability
 
 ### Next Focus
 
-1. Remaining memory-layout calls (`svcMapMemory`, `svcUnmapMemory`, `svcSetMemoryPermission`, `svcSetMemoryAttribute`)
+1. Remaining memory-layout calls (`svcMapMemory`, `svcUnmapMemory`)
 2. Vulkan render backend
 3. Commercial title compatibility
 

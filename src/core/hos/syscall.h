@@ -90,20 +90,22 @@
 //! # What is not here, and why
 //!
 //! Process objects (`svcGetProcessId`, `svcGetInfo`) need a process model beyond
-//! the handle table. The remaining memory-layout calls (`svcMapMemory`,
-//! `svcUnmapMemory`, `svcSetMemoryPermission`, `svcSetMemoryAttribute`) need the
-//! same region table `svcQueryMemory` reads and are the next slice of it. IPC
+//! the handle table. The two memory-layout calls that alias a range
+//! (`svcMapMemory`, `svcUnmapMemory`) need an unmap path the region table does not
+//! have yet: Pound's guest memory is one flat buffer, so mapping a range at a
+//! second address would need a real alias rather than a second region. IPC
 //! (`svcSendSyncRequest`, `svcReplyAndReceive`) needs the CMIF wire format and
 //! the thread-local command buffer at `TPIDR_EL0 + 0x80`. Each returns
 //! `POUND_ERROR_UNSUPPORTED_SYSCALL` and says so in the log.
 //!
-//! `svcSetHeapSize` and `svcQueryMemory` are here, and they change the shape of a
-//! refusal in one place worth naming. `hos_memory_layout_t`, above, partitions
-//! the address space; a context that was never given one has an unpartitioned
-//! window, and these two calls are refused with `POUND_ERROR_UNSUPPORTED_SYSCALL`
-//! exactly as if they were not implemented, rather than answering from a layout
-//! that does not exist. That is the same rule as the scheduler: a feature that is
-//! absent is refused, never approximated.
+//! Four calls answer from the region table -- `svcSetHeapSize`, `svcQueryMemory`,
+//! `svcSetMemoryPermission` and `svcSetMemoryAttribute` -- and they change the
+//! shape of a refusal in one place worth naming. `hos_memory_layout_t`, above,
+//! partitions the address space; a context that was never given one has an
+//! unpartitioned window, and these calls are refused with
+//! `POUND_ERROR_UNSUPPORTED_SYSCALL` exactly as if they were not implemented,
+//! rather than answering from a layout that does not exist. That is the same rule
+//! as the scheduler: a feature that is absent is refused, never approximated.
 //!
 //! # Result values
 //!
@@ -143,6 +145,17 @@ typedef enum
     /// Grows or shrinks the calling process's heap, answering its base address in
     /// `X1`. Needs a memory layout; refused without one.
     HOS_SVC_SET_HEAP_SIZE = 0x01,
+
+    /// Changes the permission of a page-aligned range of the address space. The
+    /// range must fall in one homogeneous, reprotectable region; a range that
+    /// covers part of a region splits it. Needs a memory layout; refused without
+    /// one.
+    HOS_SVC_SET_MEMORY_PERMISSION = 0x02,
+
+    /// Changes the `mask` attribute bits of a page-aligned range, under the same
+    /// range rules as `svcSetMemoryPermission`. Only the uncached bit may be
+    /// changed. Needs a memory layout; refused without one.
+    HOS_SVC_SET_MEMORY_ATTRIBUTE = 0x03,
 
     /// Reports what the address space holds at an address, writing a `MemoryInfo`
     /// through the pointer in `X0` and the page flags in `W1`. Needs a memory
@@ -229,8 +242,9 @@ typedef enum
 /// for this call -- a writable-event handle where an event is needed, for example.
 #define HOS_RESULT_INVALID_HANDLE 0x0000E401U
 
-/// A guest pointer the call needs to read or write is not mapped.
-#define HOS_RESULT_INVALID_ADDRESS 0x0000E601U
+/// A guest pointer the call needs to read or write is not mapped. Horizon's own
+/// name for this is `ResultInvalidPointer`.
+#define HOS_RESULT_INVALID_POINTER 0x0000E601U
 
 /// A wait finished without anything it was waiting for becoming ready.
 #define HOS_RESULT_TIMEOUT 0x0000EA01U
@@ -254,6 +268,28 @@ typedef enum
 /// reports this for `svcSetHeapSize`; Pound's region table is its memory-block
 /// pool, so it answers the same word when the table has no room for the split.
 #define HOS_RESULT_SLAB_EXHAUSTED 0x0000CE01U
+
+/// `svcSetMemoryPermission` and `svcSetMemoryAttribute` were given a range whose
+/// address is not page-aligned. Horizon's own name for this is
+/// `ResultInvalidAddress`.
+#define HOS_RESULT_INVALID_ADDRESS 0x0000CC01U
+
+/// A memory call was given a range that is not inside the process address space,
+/// or that covers a region whose state or attribute forbids the change. Horizon's
+/// own name for this is `ResultInvalidCurrentMemory`.
+#define HOS_RESULT_INVALID_CURRENT_MEMORY 0x0000D401U
+
+/// `svcSetMemoryPermission` was asked for a permission it does not accept. Only
+/// no access, read-only and read-write are valid: the kernel refuses write-only,
+/// and refuses execute here because that is `svcSetProcessMemoryPermission`'s
+/// job. Horizon's own name for this is `ResultInvalidNewMemoryPermission`.
+#define HOS_RESULT_INVALID_NEW_PERMISSION 0x0000D801U
+
+/// `svcSetMemoryAttribute` was given a mask and value it does not accept. The
+/// value must be a subset of the mask, and both must stay inside the one
+/// attribute Pound can change, the uncached bit. Horizon's own name for this is
+/// `ResultInvalidCombination`.
+#define HOS_RESULT_INVALID_COMBINATION 0x0000E801U
 
 // -----------------------------------------------------------------------------
 // Limits

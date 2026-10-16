@@ -127,6 +127,29 @@ typedef enum
     HOS_MEMORY_STATE_NORMAL = 0x37EBD05U,
 } hos_memory_state_t;
 
+/// `MemoryState` flag bit (`0x100`): the region may have its permission changed
+/// by `svcSetMemoryPermission`. The kernel checks it with
+/// `state & FlagCanReprotect` before reprotecting anything, so a `Code` region --
+/// which does not carry it -- is refused rather than made writable.
+#define HOS_MEMORY_STATE_FLAG_CAN_REPROTECT 0x00000100U
+
+/// `MemoryState` flag bit (`0x1000000`): the region may have its attribute
+/// changed by `svcSetMemoryAttribute`.
+#define HOS_MEMORY_STATE_FLAG_CAN_CHANGE_ATTRIBUTE 0x01000000U
+
+/// `MemoryAttribute` bit (`0x8`): the region is mapped uncached. It is the one
+/// attribute `svcSetMemoryAttribute` may set or clear, and the only one whose
+/// change the access gate has nothing to do with -- Pound's host memory has no
+/// separate cached view, so the bit lives in the table and comes back out
+/// through `svcQueryMemory` exactly as it went in.
+#define HOS_MEMORY_ATTRIBUTE_UNCACHED 0x00000008U
+
+/// `MemoryAttribute` bit (`0x1`): the region is locked. `svcMapMemory` sets it on
+/// a source range, and it makes the region ineligible for reprotection. Pound
+/// does not map aliases yet, so nothing sets this bit; it is named here because
+/// the reprotection check tests for it by name.
+#define HOS_MEMORY_ATTRIBUTE_LOCKED 0x00000001U
+
 /// A process address space: the region table, the heap region, and the heap
 /// inside it.
 ///
@@ -236,6 +259,61 @@ error_t hos_memory_layout_map(hos_memory_layout_t *POUND_RESTRICT layout,
 /// - `POUND_ERROR_ALLOCATION_FAILED` -- the region table is full. On hardware
 ///   this is `0xCE01`; `svcSetHeapSize` translates it.
 error_t hos_memory_layout_set_heap_size(hos_memory_layout_t *POUND_RESTRICT layout, uint64_t size);
+
+/// Reprotects `[base, base + size)` with `permission`.
+///
+/// This is `svcSetMemoryPermission`. The range must lie inside the address
+/// space, must be page-aligned, and every region it covers must carry
+/// `HOS_MEMORY_STATE_FLAG_CAN_REPROTECT` with no attribute set, and agree with
+/// the others about state, permission and attribute. That last rule is Horizon's:
+/// the kernel's `CheckMemoryState` walks the range and refuses a change across a
+/// boundary between two differently-configured regions rather than half-making
+/// it, so a range straddling such a boundary is refused here too.
+///
+/// A range that covers only part of a region splits it, so exactly
+/// `[base, base + size)` changes and the bytes outside are untouched. A no-op
+/// range -- one that already has `permission` -- is answered without splitting,
+/// because Horizon short-circuits it before it allocates anything.
+///
+/// Returns:
+/// - `POUND_SUCCESS`.
+/// - `POUND_ERROR_INVALID_ARGUMENT` -- a NULL layout, a zero size, a range
+///   outside the address space, a range that is not homogeneous, or a region
+///   that may not be reprotected.
+/// - `POUND_ERROR_MEMORY_ALIGNMENT` -- a bound is not page-aligned.
+/// - `POUND_ERROR_GUEST_ADDRESS_OVERFLOW` -- `base + size` wraps.
+/// - `POUND_ERROR_NOT_INITIALIZED` -- the layout was never initialised.
+/// - `POUND_ERROR_CORRUPTED` -- the table is not tiling the address space.
+/// - `POUND_ERROR_ALLOCATION_FAILED` -- the region table is full. On hardware
+///   this is `0xCE01`; `svcSetMemoryPermission` translates it.
+error_t hos_memory_layout_set_permission(hos_memory_layout_t *POUND_RESTRICT layout,
+                                         uint64_t                            base,
+                                         uint64_t                            size,
+                                         uint32_t                            permission);
+
+/// Changes the `mask` bits of the attribute of `[base, base + size)` to
+/// `attribute`.
+///
+/// This is `svcSetMemoryAttribute`, and it obeys the same range rules as
+/// `hos_memory_layout_set_permission`: inside the address space, page-aligned,
+/// homogeneous, and split out of its regions. It adds one of its own: a region
+/// whose masked bits include `HOS_MEMORY_ATTRIBUTE_UNCACHED` must carry
+/// `HOS_MEMORY_STATE_FLAG_CAN_CHANGE_ATTRIBUTE`, and a region that carries an
+/// attribute the caller is not masking -- `HOS_MEMORY_ATTRIBUTE_LOCKED`, say --
+/// is not eligible at all, because Horizon's `CheckMemoryState` refuses to touch
+/// a block that has attributes it is not changing.
+///
+/// `mask` must be a subset of `HOS_MEMORY_ATTRIBUTE_UNCACHED` and `attribute` a
+/// subset of `mask`; the caller (`svcSetMemoryAttribute`) has already rejected
+/// anything else, and the check is not repeated here.
+///
+/// Returns the same errors as `hos_memory_layout_set_permission`, with
+/// `POUND_ERROR_INVALID_ARGUMENT` also covering an ineligible region.
+error_t hos_memory_layout_set_attribute(hos_memory_layout_t *POUND_RESTRICT layout,
+                                        uint64_t                            base,
+                                        uint64_t                            size,
+                                        uint32_t                            mask,
+                                        uint32_t                            attribute);
 
 /// The region containing `address`, or NULL when `address` is outside the
 /// address space.

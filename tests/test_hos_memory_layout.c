@@ -407,6 +407,263 @@ POUND_TEST(hos_memory_layout, set_heap_size_refuses_bad_sizes)
 }
 
 // -----------------------------------------------------------------------------
+// hos_memory_layout_set_permission
+// -----------------------------------------------------------------------------
+
+POUND_TEST(hos_memory_layout, set_permission_reprotects_a_region)
+{
+    layout_machine_reset();
+
+    const uint64_t normal_base = LAYOUT_GUEST_BASE + 0x1000U;
+    POUND_REQUIRE(POUND_SUCCESS == map_page(normal_base, HOS_MEMORY_STATE_NORMAL, LAYOUT_RW));
+
+    // Read-only: writes stop working and reads keep working.
+    POUND_REQUIRE(POUND_SUCCESS ==
+                  hos_memory_layout_set_permission(&g_layout, normal_base, 0x1000U, GUEST_MEMORY_PERM_READ));
+
+    const guest_memory_region_t *region = hos_memory_layout_find(&g_layout, normal_base);
+    POUND_REQUIRE(region != NULL);
+    POUND_CHECK_EQ_U64(region->permission, GUEST_MEMORY_PERM_READ);
+
+    size_t bytes = 0U;
+    POUND_CHECK_PTR_NON_NULL(guest_memory_translate_read(&g_memory_region, normal_base, &bytes));
+    POUND_CHECK_PTR_NULL(guest_memory_translate_write(&g_memory_region, normal_base, &bytes));
+
+    // No access: both stop.
+    POUND_REQUIRE(POUND_SUCCESS == hos_memory_layout_set_permission(&g_layout, normal_base, 0x1000U, 0U));
+    POUND_CHECK_PTR_NULL(guest_memory_translate_read(&g_memory_region, normal_base, &bytes));
+
+    // Back to read|write.
+    POUND_REQUIRE(POUND_SUCCESS == hos_memory_layout_set_permission(&g_layout, normal_base, 0x1000U, LAYOUT_RW));
+    POUND_CHECK_PTR_NON_NULL(guest_memory_translate_write(&g_memory_region, normal_base, &bytes));
+}
+
+POUND_TEST(hos_memory_layout, set_permission_splits_a_partial_range)
+{
+    layout_machine_reset();
+
+    const uint64_t region_base = LAYOUT_GUEST_BASE + 0x1000U;
+    POUND_REQUIRE(POUND_SUCCESS ==
+                  hos_memory_layout_map(&g_layout, region_base, 0x3000U, HOS_MEMORY_STATE_NORMAL, LAYOUT_RW, 0U));
+
+    const uint64_t before = g_layout.region_count;
+
+    // The middle page only.
+    POUND_REQUIRE(POUND_SUCCESS ==
+                  hos_memory_layout_set_permission(&g_layout, region_base + 0x1000U, 0x1000U, 0U));
+
+    // The one region split into three: the two edges keep their permission, the middle loses
+    // it. This is the case a whole-region-only model would have to refuse, and the reason the
+    // operation splits rather than insisting a caller reprotect a whole region at a time.
+    POUND_CHECK_EQ_U64(g_layout.region_count, before + 2U);
+
+    size_t bytes = 0U;
+    POUND_CHECK_PTR_NON_NULL(guest_memory_translate_write(&g_memory_region, region_base, &bytes));
+    POUND_CHECK_PTR_NULL(guest_memory_translate_read(&g_memory_region, region_base + 0x1000U, &bytes));
+    POUND_CHECK_PTR_NON_NULL(guest_memory_translate_write(&g_memory_region, region_base + 0x2000U, &bytes));
+
+    // The edge pieces carry what the original region had.
+    const guest_memory_region_t *left = hos_memory_layout_find(&g_layout, region_base);
+    POUND_REQUIRE(left != NULL);
+    POUND_CHECK_EQ_U64(left->state, HOS_MEMORY_STATE_NORMAL);
+    POUND_CHECK_EQ_U64(left->permission, LAYOUT_RW);
+
+    const guest_memory_region_t *middle = hos_memory_layout_find(&g_layout, region_base + 0x1000U);
+    POUND_REQUIRE(middle != NULL);
+    POUND_CHECK_EQ_U64(middle->permission, 0U);
+}
+
+POUND_TEST(hos_memory_layout, set_permission_needs_a_configuration_it_can_change)
+{
+    layout_machine_reset();
+
+    const uint64_t normal_base = LAYOUT_GUEST_BASE + 0x1000U;
+    POUND_REQUIRE(POUND_SUCCESS == map_page(normal_base, HOS_MEMORY_STATE_NORMAL, LAYOUT_RW));
+    POUND_REQUIRE(POUND_SUCCESS == map_page(normal_base + 0x1000U, HOS_MEMORY_STATE_CODE, LAYOUT_RX));
+
+    hos_memory_layout_t blank;
+    memset(&blank, 0, sizeof(blank));
+
+    POUND_CHECK_EQ_U64(hos_memory_layout_set_permission(NULL, normal_base, 0x1000U, 0U), POUND_ERROR_INVALID_ARGUMENT);
+    POUND_CHECK_EQ_U64(hos_memory_layout_set_permission(&blank, normal_base, 0x1000U, 0U),
+                       POUND_ERROR_NOT_INITIALIZED);
+
+    // Zero size, and misaligned bounds.
+    POUND_CHECK_EQ_U64(hos_memory_layout_set_permission(&g_layout, normal_base, 0U, 0U), POUND_ERROR_INVALID_ARGUMENT);
+    POUND_CHECK_EQ_U64(hos_memory_layout_set_permission(&g_layout, normal_base + 1U, 0x1000U, 0U),
+                       POUND_ERROR_MEMORY_ALIGNMENT);
+    POUND_CHECK_EQ_U64(hos_memory_layout_set_permission(&g_layout, normal_base, 0x1001U, 0U),
+                       POUND_ERROR_MEMORY_ALIGNMENT);
+
+    // Outside the address space, below and above.
+    POUND_CHECK_EQ_U64(hos_memory_layout_set_permission(&g_layout, LAYOUT_GUEST_BASE - 0x1000U, 0x1000U, 0U),
+                       POUND_ERROR_GUEST_ADDRESS_OUT_OF_BOUNDS);
+    POUND_CHECK_EQ_U64(hos_memory_layout_set_permission(&g_layout,
+                                                        LAYOUT_GUEST_BASE + LAYOUT_GUEST_SIZE - 0x1000U,
+                                                        0x2000U,
+                                                        0U),
+                       POUND_ERROR_GUEST_ADDRESS_OUT_OF_BOUNDS);
+
+    // Wrapping is its own refusal.
+    POUND_CHECK_EQ_U64(hos_memory_layout_set_permission(&g_layout, UINT64_MAX - 0xFFFU, 0x1000U, 0U),
+                       POUND_ERROR_GUEST_ADDRESS_OVERFLOW);
+
+    // The Free page to the left of the mapping carries no reprotect flag, so it cannot be
+    // reprotected -- even to the permission it already has.
+    POUND_CHECK_EQ_U64(hos_memory_layout_set_permission(&g_layout, LAYOUT_GUEST_BASE, 0x1000U, 0U),
+                       POUND_ERROR_INVALID_ARGUMENT);
+
+    // Code does not carry the flag either: making it writable is not something this call may
+    // do.
+    POUND_CHECK_EQ_U64(hos_memory_layout_set_permission(&g_layout, normal_base + 0x1000U, 0x1000U, LAYOUT_RW),
+                       POUND_ERROR_INVALID_ARGUMENT);
+
+    // A range spanning both is not one configuration, and is refused as a whole rather than
+    // half-changed.
+    POUND_CHECK_EQ_U64(hos_memory_layout_set_permission(&g_layout, normal_base, 0x2000U, 0U),
+                       POUND_ERROR_INVALID_ARGUMENT);
+
+    POUND_CHECK(pound_test_log_contains("Rejecting memory layout reprotect"));
+}
+
+POUND_TEST(hos_memory_layout, set_permission_answers_an_unchanged_range_without_splitting)
+{
+    layout_machine_reset();
+
+    const uint64_t region_base = LAYOUT_GUEST_BASE + 0x1000U;
+    POUND_REQUIRE(POUND_SUCCESS ==
+                  hos_memory_layout_map(&g_layout, region_base, 0x3000U, HOS_MEMORY_STATE_NORMAL, LAYOUT_RW, 0U));
+
+    const uint64_t before = g_layout.region_count;
+
+    // The middle page already has the requested permission, so the call short-circuits and
+    // nothing is split -- the shape a guest relies on when it reprotects a range it already
+    // configured.
+    POUND_REQUIRE(POUND_SUCCESS ==
+                  hos_memory_layout_set_permission(&g_layout, region_base + 0x1000U, 0x1000U, LAYOUT_RW));
+    POUND_CHECK_EQ_U64(g_layout.region_count, before);
+}
+
+POUND_TEST(hos_memory_layout, set_permission_refuses_when_the_table_is_full)
+{
+    layout_machine_reset();
+
+    // One large region, then single pages until the table is full. The large region has room
+    // to be split, but no entries left to split it into -- the refusal `svcSetMemoryPermission`
+    // answers as `0xCE01`.
+    POUND_REQUIRE(POUND_SUCCESS ==
+                  hos_memory_layout_map(&g_layout, LAYOUT_GUEST_BASE, 0x100000U, HOS_MEMORY_STATE_NORMAL, LAYOUT_RW, 0U));
+
+    uint64_t cursor = LAYOUT_GUEST_BASE + 0x100000U;
+
+    while (g_layout.region_count < HOS_MEMORY_LAYOUT_MAX_REGIONS)
+    {
+        POUND_REQUIRE(POUND_SUCCESS == map_page(cursor, HOS_MEMORY_STATE_NORMAL, LAYOUT_RW));
+        cursor += 0x1000U;
+    }
+
+    POUND_CHECK_EQ_U64(hos_memory_layout_set_permission(&g_layout, LAYOUT_GUEST_BASE + 0x1000U, 0x1000U, 0U),
+                       POUND_ERROR_ALLOCATION_FAILED);
+    POUND_CHECK_EQ_U64(g_layout.region_count, HOS_MEMORY_LAYOUT_MAX_REGIONS);
+
+    // The refused change left the region as it was.
+    const guest_memory_region_t *region = hos_memory_layout_find(&g_layout, LAYOUT_GUEST_BASE + 0x1000U);
+    POUND_REQUIRE(region != NULL);
+    POUND_CHECK_EQ_U64(region->permission, LAYOUT_RW);
+}
+
+// -----------------------------------------------------------------------------
+// hos_memory_layout_set_attribute
+// -----------------------------------------------------------------------------
+
+POUND_TEST(hos_memory_layout, set_attribute_sets_and_clears_the_uncached_bit)
+{
+    layout_machine_reset();
+
+    const uint64_t normal_base = LAYOUT_GUEST_BASE + 0x1000U;
+    POUND_REQUIRE(POUND_SUCCESS == map_page(normal_base, HOS_MEMORY_STATE_NORMAL, LAYOUT_RW));
+
+    POUND_REQUIRE(POUND_SUCCESS == hos_memory_layout_set_attribute(&g_layout,
+                                                                   normal_base,
+                                                                   0x1000U,
+                                                                   HOS_MEMORY_ATTRIBUTE_UNCACHED,
+                                                                   HOS_MEMORY_ATTRIBUTE_UNCACHED));
+
+    const guest_memory_region_t *region = hos_memory_layout_find(&g_layout, normal_base);
+    POUND_REQUIRE(region != NULL);
+    POUND_CHECK_EQ_U64(region->attribute, HOS_MEMORY_ATTRIBUTE_UNCACHED);
+
+    // Clearing it puts the region back.
+    POUND_REQUIRE(POUND_SUCCESS ==
+                  hos_memory_layout_set_attribute(&g_layout, normal_base, 0x1000U, HOS_MEMORY_ATTRIBUTE_UNCACHED, 0U));
+    POUND_CHECK_EQ_U64(region->attribute, 0U);
+
+    // A zero mask changes nothing and answers success.
+    POUND_REQUIRE(POUND_SUCCESS == hos_memory_layout_set_attribute(&g_layout, normal_base, 0x1000U, 0U, 0U));
+    POUND_CHECK_EQ_U64(region->attribute, 0U);
+
+    // The permission is untouched by an attribute change.
+    POUND_CHECK_EQ_U64(region->permission, LAYOUT_RW);
+}
+
+POUND_TEST(hos_memory_layout, set_attribute_needs_a_region_that_allows_it)
+{
+    layout_machine_reset();
+
+    const uint64_t normal_base = LAYOUT_GUEST_BASE + 0x1000U;
+    POUND_REQUIRE(POUND_SUCCESS == map_page(normal_base, HOS_MEMORY_STATE_NORMAL, LAYOUT_RW));
+    POUND_REQUIRE(POUND_SUCCESS == map_page(normal_base + 0x1000U, HOS_MEMORY_STATE_CODE, LAYOUT_RX));
+
+    // A region carrying an attribute the mask does not name is not eligible: the locked page
+    // stays locked.
+    POUND_REQUIRE(POUND_SUCCESS ==
+                  hos_memory_layout_map(&g_layout,
+                                        normal_base + 0x2000U,
+                                        0x1000U,
+                                        HOS_MEMORY_STATE_NORMAL,
+                                        LAYOUT_RW,
+                                        HOS_MEMORY_ATTRIBUTE_LOCKED));
+
+    hos_memory_layout_t blank;
+    memset(&blank, 0, sizeof(blank));
+
+    POUND_CHECK_EQ_U64(
+        hos_memory_layout_set_attribute(NULL, normal_base, 0x1000U, HOS_MEMORY_ATTRIBUTE_UNCACHED, 0U),
+        POUND_ERROR_INVALID_ARGUMENT);
+    POUND_CHECK_EQ_U64(hos_memory_layout_set_attribute(&blank, normal_base, 0x1000U, HOS_MEMORY_ATTRIBUTE_UNCACHED, 0U),
+                       POUND_ERROR_NOT_INITIALIZED);
+
+    POUND_CHECK_EQ_U64(hos_memory_layout_set_attribute(&g_layout, normal_base, 0U, HOS_MEMORY_ATTRIBUTE_UNCACHED, 0U),
+                       POUND_ERROR_INVALID_ARGUMENT);
+    POUND_CHECK_EQ_U64(hos_memory_layout_set_attribute(&g_layout, normal_base + 1U, 0x1000U,
+                                                       HOS_MEMORY_ATTRIBUTE_UNCACHED, 0U),
+                       POUND_ERROR_MEMORY_ALIGNMENT);
+    POUND_CHECK_EQ_U64(hos_memory_layout_set_attribute(&g_layout, normal_base, 0x1001U,
+                                                       HOS_MEMORY_ATTRIBUTE_UNCACHED, 0U),
+                       POUND_ERROR_MEMORY_ALIGNMENT);
+    POUND_CHECK_EQ_U64(hos_memory_layout_set_attribute(&g_layout, LAYOUT_GUEST_BASE - 0x1000U, 0x1000U,
+                                                       HOS_MEMORY_ATTRIBUTE_UNCACHED, 0U),
+                       POUND_ERROR_GUEST_ADDRESS_OUT_OF_BOUNDS);
+
+    // Free does not carry the change flag.
+    POUND_CHECK_EQ_U64(hos_memory_layout_set_attribute(&g_layout, LAYOUT_GUEST_BASE, 0x1000U,
+                                                       HOS_MEMORY_ATTRIBUTE_UNCACHED, HOS_MEMORY_ATTRIBUTE_UNCACHED),
+                       POUND_ERROR_INVALID_ARGUMENT);
+
+    // Code does not carry it either.
+    POUND_CHECK_EQ_U64(hos_memory_layout_set_attribute(&g_layout, normal_base + 0x1000U, 0x1000U,
+                                                       HOS_MEMORY_ATTRIBUTE_UNCACHED, HOS_MEMORY_ATTRIBUTE_UNCACHED),
+                       POUND_ERROR_INVALID_ARGUMENT);
+
+    // The locked page carries an attribute the mask does not name.
+    POUND_CHECK_EQ_U64(hos_memory_layout_set_attribute(&g_layout, normal_base + 0x2000U, 0x1000U,
+                                                       HOS_MEMORY_ATTRIBUTE_UNCACHED, HOS_MEMORY_ATTRIBUTE_UNCACHED),
+                       POUND_ERROR_INVALID_ARGUMENT);
+
+    POUND_CHECK(pound_test_log_contains("Rejecting memory layout attribute change"));
+}
+
+// -----------------------------------------------------------------------------
 // The gate the layout installs, seen through the interpreter's fetch
 // -----------------------------------------------------------------------------
 
@@ -463,6 +720,13 @@ POUND_TEST_SUITE(hos_memory_layout,
                  POUND_TEST_CASE(hos_memory_layout, map_fills_the_table_and_then_refuses),
                  POUND_TEST_CASE(hos_memory_layout, set_heap_size_commits_normal_bytes_and_frees_the_rest),
                  POUND_TEST_CASE(hos_memory_layout, set_heap_size_refuses_bad_sizes),
+                 POUND_TEST_CASE(hos_memory_layout, set_permission_reprotects_a_region),
+                 POUND_TEST_CASE(hos_memory_layout, set_permission_splits_a_partial_range),
+                 POUND_TEST_CASE(hos_memory_layout, set_permission_needs_a_configuration_it_can_change),
+                 POUND_TEST_CASE(hos_memory_layout, set_permission_answers_an_unchanged_range_without_splitting),
+                 POUND_TEST_CASE(hos_memory_layout, set_permission_refuses_when_the_table_is_full),
+                 POUND_TEST_CASE(hos_memory_layout, set_attribute_sets_and_clears_the_uncached_bit),
+                 POUND_TEST_CASE(hos_memory_layout, set_attribute_needs_a_region_that_allows_it),
                  POUND_TEST_CASE(hos_memory_layout, instruction_fetch_needs_execute_permission))
 
 /*** end of file ***/
