@@ -43,6 +43,7 @@ static error_t svc_set_thread_priority(hos_syscall_context_t *context, guest_sta
 static error_t svc_get_current_processor_number(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_signal_event(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_clear_event(hos_syscall_context_t *context, guest_state_t *state);
+static error_t svc_create_event(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_close_handle(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_reset_signal(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_wait_synchronization(hos_syscall_context_t *context, guest_state_t *state);
@@ -87,6 +88,7 @@ static const hos_syscall_entry_t HOS_SYSCALLS[] = {
     { HOS_SVC_OUTPUT_DEBUG_STRING, "svcOutputDebugString", svc_output_debug_string },
     { HOS_SVC_FLUSH_ENTIRE_DATA_CACHE, "svcFlushEntireDataCache", svc_flush_entire_data_cache },
     { HOS_SVC_FLUSH_DATA_CACHE, "svcFlushDataCache", svc_flush_data_cache },
+    { HOS_SVC_CREATE_EVENT, "svcCreateEvent", svc_create_event },
     { HOS_SVC_SLEEP_SYSTEM, "svcSleepSystem", svc_sleep_system },
 
     // Known, named, and deliberately not implemented. Each of these is waiting on a
@@ -105,7 +107,6 @@ static const hos_syscall_entry_t HOS_SYSCALLS[] = {
     { 0x42U, "svcReplyAndReceiveLight", NULL },
     { 0x43U, "svcReplyAndReceive", NULL },
     { 0x44U, "svcReplyAndReceiveWithUserBuffer", NULL },
-    { 0x45U, "svcCreateEvent", NULL },
     { 0x50U, "svcCreateSharedMemory", NULL },
     { 0x70U, "svcCreatePort", NULL },
     { 0x71U, "svcManageNamedPort", NULL },
@@ -640,6 +641,12 @@ handle_failure_result(error_t error, uint32_t *POUND_RESTRICT out_result)
         return true;
     }
 
+    if (error == POUND_ERROR_INVALID_STATE)
+    {
+        *out_result = HOS_RESULT_INVALID_STATE;
+        return true;
+    }
+
     return false;
 }
 
@@ -681,9 +688,41 @@ svc_clear_event(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *PO
         return error;
     }
 
-    // Clearing an event that is not signaled is a success: `svcClearEvent` is allowed to
-    // be redundant, which is what makes it usable as "make sure this is clear".
     state->x[0] = HOS_RESULT_SUCCESS;
+    return POUND_SUCCESS;
+}
+
+static error_t
+svc_create_event(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *POUND_RESTRICT state)
+{
+    // Horizon's signature takes no arguments: the kernel answers with two handles in
+    // registers, `W1` writable and `W2` readable. libnx's stub saves the caller's two
+    // out-pointers before the trap and stores those registers through them afterwards, so
+    // a handler that wrote through `X0` instead would leave a real guest with stale
+    // handle values.
+    hos_handle_t writable = HOS_HANDLE_INVALID;
+    hos_handle_t readable = HOS_HANDLE_INVALID;
+
+    const error_t error =
+        hos_process_create_event_pair(context->process, false, &writable, &readable);
+
+    if (error == POUND_ERROR_ALLOCATION_FAILED)
+    {
+        // Pound's object and handle tables are its event quota, and running out of slots
+        // is exactly what Horizon reports as `0xCE01` for this call. Refusing with an
+        // emulator error would wedge a guest that Horizon would have let run.
+        state->x[0] = HOS_RESULT_SLAB_EXHAUSTED;
+        return POUND_SUCCESS;
+    }
+
+    if (error != POUND_SUCCESS)
+    {
+        return error;
+    }
+
+    state->x[0] = HOS_RESULT_SUCCESS;
+    state->x[1] = writable;
+    state->x[2] = readable;
     return POUND_SUCCESS;
 }
 
@@ -711,38 +750,21 @@ svc_close_handle(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *P
 static error_t
 svc_reset_signal(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *POUND_RESTRICT state)
 {
-    const hos_handle_t handle = handle_argument(state->x[0]);
-    bool               signaled = false;
-
     uint32_t      result = HOS_RESULT_SUCCESS;
-    error_t       error  = hos_process_event_is_signaled(context->process, handle, &signaled);
+    const error_t error =
+        hos_process_event_reset(context->process, handle_argument(state->x[0]));
 
     if (handle_failure_result(error, &result))
     {
+        // `0xFA01` for an event that was already clear is the point of the call: it is
+        // how a guest tells "I consumed the signal" from "something else got there
+        // first", so it is a completed call with a `Result`, not an emulator error.
         state->x[0] = result;
         return POUND_SUCCESS;
     }
 
     if (error != POUND_SUCCESS)
     {
-        return error;
-    }
-
-    if (!signaled)
-    {
-        // Not a no-op, and deliberately so: this is how a guest distinguishes having
-        // consumed a signal from something else having got there first. Reporting
-        // success for an event that was already clear would erase that distinction.
-        state->x[0] = HOS_RESULT_INVALID_STATE;
-        return POUND_SUCCESS;
-    }
-
-    error = hos_process_event_clear(context->process, handle);
-
-    if (error != POUND_SUCCESS)
-    {
-        // Unreachable: the handle was resolved and typed one call ago, and nothing has
-        // run in between because the kernel lock is released and retaken per call.
         return error;
     }
 

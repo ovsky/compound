@@ -65,6 +65,20 @@
 //! A call that returns nothing at all (`svcExitThread`, `svcSleepThread`,
 //! `svcFlushEntireDataCache`) must leave `X0` exactly as the guest left it.
 //!
+//! # Events and the two sides of a handle
+//!
+//! `svcCreateEvent` takes no arguments and answers two handles in registers: `W1`
+//! is the writable side and `W2` the readable one. The two name one manual-reset
+//! event. Horizon's event handles are one-directional -- `svcSignalEvent` needs the
+//! writable side, a wait and `svcResetSignal` need the readable one, and
+//! `svcClearEvent` accepts either -- and the wrong side is `0xE401`, the same
+//! `Result` as a handle that names nothing. Pound models that as a right on the
+//! handle rather than on the object, so `svcDuplicateHandle` cannot promote a
+//! readable handle into a writable one. The event itself is manual-reset and not
+//! auto-reset: libnx implements its autoclear mode by calling `svcResetSignal`
+//! after a successful wait, so a kernel that consumed the signal in the wait would
+//! make every autoclear wait return `0xFA01`.
+//!
 //! # Blocking
 //!
 //! `svcWaitSynchronization` and `svcSleepThread` can suspend the calling thread,
@@ -242,6 +256,11 @@ typedef enum
 
     /// Discards a range of the data cache.
     HOS_SVC_FLUSH_DATA_CACHE = 0x2B,
+
+    /// Creates a manual-reset event and answers its two handles: `W1` is the writable
+    /// side and `W2` the readable one (the caller's stub stores those registers through
+    /// the two pointers it saved before the trap). Takes no arguments.
+    HOS_SVC_CREATE_EVENT = 0x45,
 
     /// Enters the system sleep state. Returns nothing; there is nothing to sleep.
     HOS_SVC_SLEEP_SYSTEM = 0x4D,

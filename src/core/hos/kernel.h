@@ -150,6 +150,25 @@ typedef enum
     HOS_OBJECT_THREAD = 2,
 } hos_object_type_t;
 
+/// Which side of an event a handle carries.
+///
+/// Horizon mints two handles for one event -- a writable one that signals it and a
+/// readable one that waits on it -- and refuses the wrong side with `0xE401`. The right
+/// lives on the handle rather than on the object, so a duplicate copies it and cannot
+/// gain one the source did not have. Other object kinds carry `HOS_HANDLE_RIGHT_ALL`;
+/// only events are split today.
+typedef enum
+{
+    /// The handle may observe the event: wait on it and read its state.
+    HOS_HANDLE_RIGHT_READ = 0x1,
+
+    /// The handle may signal the event.
+    HOS_HANDLE_RIGHT_WRITE = 0x2,
+
+    /// Both sides, which is what a handle the emulator mints for itself carries.
+    HOS_HANDLE_RIGHT_ALL = 0x3,
+} hos_handle_right_t;
+
 /// What a wait on an event does to it.
 typedef enum
 {
@@ -393,6 +412,10 @@ uint32_t hos_process_handle_count(const hos_process_t *POUND_RESTRICT process);
 /// moment anything waits on it, which is why the initial state is an argument rather
 /// than an afterthought.
 ///
+/// This is the emulator's own creation path, so the single handle it returns carries
+/// both rights. Horizon's `svcCreateEvent` instead returns two one-sided handles; that
+/// pair is `hos_process_create_event_pair`.
+///
 /// Returns `POUND_ERROR_INVALID_ARGUMENT` if `process` or `out_handle` is NULL,
 /// `POUND_ERROR_NOT_INITIALIZED` if the process is not open,
 /// `POUND_ERROR_ALLOCATION_FAILED` if a table could not grow.
@@ -400,6 +423,23 @@ error_t hos_process_create_event(hos_process_t *POUND_RESTRICT process,
                                  hos_event_mode_t             mode,
                                  bool                         initially_signaled,
                                  hos_handle_t *POUND_RESTRICT out_handle);
+
+/// Creates one manual-reset event and returns the two handles `svcCreateEvent` does.
+///
+/// `out_writable` carries `HOS_HANDLE_RIGHT_WRITE` and `out_readable` carries
+/// `HOS_HANDLE_RIGHT_READ`; the two name the same object, so closing either leaves the
+/// other usable. The event is manual-reset because that is what Horizon creates:
+/// libnx's autoclear mode is a userspace `svcResetSignal` after a successful wait, not a
+/// kernel clear, so a kernel that consumed the signal in the wait would break it.
+///
+/// Returns `POUND_ERROR_INVALID_ARGUMENT` if `process` is NULL, either output is NULL, or
+/// the two outputs are the same pointer (one of the handles would be leaked),
+/// `POUND_ERROR_NOT_INITIALIZED` if the process is not open, and
+/// `POUND_ERROR_ALLOCATION_FAILED` if the object or either handle could not be allocated.
+error_t hos_process_create_event_pair(hos_process_t *POUND_RESTRICT process,
+                                      bool                         initially_signaled,
+                                      hos_handle_t *POUND_RESTRICT out_writable,
+                                      hos_handle_t *POUND_RESTRICT out_readable);
 
 /// Opens a session with the service called `name` and returns a handle to it.
 ///
@@ -413,8 +453,9 @@ error_t hos_process_connect(hos_process_t *POUND_RESTRICT process,
 /// Copies `handle` into `target`, giving the target its own name for the same object.
 ///
 /// The object's reference count rises by one, so closing `handle` in the source no longer
-/// destroys it. Both processes must have been created from the same kernel, or the target
-/// would hold a handle into another kernel's object table; that is
+/// destroys it. The handle's rights are copied with it, so a duplicate of a readable event
+/// handle cannot signal the event. Both processes must have been created from the same
+/// kernel, or the target would hold a handle into another kernel's object table; that is
 /// `POUND_ERROR_INVALID_ARGUMENT`.
 ///
 /// Returns `POUND_ERROR_INVALID_HANDLE` if `handle` names nothing live in `source`,
@@ -457,32 +498,49 @@ error_t hos_process_handle_type(const hos_process_t *POUND_RESTRICT process,
 // Events
 // -----------------------------------------------------------------------------
 
-/// Marks the event signalled.
+/// Signals the event through its writable handle.
 ///
 /// Signalling an already-signalled event is not an error and does not queue a second
 /// wake: an event is a state, not a counter.
 ///
 /// Returns `POUND_ERROR_INVALID_HANDLE` if the handle names nothing live,
-/// `POUND_ERROR_INVALID_ARGUMENT` if it names something other than an event, plus the
-/// argument and open-state errors.
+/// `POUND_ERROR_INVALID_ARGUMENT` if it names something other than an event or names the
+/// event's readable side (Horizon's `Handle<WritableEvent>`), plus the argument and
+/// open-state errors.
 error_t hos_process_event_signal(hos_process_t *POUND_RESTRICT process, hos_handle_t handle);
 
-/// Marks the event unsignalled, whatever its clear mode.
+/// Clears the event through either side of it, whatever its clear mode.
+///
+/// Returns `POUND_ERROR_INVALID_STATE` if the event was not signalled -- Horizon's
+/// `0xFA01`, which is how a guest tells "I consumed it" from "someone else did" -- and
+/// `POUND_ERROR_INVALID_ARGUMENT` for a handle that names another kind of object.
 error_t hos_process_event_clear(hos_process_t *POUND_RESTRICT process, hos_handle_t handle);
 
-/// Reads the event's state without changing it.
+/// Clears the event through its readable handle, which is what `svcResetSignal` does.
+///
+/// Clears an event that is signalled and reports `POUND_ERROR_INVALID_STATE` otherwise,
+/// so the call distinguishes having consumed a signal from finding it already gone. A
+/// writable handle is refused with `POUND_ERROR_INVALID_ARGUMENT`, because Horizon's
+/// reset takes a `ReadableEvent`.
+error_t hos_process_event_reset(hos_process_t *POUND_RESTRICT process, hos_handle_t handle);
+
+/// Reads the event's state without changing it, through either side of it.
 error_t hos_process_event_is_signaled(const hos_process_t *POUND_RESTRICT  process,
                                       hos_handle_t                        handle,
                                       bool *POUND_RESTRICT                 out_signaled);
 
 /// Waits for the event and does not block.
 ///
+/// Requires the readable side: a writable handle has no wait to satisfy and is refused as
+/// an argument error, which the syscall layer reports as Horizon's `0xE401`.
+///
 /// Reports whether the event was signalled, and clears an auto-reset event that was, so
 /// that the signal is consumed exactly once. A manual-reset event is left signalled.
 /// A wait on an unsignalled event returns `POUND_SUCCESS` with `*out_signaled` false:
 /// "not yet" is a result, not a failure, and a blocking wait is the scheduler's job.
 ///
-/// Returns the same errors as `hos_process_event_is_signaled`.
+/// Returns the same errors as `hos_process_event_is_signaled`, plus
+/// `POUND_ERROR_INVALID_ARGUMENT` for a writable handle.
 error_t hos_process_event_wait(hos_process_t *POUND_RESTRICT process,
                                hos_handle_t                 handle,
                                bool *POUND_RESTRICT         out_signaled);
@@ -504,7 +562,8 @@ error_t hos_process_event_wait(hos_process_t *POUND_RESTRICT process,
 ///
 /// A thread is ready once it has terminated, which is how a title joins one: waiting on a
 /// thread handle and being woken when it exits is a level rather than an edge, so it needs
-/// no signal and nothing to consume.
+/// no signal and nothing to consume. A writable event handle is not waitable and is
+/// refused as `POUND_ERROR_INVALID_HANDLE`, which the syscall layer reports as `0xE401`.
 ///
 /// On `POUND_SUCCESS`, `*out_ready` says whether anything was ready and, when it was,
 /// `*out_index` is the position in `handles` of the one that was. On a timeout the index

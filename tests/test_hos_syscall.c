@@ -735,11 +735,13 @@ POUND_TEST(hos_syscall, signal_and_clear_an_event)
     POUND_CHECK_EQ_U64(hos_process_event_is_signaled(&g_process, event, &signaled), POUND_SUCCESS);
     POUND_CHECK(!signaled);
 
-    // Clearing an event that is already clear is a success: `svcClearEvent` has to be
-    // usable as "make sure this is clear".
+    // Clearing an event that is already clear has nothing to consume. Horizon reports
+    // `0xFA01` rather than a success, and libnx depends on that distinction: its autoclear
+    // mode is "wait, then reset", and a reset that always succeeded could not tell whether
+    // the wait it just finished actually had a signal.
     g_state.x[0] = event;
     POUND_CHECK_EQ_U64(call(HOS_SVC_CLEAR_EVENT), POUND_SUCCESS);
-    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_STATE);
 
     machine_teardown();
 }
@@ -835,6 +837,130 @@ POUND_TEST(hos_syscall, close_handle_gives_the_handle_back)
     g_state.x[0] = event;
     POUND_CHECK_EQ_U64(call(HOS_SVC_CLOSE_HANDLE), POUND_SUCCESS);
     POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_HANDLE);
+
+    machine_teardown();
+}
+
+POUND_TEST(hos_syscall, create_event_answers_two_one_sided_handles)
+{
+    machine_reset();
+
+    // `svcCreateEvent` takes no arguments: the kernel answers `W1` writable and `W2`
+    // readable, and the caller's stub stores those two registers through the pointers it
+    // saved before the trap. All three registers are dirtied first so a handler that
+    // answered through `X0` cannot pass by accident.
+    g_state.x[0] = 0xAAAAAAAAAAAAAAAAULL;
+    g_state.x[1] = 0xBBBBBBBBBBBBBBBBULL;
+    g_state.x[2] = 0xCCCCCCCCCCCCCCCCULL;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_CREATE_EVENT), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.pc, TEST_GUEST_BASE + 4U);
+
+    const hos_handle_t writable = (hos_handle_t)(uint32_t)g_state.x[1];
+    const hos_handle_t readable = (hos_handle_t)(uint32_t)g_state.x[2];
+
+    POUND_CHECK(writable != HOS_HANDLE_INVALID);
+    POUND_CHECK(readable != HOS_HANDLE_INVALID);
+    POUND_CHECK(writable != readable);
+    POUND_CHECK_EQ_U64(hos_process_handle_count(&g_process), 2U);
+
+    // One object, two handles: the pair is a view of one event, not two events.
+    POUND_CHECK_EQ_U64(hos_kernel_object_count(&g_kernel), 1U);
+
+    hos_object_type_t type = HOS_OBJECT_SESSION;
+    POUND_CHECK_EQ_U64(hos_process_handle_type(&g_process, writable, &type), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(type, HOS_OBJECT_EVENT);
+    POUND_CHECK_EQ_U64(hos_process_handle_type(&g_process, readable, &type), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(type, HOS_OBJECT_EVENT);
+
+    g_state.x[0] = writable;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SIGNAL_EVENT), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_SUCCESS);
+
+    const hos_handle_t handles[1] = { readable };
+    put_handles(handles, 1U, TEST_HANDLES_ADDRESS);
+
+    g_state.x[0] = TEST_OUT_SLOT_0;
+    g_state.x[1] = TEST_HANDLES_ADDRESS;
+    g_state.x[2] = 1U;
+    g_state.x[3] = 0U;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_WAIT_SYNCHRONIZATION), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[1], 0U);
+    POUND_CHECK_EQ_U64(read_u64_at(TEST_OUT_SLOT_0), 0U);
+
+    // The wait did not consume the signal: Horizon's own events are manual-reset, and
+    // libnx implements autoclear by resetting after a successful wait.
+    g_state.x[0] = TEST_OUT_SLOT_0;
+    g_state.x[1] = TEST_HANDLES_ADDRESS;
+    g_state.x[2] = 1U;
+    g_state.x[3] = 0U;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_WAIT_SYNCHRONIZATION), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_SUCCESS);
+
+    // Resetting through the readable side is what clears it.
+    g_state.x[0] = readable;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_RESET_SIGNAL), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_SUCCESS);
+
+    // The handles close independently and the object dies with the last one.
+    g_state.x[0] = writable;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_CLOSE_HANDLE), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(hos_process_handle_count(&g_process), 1U);
+    POUND_CHECK_EQ_U64(hos_kernel_object_count(&g_kernel), 1U);
+
+    g_state.x[0] = readable;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_CLOSE_HANDLE), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(hos_process_handle_count(&g_process), 0U);
+    POUND_CHECK_EQ_U64(hos_kernel_object_count(&g_kernel), 0U);
+
+    machine_teardown();
+}
+
+POUND_TEST(hos_syscall, create_event_handles_refuse_the_wrong_side)
+{
+    machine_reset();
+
+    g_state.x[0] = 0U;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_CREATE_EVENT), POUND_SUCCESS);
+
+    const hos_handle_t writable = (hos_handle_t)(uint32_t)g_state.x[1];
+    const hos_handle_t readable = (hos_handle_t)(uint32_t)g_state.x[2];
+    POUND_REQUIRE((writable != HOS_HANDLE_INVALID) && (readable != HOS_HANDLE_INVALID));
+
+    // A one-sided handle used on the wrong side is the same `Result` as a handle that
+    // names nothing: `0xE401`.
+    g_state.x[0] = readable;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SIGNAL_EVENT), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_HANDLE);
+
+    // A writable handle is not waitable.
+    const hos_handle_t handles[1] = { writable };
+    put_handles(handles, 1U, TEST_HANDLES_ADDRESS);
+    g_state.x[0] = TEST_OUT_SLOT_0;
+    g_state.x[1] = TEST_HANDLES_ADDRESS;
+    g_state.x[2] = 1U;
+    g_state.x[3] = 0U;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_WAIT_SYNCHRONIZATION), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_HANDLE);
+
+    g_state.x[0] = writable;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_RESET_SIGNAL), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_HANDLE);
+
+    // Clear accepts either side, which the wiki documents explicitly and which is what
+    // lets libnx's `eventClear` work with whichever handle it has.
+    g_state.x[0] = writable;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SIGNAL_EVENT), POUND_SUCCESS);
+    g_state.x[0] = writable;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_CLEAR_EVENT), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_SUCCESS);
+
+    g_state.x[0] = writable;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_SIGNAL_EVENT), POUND_SUCCESS);
+    g_state.x[0] = readable;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_CLEAR_EVENT), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_SUCCESS);
 
     machine_teardown();
 }
@@ -2025,6 +2151,8 @@ POUND_TEST_SUITE(hos_syscall,
                  POUND_TEST_CASE(hos_syscall, event_calls_report_an_invalid_handle),
                  POUND_TEST_CASE(hos_syscall, reset_signal_reports_whether_it_was_signaled),
                  POUND_TEST_CASE(hos_syscall, close_handle_gives_the_handle_back),
+                 POUND_TEST_CASE(hos_syscall, create_event_answers_two_one_sided_handles),
+                 POUND_TEST_CASE(hos_syscall, create_event_handles_refuse_the_wrong_side),
                  POUND_TEST_CASE(hos_syscall, wait_synchronization_polls_the_handles),
                  POUND_TEST_CASE(hos_syscall, wait_synchronization_treats_a_session_as_never_ready),
                  POUND_TEST_CASE(hos_syscall, wait_synchronization_rejects_what_it_cannot_do),

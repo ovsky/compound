@@ -106,6 +106,15 @@ typedef enum
     /// a handle at all -- a NULL pointer, or a service name of the wrong length.
     POUND_ERROR_INVALID_HANDLE,
 
+    /// The object is not in the state the operation requires.
+    ///
+    /// An event that has not been signalled cannot be cleared or reset. That is an
+    /// ordinary guest-visible answer rather than a bug -- Horizon reports it as `0xFA01`
+    /// -- and it is how a title tells "I consumed the signal" from "something else did".
+    /// Distinct from `POUND_ERROR_INVALID_HANDLE`, which says the handle never named the
+    /// object at all.
+    POUND_ERROR_INVALID_STATE,
+
     /// A guest system call, or a feature inside one, is not implemented.
     ///
     /// Distinct from `POUND_ERROR_UNSUPPORTED_INSTRUCTION`, which reports an *encoding*

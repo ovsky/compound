@@ -767,6 +767,10 @@ POUND_TEST(hos_kernel, event_manual_reset_stays_signalled)
     POUND_CHECK_EQ_U64(hos_process_event_wait(&g_process, event, &observed), POUND_SUCCESS);
     POUND_CHECK(!observed);
 
+    // A second clear has nothing to consume, which Horizon reports as `0xFA01` rather
+    // than as a no-op: a guest uses the distinction to tell who took the signal.
+    POUND_CHECK_EQ_U64(hos_process_event_clear(&g_process, event), POUND_ERROR_INVALID_STATE);
+
     machine_teardown();
 }
 
@@ -818,6 +822,7 @@ POUND_TEST(hos_kernel, event_operations_require_an_event_handle)
                        POUND_ERROR_INVALID_ARGUMENT);
     POUND_CHECK_EQ_U64(hos_process_event_is_signaled(&g_process, session, &signaled),
                        POUND_ERROR_INVALID_ARGUMENT);
+    POUND_CHECK_EQ_U64(hos_process_event_reset(&g_process, session), POUND_ERROR_INVALID_ARGUMENT);
 
     machine_teardown();
 }
@@ -846,6 +851,17 @@ POUND_TEST(hos_kernel, event_rejects_null_arguments)
                        POUND_ERROR_INVALID_ARGUMENT);
     POUND_CHECK_EQ_U64(hos_process_event_signal(NULL, event), POUND_ERROR_INVALID_ARGUMENT);
     POUND_CHECK_EQ_U64(hos_process_event_clear(NULL, event), POUND_ERROR_INVALID_ARGUMENT);
+    POUND_CHECK_EQ_U64(hos_process_event_reset(NULL, event), POUND_ERROR_INVALID_ARGUMENT);
+
+    // The pair path validates its outputs before allocating anything, so a refusal leaves
+    // no handle behind that the guest was never given.
+    POUND_CHECK_EQ_U64(hos_process_create_event_pair(NULL, false, &event, &event),
+                       POUND_ERROR_INVALID_ARGUMENT);
+    POUND_CHECK_EQ_U64(hos_process_create_event_pair(&g_process, false, NULL, &event),
+                       POUND_ERROR_INVALID_ARGUMENT);
+    POUND_CHECK_EQ_U64(hos_process_create_event_pair(&g_process, false, &event, NULL),
+                       POUND_ERROR_INVALID_ARGUMENT);
+    POUND_CHECK_EQ_U64(hos_process_handle_count(&g_process), 1U);
 
     // A process that is not open is reported as such rather than as a bad handle, because
     // the handle may be perfectly good and simply not look-up-able here.
@@ -853,6 +869,119 @@ POUND_TEST(hos_kernel, event_rejects_null_arguments)
     memset(&closed, 0, sizeof(closed));
     POUND_CHECK_EQ_U64(hos_process_event_signal(&closed, event), POUND_ERROR_NOT_INITIALIZED);
     POUND_CHECK_EQ_U64(hos_process_close_handle(&closed, event), POUND_ERROR_NOT_INITIALIZED);
+
+    machine_teardown();
+}
+
+POUND_TEST(hos_kernel, event_pair_grants_one_side_each)
+{
+    machine_reset();
+
+    hos_handle_t writable = HOS_HANDLE_INVALID;
+    hos_handle_t readable = HOS_HANDLE_INVALID;
+    POUND_REQUIRE(POUND_SUCCESS ==
+                  hos_process_create_event_pair(&g_process, false, &writable, &readable));
+
+    POUND_CHECK(writable != readable);
+
+    hos_object_type_t type = HOS_OBJECT_SESSION;
+    POUND_CHECK_EQ_U64(hos_process_handle_type(&g_process, writable, &type), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(type, HOS_OBJECT_EVENT);
+    POUND_CHECK_EQ_U64(hos_process_handle_type(&g_process, readable, &type), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(type, HOS_OBJECT_EVENT);
+
+    // Only the writable side signals and only the readable side waits. The object is of
+    // the right kind in both cases; the handle is what lacks the authority.
+    POUND_CHECK_EQ_U64(hos_process_event_signal(&g_process, readable), POUND_ERROR_INVALID_ARGUMENT);
+    POUND_CHECK_EQ_U64(hos_process_event_signal(&g_process, writable), POUND_SUCCESS);
+
+    bool observed = false;
+    POUND_CHECK_EQ_U64(hos_process_event_wait(&g_process, writable, &observed),
+                       POUND_ERROR_INVALID_ARGUMENT);
+    POUND_CHECK_EQ_U64(hos_process_event_wait(&g_process, readable, &observed), POUND_SUCCESS);
+    POUND_CHECK(observed);
+
+    // Manual-reset: seeing the signal did not consume it, which is what makes libnx's
+    // "wait, then reset" implementation of autoclear work.
+    POUND_CHECK_EQ_U64(hos_process_event_wait(&g_process, readable, &observed), POUND_SUCCESS);
+    POUND_CHECK(observed);
+
+    // Reset takes the readable side; clear accepts either, exactly as the wiki documents.
+    POUND_CHECK_EQ_U64(hos_process_event_reset(&g_process, writable), POUND_ERROR_INVALID_ARGUMENT);
+    POUND_CHECK_EQ_U64(hos_process_event_reset(&g_process, readable), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(hos_process_event_reset(&g_process, readable), POUND_ERROR_INVALID_STATE);
+
+    POUND_CHECK_EQ_U64(hos_process_event_signal(&g_process, writable), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(hos_process_event_clear(&g_process, writable), POUND_SUCCESS);
+
+    POUND_CHECK_EQ_U64(hos_process_event_signal(&g_process, writable), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(hos_process_event_clear(&g_process, readable), POUND_SUCCESS);
+
+    // Both handles name one object: closing the writable side leaves the readable one
+    // usable and the object alive until the last handle goes.
+    POUND_CHECK_EQ_U64(hos_process_close_handle(&g_process, writable), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(hos_process_handle_count(&g_process), 1U);
+    POUND_CHECK_EQ_U64(hos_kernel_object_count(&g_kernel), 1U);
+
+    POUND_CHECK_EQ_U64(hos_process_event_is_signaled(&g_process, readable, &observed), POUND_SUCCESS);
+    POUND_CHECK(!observed);
+
+    POUND_CHECK_EQ_U64(hos_process_close_handle(&g_process, readable), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(hos_kernel_object_count(&g_kernel), 0U);
+
+    machine_teardown();
+}
+
+POUND_TEST(hos_kernel, event_pair_refuses_aliased_outputs)
+{
+    machine_reset();
+
+    hos_handle_t handle = HOS_HANDLE_INVALID;
+    POUND_CHECK_EQ_U64(hos_process_create_event_pair(&g_process, false, &handle, &handle),
+                       POUND_ERROR_INVALID_ARGUMENT);
+
+    // Nothing was allocated: returning two handles through one slot would leak whichever
+    // one the guest never saw.
+    POUND_CHECK_EQ_U64(hos_process_handle_count(&g_process), 0U);
+    POUND_CHECK_EQ_U64(hos_kernel_object_count(&g_kernel), 0U);
+
+    machine_teardown();
+}
+
+POUND_TEST(hos_kernel, duplicated_event_handle_keeps_its_side)
+{
+    machine_reset();
+
+    hos_handle_t writable = HOS_HANDLE_INVALID;
+    hos_handle_t readable = HOS_HANDLE_INVALID;
+    POUND_REQUIRE(POUND_SUCCESS ==
+                  hos_process_create_event_pair(&g_process, false, &writable, &readable));
+
+    hos_handle_t readable_copy = HOS_HANDLE_INVALID;
+    hos_handle_t writable_copy = HOS_HANDLE_INVALID;
+    POUND_REQUIRE(POUND_SUCCESS ==
+                  hos_process_duplicate_handle(&g_process, readable, &readable_copy));
+    POUND_REQUIRE(POUND_SUCCESS ==
+                  hos_process_duplicate_handle(&g_process, writable, &writable_copy));
+
+    // A duplicate is a second name for the same authority, never a promotion to the
+    // other side.
+    POUND_CHECK_EQ_U64(hos_process_event_signal(&g_process, readable_copy),
+                       POUND_ERROR_INVALID_ARGUMENT);
+    POUND_CHECK_EQ_U64(hos_process_event_signal(&g_process, writable_copy), POUND_SUCCESS);
+
+    bool observed = false;
+    POUND_CHECK_EQ_U64(hos_process_event_wait(&g_process, writable_copy, &observed),
+                       POUND_ERROR_INVALID_ARGUMENT);
+    POUND_CHECK_EQ_U64(hos_process_event_wait(&g_process, readable_copy, &observed), POUND_SUCCESS);
+    POUND_CHECK(observed);
+
+    // All four handles name one event, so a reset through any readable one is visible to
+    // every other.
+    POUND_CHECK_EQ_U64(hos_process_event_reset(&g_process, readable), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(hos_process_event_is_signaled(&g_process, readable_copy, &observed),
+                       POUND_SUCCESS);
+    POUND_CHECK(!observed);
 
     machine_teardown();
 }
@@ -1555,6 +1684,9 @@ POUND_TEST_SUITE(hos_kernel,
                  POUND_TEST_CASE(hos_kernel, event_can_be_created_signalled),
                  POUND_TEST_CASE(hos_kernel, event_operations_require_an_event_handle),
                  POUND_TEST_CASE(hos_kernel, event_rejects_null_arguments),
+                 POUND_TEST_CASE(hos_kernel, event_pair_grants_one_side_each),
+                 POUND_TEST_CASE(hos_kernel, event_pair_refuses_aliased_outputs),
+                 POUND_TEST_CASE(hos_kernel, duplicated_event_handle_keeps_its_side),
                  POUND_TEST_CASE(hos_kernel, process_lifecycle),
                  POUND_TEST_CASE(hos_kernel, process_close_releases_every_handle),
                  POUND_TEST_CASE(hos_kernel, session_request_routes_command_and_payload),

@@ -124,6 +124,12 @@ struct hos_handle_slot
     /// Index into the owning kernel's object table. Meaningful only while `in_use`.
     uint32_t object_index;
 
+    /// Which rights this handle carries for the object it names.
+    ///
+    /// Only events split them today (see `hos_handle_right_t`); every other object kind
+    /// carries `HOS_HANDLE_RIGHT_ALL`.
+    uint32_t rights;
+
     /// Whether this slot currently names an object.
     bool in_use;
 };
@@ -326,7 +332,10 @@ allocate_object(hos_kernel_t *POUND_RESTRICT kernel, hos_object_type_t type, uin
 ///
 /// Must be called with the kernel lock held.
 static error_t
-allocate_handle(hos_process_t *POUND_RESTRICT process, uint32_t object_index, hos_handle_t *POUND_RESTRICT out_handle)
+allocate_handle(hos_process_t *POUND_RESTRICT process,
+                uint32_t                          object_index,
+                uint32_t                          rights,
+                hos_handle_t *POUND_RESTRICT      out_handle)
 {
     if (process->handle_count == process->handle_capacity)
     {
@@ -349,6 +358,7 @@ allocate_handle(hos_process_t *POUND_RESTRICT process, uint32_t object_index, ho
 
         slot->in_use       = true;
         slot->object_index = object_index;
+        slot->rights       = rights;
         process->handle_count++;
 
         struct hos_object *object = &process->kernel->objects[object_index];
@@ -394,6 +404,32 @@ release_object(hos_kernel_t *POUND_RESTRICT kernel, uint32_t object_index)
                 kernel->object_count--;
             }
         }
+    }
+}
+
+/// Drops the handle in `handle`'s slot, releasing the object it named.
+///
+/// Must be called with the kernel lock held and after `handle` has resolved to
+/// `object_index`. Shared by `hos_process_close_handle` and by the rollback in
+/// `hos_process_create_event_pair`, which must not leave behind a handle the guest was
+/// never given.
+static void
+drop_handle_locked(hos_process_t *POUND_RESTRICT process,
+                   hos_handle_t                 handle,
+                   uint32_t                     object_index)
+{
+    struct hos_handle_slot *slot = &process->handles[handle_slot_number(handle) - 1U];
+
+    release_object(process->kernel, object_index);
+
+    slot->in_use       = false;
+    slot->object_index = 0U;
+    slot->rights       = 0U;
+    slot->generation   = (slot->generation + 1U) & HOS_HANDLE_GENERATION_MASK;
+
+    if (process->handle_count > 0U)
+    {
+        process->handle_count--;
     }
 }
 
@@ -490,6 +526,45 @@ resolve_handle_as(const hos_process_t *POUND_RESTRICT process,
                         (const void *)process,
                         object_kind_name(actual),
                         object_kind_name(type));
+        return POUND_ERROR_INVALID_ARGUMENT;
+    }
+
+    *out_object_index = object_index;
+    return POUND_SUCCESS;
+}
+
+/// Resolves `handle` as an event carrying at least one of `any_right`.
+///
+/// Must be called with the kernel lock held. A handle of the right kind that carries only
+/// the wrong side of the event is an argument error, matching `resolve_handle_as`: the
+/// handle is good, it just does not authorise this operation. `any_right` is a mask
+/// because clear and the state query accept either side, while signal and wait each
+/// accept exactly one.
+static error_t
+resolve_event(const hos_process_t *POUND_RESTRICT process,
+              hos_handle_t                        handle,
+              uint32_t                            any_right,
+              uint32_t *POUND_RESTRICT            out_object_index)
+{
+    uint32_t      object_index = 0U;
+    const error_t error        = resolve_handle_as(process, handle, HOS_OBJECT_EVENT, &object_index);
+
+    if (error != POUND_SUCCESS)
+    {
+        return error;
+    }
+
+    const uint32_t rights = process->handles[handle_slot_number(handle) - 1U].rights;
+
+    if ((rights & any_right) == 0U)
+    {
+        POUND_LOG_ERROR(&thread_logger,
+                        "Rejected handle 0x%08X from process %p: it carries rights 0x%X, but this event "
+                        "operation needs one of 0x%X.",
+                        (unsigned int)handle,
+                        (const void *)process,
+                        (unsigned int)rights,
+                        (unsigned int)any_right);
         return POUND_ERROR_INVALID_ARGUMENT;
     }
 
@@ -1078,7 +1153,80 @@ hos_process_create_event(hos_process_t *POUND_RESTRICT process,
     {
         kernel->objects[object_index].event_mode     = mode;
         kernel->objects[object_index].event_signaled = initially_signaled;
-        error = allocate_handle(process, object_index, out_handle);
+        error = allocate_handle(process, object_index, HOS_HANDLE_RIGHT_ALL, out_handle);
+    }
+
+    mutex_unlock(&kernel->lock);
+    return error;
+}
+
+error_t
+hos_process_create_event_pair(hos_process_t *POUND_RESTRICT process,
+                              bool                         initially_signaled,
+                              hos_handle_t *POUND_RESTRICT out_writable,
+                              hos_handle_t *POUND_RESTRICT out_readable)
+{
+    if (process == NULL)
+    {
+        POUND_LOG_ERROR(&thread_logger, "Aborting hos_process_create_event_pair: process is NULL.");
+        return POUND_ERROR_INVALID_ARGUMENT;
+    }
+
+    if ((out_writable == NULL) || (out_readable == NULL))
+    {
+        POUND_LOG_ERROR(&thread_logger,
+                        "Aborting hos_process_create_event_pair: out_writable or out_readable is NULL.");
+        return POUND_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (out_writable == out_readable)
+    {
+        POUND_LOG_ERROR(&thread_logger,
+                        "Aborting hos_process_create_event_pair: out_writable and out_readable are the "
+                        "same pointer, which would leak the handle it overwrote.");
+        return POUND_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (!hos_process_is_open(process))
+    {
+        POUND_LOG_ERROR(&thread_logger,
+                        "Aborting hos_process_create_event_pair: the process was never created, or was "
+                        "already closed.");
+        return POUND_ERROR_NOT_INITIALIZED;
+    }
+
+    hos_kernel_t *kernel = process->kernel;
+    mutex_lock(&kernel->lock);
+
+    uint32_t object_index = 0U;
+    error_t  error        = allocate_object(kernel, HOS_OBJECT_EVENT, &object_index);
+
+    if (error == POUND_SUCCESS)
+    {
+        // Horizon's own events are manual-reset. libnx implements its `autoclear` flag by
+        // calling `svcResetSignal` after a successful wait, which only works if the wait
+        // left the event signalled.
+        kernel->objects[object_index].event_mode     = HOS_EVENT_MANUAL;
+        kernel->objects[object_index].event_signaled = initially_signaled;
+
+        hos_handle_t writable = HOS_HANDLE_INVALID;
+        error = allocate_handle(process, object_index, HOS_HANDLE_RIGHT_WRITE, &writable);
+
+        if (error == POUND_SUCCESS)
+        {
+            error = allocate_handle(process, object_index, HOS_HANDLE_RIGHT_READ, out_readable);
+
+            if (error == POUND_SUCCESS)
+            {
+                *out_writable = writable;
+            }
+            else
+            {
+                // The guest never saw `writable`, so it must not stay in the table: a
+                // handle nothing can name is a reference the object would never lose.
+                drop_handle_locked(process, writable, object_index);
+            }
+        }
     }
 
     mutex_unlock(&kernel->lock);
@@ -1136,7 +1284,7 @@ hos_process_connect(hos_process_t *POUND_RESTRICT process,
     if (error == POUND_SUCCESS)
     {
         kernel->objects[object_index].service_index = service_index;
-        error = allocate_handle(process, object_index, out_handle);
+        error = allocate_handle(process, object_index, HOS_HANDLE_RIGHT_ALL, out_handle);
     }
 
     mutex_unlock(&kernel->lock);
@@ -1189,7 +1337,10 @@ hos_process_duplicate_handle_into(hos_process_t *POUND_RESTRICT source,
 
     if (error == POUND_SUCCESS)
     {
-        error = allocate_handle(target, object_index, out_handle);
+        // Rights travel with the handle. A duplicate is a second name for the same
+        // authority, never a way to gain the other side of an event.
+        const uint32_t rights = source->handles[handle_slot_number(handle) - 1U].rights;
+        error                 = allocate_handle(target, object_index, rights, out_handle);
     }
 
     mutex_unlock(&kernel->lock);
@@ -1233,18 +1384,7 @@ hos_process_close_handle(hos_process_t *POUND_RESTRICT process, hos_handle_t han
         return error;
     }
 
-    struct hos_handle_slot *slot = &process->handles[handle_slot_number(handle) - 1U];
-
-    release_object(kernel, object_index);
-
-    slot->in_use       = false;
-    slot->object_index = 0U;
-    slot->generation   = (slot->generation + 1U) & HOS_HANDLE_GENERATION_MASK;
-
-    if (process->handle_count > 0U)
-    {
-        process->handle_count--;
-    }
+    drop_handle_locked(process, handle, object_index);
 
     mutex_unlock(&kernel->lock);
     return POUND_SUCCESS;
@@ -1317,7 +1457,7 @@ hos_process_event_signal(hos_process_t *POUND_RESTRICT process, hos_handle_t han
     mutex_lock(&kernel->lock);
 
     uint32_t      object_index = 0U;
-    const error_t error        = resolve_handle_as(process, handle, HOS_OBJECT_EVENT, &object_index);
+    const error_t error        = resolve_event(process, handle, HOS_HANDLE_RIGHT_WRITE, &object_index);
 
     if (error == POUND_SUCCESS)
     {
@@ -1328,20 +1468,27 @@ hos_process_event_signal(hos_process_t *POUND_RESTRICT process, hos_handle_t han
     return error;
 }
 
-error_t
-hos_process_event_clear(hos_process_t *POUND_RESTRICT process, hos_handle_t handle)
+/// Shared body of `hos_process_event_clear` and `hos_process_event_reset`.
+///
+/// Both take the event out of the signalled state and refuse an event that is already
+/// clear; they differ only in which side of the handle they accept.
+static error_t
+clear_event(hos_process_t *POUND_RESTRICT process,
+            hos_handle_t                 handle,
+            uint32_t                     any_right,
+            const char *POUND_RESTRICT   operation)
 {
     if (process == NULL)
     {
-        POUND_LOG_ERROR(&thread_logger, "Aborting hos_process_event_clear: process is NULL.");
+        POUND_LOG_ERROR(&thread_logger, "Aborting %s: process is NULL.", operation);
         return POUND_ERROR_INVALID_ARGUMENT;
     }
 
     if (!hos_process_is_open(process))
     {
         POUND_LOG_ERROR(&thread_logger,
-                        "Aborting hos_process_event_clear: the process was never created, or was already "
-                        "closed.");
+                        "Aborting %s: the process was never created, or was already closed.",
+                        operation);
         return POUND_ERROR_NOT_INITIALIZED;
     }
 
@@ -1349,15 +1496,42 @@ hos_process_event_clear(hos_process_t *POUND_RESTRICT process, hos_handle_t hand
     mutex_lock(&kernel->lock);
 
     uint32_t      object_index = 0U;
-    const error_t error        = resolve_handle_as(process, handle, HOS_OBJECT_EVENT, &object_index);
+    error_t       error        = resolve_event(process, handle, any_right, &object_index);
 
     if (error == POUND_SUCCESS)
     {
-        kernel->objects[object_index].event_signaled = false;
+        struct hos_object *event = &kernel->objects[object_index];
+
+        if (!event->event_signaled)
+        {
+            // Horizon reports an already-clear event as `0xFA01`, and the distinction is
+            // the point: a guest uses it to tell "I consumed the signal" from "someone
+            // else did".
+            error = POUND_ERROR_INVALID_STATE;
+        }
+        else
+        {
+            event->event_signaled = false;
+        }
     }
 
     mutex_unlock(&kernel->lock);
     return error;
+}
+
+error_t
+hos_process_event_clear(hos_process_t *POUND_RESTRICT process, hos_handle_t handle)
+{
+    return clear_event(process,
+                       handle,
+                       HOS_HANDLE_RIGHT_READ | HOS_HANDLE_RIGHT_WRITE,
+                       "hos_process_event_clear");
+}
+
+error_t
+hos_process_event_reset(hos_process_t *POUND_RESTRICT process, hos_handle_t handle)
+{
+    return clear_event(process, handle, HOS_HANDLE_RIGHT_READ, "hos_process_event_reset");
 }
 
 error_t
@@ -1391,7 +1565,10 @@ hos_process_event_is_signaled(const hos_process_t *POUND_RESTRICT process,
     mutex_lock(&kernel->lock);
 
     uint32_t      object_index = 0U;
-    const error_t error = resolve_handle_as(mutable_process, handle, HOS_OBJECT_EVENT, &object_index);
+    const error_t error = resolve_event(mutable_process,
+                                        handle,
+                                        HOS_HANDLE_RIGHT_READ | HOS_HANDLE_RIGHT_WRITE,
+                                        &object_index);
 
     if (error == POUND_SUCCESS)
     {
@@ -1431,7 +1608,7 @@ hos_process_event_wait(hos_process_t *POUND_RESTRICT process,
     mutex_lock(&kernel->lock);
 
     uint32_t      object_index = 0U;
-    const error_t error        = resolve_handle_as(process, handle, HOS_OBJECT_EVENT, &object_index);
+    const error_t error        = resolve_event(process, handle, HOS_HANDLE_RIGHT_READ, &object_index);
 
     if (error == POUND_SUCCESS)
     {
@@ -1514,6 +1691,21 @@ hos_process_wait_any(const hos_process_t *POUND_RESTRICT process,
         }
 
         struct hos_object *object = &kernel->objects[object_index];
+
+        if ((object->type == HOS_OBJECT_EVENT) &&
+            ((mutable_process->handles[handle_slot_number(handles[position]) - 1U].rights &
+              HOS_HANDLE_RIGHT_READ) == 0U))
+        {
+            // Horizon's wait takes readable objects only. A writable event handle is a live
+            // handle of the wrong kind, which the syscall layer reports as `0xE401`.
+            POUND_LOG_ERROR(&thread_logger,
+                            "Rejected handle 0x%08X from process %p in a wait: it is the writable side "
+                            "of an event, which cannot be waited on.",
+                            (unsigned int)handles[position],
+                            (const void *)process);
+            mutex_unlock(&kernel->lock);
+            return POUND_ERROR_INVALID_HANDLE;
+        }
 
         if (object->type == HOS_OBJECT_THREAD)
         {
@@ -1617,7 +1809,7 @@ hos_process_create_thread(hos_process_t *POUND_RESTRICT       process,
         // the new field visible beside the rest of the thread's initial state.
         thread->cancel_requested = false;
 
-        error = allocate_handle(process, object_index, out_handle);
+        error = allocate_handle(process, object_index, HOS_HANDLE_RIGHT_ALL, out_handle);
     }
 
     mutex_unlock(&kernel->lock);

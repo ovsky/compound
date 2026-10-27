@@ -200,8 +200,10 @@ typedef struct
 
 /// Upper bound on registered cases. The suite is a fixed set of translation
 /// units, so exceeding this is a programming error rather than a runtime
-/// condition.
-#define POUND_TEST_MAX_CASES 512
+/// condition. It is a ceiling on the registry, not a target: raise it when a
+/// slice adds cases to a tree that is already at the limit, never by deleting a
+/// case to fit.
+#define POUND_TEST_MAX_CASES 1024
 
 /// Registers one case with the global registry.
 void pound_test_register(const pound_test_t *test);
