@@ -82,8 +82,29 @@ static uint64_t     g_thread_id;
 /// `pc` and dispatches it, and these cases dispatch a call they chose instead. What is
 /// being tested is the same either way -- that a call which blocks parks the thread, and
 /// that the thread is finished by `hos_syscall_complete_block` when it is woken.
-static uint32_t g_call_number;
-static bool     g_call_pending;
+/// One call a case has scripted for the thread that must make it.
+///
+/// Per-thread rather than a single pending call, because a case that needs two threads to
+/// interact cannot express it otherwise: one thread parks on a wait while the other cancels
+/// it. An entry is consumed when the named thread runs, so entries for different threads are
+/// independent and the order they were added in only matters within one thread.
+typedef struct
+{
+    uint64_t thread_id;
+    uint32_t number;
+} scripted_call_t;
+
+/// How many calls one case may script. Four threads, two calls each, is well past what any
+/// case here needs; the bound exists so a case that forgets to consume one is caught by an
+/// assertion rather than by an out-of-bounds write.
+#define TEST_SCRIPTED_CALL_MAX 8U
+
+static scripted_call_t g_scripted_calls[TEST_SCRIPTED_CALL_MAX];
+static uint32_t        g_scripted_count;
+
+/// The last wake the driver completed a call for, so a case can assert on why a wait ended.
+static hos_wake_t g_last_wake;
+static uint32_t   g_wake_count;
 
 static uint8_t *
 host_at(const uint64_t guest_address)
@@ -127,8 +148,10 @@ machine_reset(void)
 
     g_thread       = HOS_HANDLE_INVALID;
     g_thread_id    = 0U;
-    g_call_number  = 0U;
-    g_call_pending = false;
+    g_scripted_count = 0U;
+    g_wake_count     = 0U;
+    memset(g_scripted_calls, 0, sizeof(g_scripted_calls));
+    memset(&g_last_wake, 0, sizeof(g_last_wake));
 
     POUND_REQUIRE(POUND_SUCCESS ==
                   guest_memory_init(&g_memory_region, g_memory, sizeof(g_memory), TEST_GUEST_BASE));
@@ -217,6 +240,35 @@ start_a_thread(void)
     POUND_REQUIRE(POUND_SUCCESS == hos_scheduler_admit(&g_scheduler, &g_process, g_thread_id));
 }
 
+/// Creates, starts and admits another thread at `priority`, answering its handle and id.
+///
+/// A second thread is what a cancellation case needs: one thread has to be parked in a wait
+/// for another one to interrupt it.
+static void
+start_thread_with_priority(const uint32_t priority, hos_handle_t *POUND_RESTRICT out_handle, uint64_t *POUND_RESTRICT out_id)
+{
+    guest_state_t initial;
+
+    POUND_REQUIRE(POUND_SUCCESS == guest_state_init(&initial));
+    initial.pc = TEST_GUEST_BASE;
+
+    POUND_REQUIRE(POUND_SUCCESS == hos_process_create_thread(&g_process, &initial, priority, out_handle));
+    POUND_REQUIRE(POUND_SUCCESS == hos_process_thread_id(&g_process, *out_handle, out_id));
+    POUND_REQUIRE(POUND_SUCCESS == hos_kernel_thread_start(&g_kernel, *out_id));
+    POUND_REQUIRE(POUND_SUCCESS == hos_scheduler_admit(&g_scheduler, &g_process, *out_id));
+}
+
+/// Scripts one call for the thread it names.
+static void
+script_call(const uint64_t thread_id, const uint32_t number)
+{
+    POUND_REQUIRE(g_scripted_count < TEST_SCRIPTED_CALL_MAX);
+
+    g_scripted_calls[g_scripted_count].thread_id = thread_id;
+    g_scripted_calls[g_scripted_count].number    = number;
+    g_scripted_count++;
+}
+
 /// The run function the scheduler is stepped with: real SVC dispatch, no interpreter.
 ///
 /// It first finishes a call that was parked -- exactly what a run loop does with
@@ -247,13 +299,29 @@ driver_run(void *POUND_RESTRICT          context,
 
     if (hos_scheduler_take_wake(&g_scheduler, &wake))
     {
+        g_wake_count++;
+        g_last_wake = wake;
         return hos_syscall_complete_block(&g_context, state, &wake);
     }
 
-    if (g_call_pending)
+    // The first call scripted for *this* thread. Entries for other threads stay where they
+    // are, which is what lets a case say "the waiter parks, then the canceller cancels it".
+    for (uint32_t index = 0U; index < g_scripted_count; index++)
     {
-        g_call_pending = false;
-        return hos_syscall_dispatch(&g_context, g_call_number, state);
+        if (g_scripted_calls[index].thread_id != thread_id)
+        {
+            continue;
+        }
+
+        const uint32_t number = g_scripted_calls[index].number;
+
+        for (uint32_t move = index; (move + 1U) < g_scripted_count; move++)
+        {
+            g_scripted_calls[move] = g_scripted_calls[move + 1U];
+        }
+
+        g_scripted_count--;
+        return hos_syscall_dispatch(&g_context, number, state);
     }
 
     return POUND_SUCCESS;
@@ -352,6 +420,7 @@ POUND_TEST(hos_syscall, name_table)
 {
     POUND_CHECK_STR_EQ(hos_syscall_name(HOS_SVC_SIGNAL_EVENT), "svcSignalEvent");
     POUND_CHECK_STR_EQ(hos_syscall_name(HOS_SVC_WAIT_SYNCHRONIZATION), "svcWaitSynchronization");
+    POUND_CHECK_STR_EQ(hos_syscall_name(HOS_SVC_CANCEL_SYNCHRONIZATION), "svcCancelSynchronization");
     POUND_CHECK_STR_EQ(hos_syscall_name(HOS_SVC_CONNECT_TO_NAMED_PORT), "svcConnectToNamedPort");
 
     // Known to Horizon and named, even though Pound does not implement it: the name is
@@ -927,6 +996,49 @@ POUND_TEST(hos_syscall, wait_synchronization_refuses_to_block_without_a_schedule
 }
 
 // -----------------------------------------------------------------------------
+// svcCancelSynchronization
+// -----------------------------------------------------------------------------
+
+POUND_TEST(hos_syscall, cancel_synchronization_validates_the_target)
+{
+    machine_reset();
+
+    guest_state_t initial;
+    POUND_REQUIRE(POUND_SUCCESS == guest_state_init(&initial));
+
+    hos_handle_t thread = HOS_HANDLE_INVALID;
+    POUND_REQUIRE(POUND_SUCCESS ==
+                  hos_process_create_thread(&g_process, &initial, HOS_THREAD_PRIORITY_DEFAULT, &thread));
+
+    hos_handle_t event = HOS_HANDLE_INVALID;
+    POUND_REQUIRE(POUND_SUCCESS == hos_process_create_event(&g_process, HOS_EVENT_AUTO, false, &event));
+
+    // A handle that names nothing, and one that names an event rather than a thread. Both are
+    // Horizon's `0xE401` -- "invalid, or not a thread handle" -- and both are decided before
+    // the call needs a run queue, exactly as the hardware decides them.
+    g_state.x[0] = HOS_HANDLE_INVALID;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_CANCEL_SYNCHRONIZATION), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_HANDLE);
+
+    g_state.x[0] = event;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_CANCEL_SYNCHRONIZATION), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_HANDLE);
+
+    // A real thread and no scheduler: setting the flag needs no clock, but the wait that
+    // would consume it cannot exist without one, so success would promise an interruption
+    // that can never happen. The trap is left standing.
+    g_state.pc   = TEST_GUEST_BASE;
+    g_state.x[0] = thread;
+    pound_test_log_reset();
+    POUND_CHECK_EQ_U64(call(HOS_SVC_CANCEL_SYNCHRONIZATION), POUND_ERROR_UNSUPPORTED_SYSCALL);
+    POUND_CHECK(pound_test_log_contains("needs a scheduler"));
+    POUND_CHECK_EQ_U64(g_state.pc, TEST_GUEST_BASE);
+    POUND_CHECK_EQ_U64(g_state.x[0], thread);
+
+    machine_teardown();
+}
+
+// -----------------------------------------------------------------------------
 // svcConnectToNamedPort
 // -----------------------------------------------------------------------------
 
@@ -1091,6 +1203,19 @@ POUND_TEST(hos_syscall, complete_block_writes_what_each_wake_means)
     POUND_CHECK_EQ_U64(read_u64_at(TEST_OUT_SLOT_0), 0xAAAAAAAAAAAAAAAAULL);
     POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_TIMEOUT);
 
+    // CANCELLED: another thread stopped the wait. Like a timeout it reports no index, so the
+    // slot stays poisoned and `W1` keeps its old value; `X0` is Horizon's `0xEC01`.
+    g_state.pc   = TEST_GUEST_BASE;
+    g_state.x[0] = TEST_OUT_SLOT_0;
+    memset(host_at(TEST_OUT_SLOT_0), 0xAA, sizeof(uint64_t));
+
+    wake = (hos_wake_t){ HOS_WAKE_CANCELLED, 0U };
+    POUND_CHECK_EQ_U64(hos_syscall_complete_block(&g_context, &g_state, &wake), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(read_u64_at(TEST_OUT_SLOT_0), 0xAAAAAAAAAAAAAAAAULL);
+    POUND_CHECK_EQ_U64(g_state.x[1], 3U);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INTERRUPTED);
+    POUND_CHECK_EQ_U64(g_state.pc, TEST_GUEST_BASE + 4U);
+
     // SLEPT: svcSleepThread returns nothing, so X0 keeps the duration the guest passed. A
     // Result here would be the one thing a void call must not do.
     g_state.pc   = TEST_GUEST_BASE;
@@ -1125,8 +1250,7 @@ POUND_TEST(hos_syscall, a_sleep_parks_the_caller_and_the_clock_wakes_it)
     // The one call the thread makes: a sleep of about a millisecond. It cannot be answered
     // now, so the thread has to park -- and it is the scheduler, not this layer, that will
     // bring it back.
-    g_call_number  = HOS_SVC_SLEEP_THREAD;
-    g_call_pending = true;
+    script_call(g_thread_id, HOS_SVC_SLEEP_THREAD);
 
     POUND_CHECK_EQ_U64(step(), HOS_SCHEDULER_RAN);
 
@@ -1177,8 +1301,7 @@ POUND_TEST(hos_syscall, a_wait_parks_the_caller_and_a_signal_wakes_it)
     registers.x[3] = (uint64_t)-1; // wait forever
     POUND_REQUIRE(POUND_SUCCESS == hos_kernel_thread_set_context(&g_kernel, g_thread_id, &registers));
 
-    g_call_number  = HOS_SVC_WAIT_SYNCHRONIZATION;
-    g_call_pending = true;
+    script_call(g_thread_id, HOS_SVC_WAIT_SYNCHRONIZATION);
 
     POUND_CHECK_EQ_U64(step(), HOS_SCHEDULER_RAN);
     POUND_CHECK_EQ_U64(hos_scheduler_ready_count(&g_scheduler), 0U);
@@ -1224,8 +1347,7 @@ POUND_TEST(hos_syscall, a_wait_parks_the_caller_and_the_deadline_times_it_out)
     registers.x[3] = 1000000U; // one millisecond
     POUND_REQUIRE(POUND_SUCCESS == hos_kernel_thread_set_context(&g_kernel, g_thread_id, &registers));
 
-    g_call_number  = HOS_SVC_WAIT_SYNCHRONIZATION;
-    g_call_pending = true;
+    script_call(g_thread_id, HOS_SVC_WAIT_SYNCHRONIZATION);
 
     POUND_CHECK_EQ_U64(step(), HOS_SCHEDULER_RAN);
     POUND_CHECK_EQ_U64(hos_scheduler_ready_count(&g_scheduler), 0U);
@@ -1246,6 +1368,132 @@ POUND_TEST(hos_syscall, a_wait_parks_the_caller_and_the_deadline_times_it_out)
     bool signaled = false;
     POUND_CHECK_EQ_U64(hos_process_event_is_signaled(&g_process, event, &signaled), POUND_SUCCESS);
     POUND_CHECK(!signaled);
+
+    machine_teardown();
+}
+
+POUND_TEST(hos_syscall, cancel_synchronization_interrupts_the_callers_next_wait)
+{
+    machine_reset();
+    machine_add_scheduler();
+    start_a_thread();
+
+    // A signalled auto-reset event, so a wait that was *not* interrupted would succeed and
+    // consume the signal. Horizon's request interrupts the next synchronization call, so it
+    // must win over a ready handle rather than only affect a call that would have blocked.
+    hos_handle_t event = HOS_HANDLE_INVALID;
+    POUND_REQUIRE(POUND_SUCCESS == hos_process_create_event(&g_process, HOS_EVENT_AUTO, false, &event));
+    POUND_REQUIRE(POUND_SUCCESS == hos_process_event_signal(&g_process, event));
+
+    const hos_handle_t handles[1] = { event };
+    put_handles(handles, 1U, TEST_HANDLES_ADDRESS);
+
+    guest_state_t registers;
+    thread_registers(&registers);
+    registers.x[0] = g_thread; // svcCancelSynchronization(thread)
+    POUND_REQUIRE(POUND_SUCCESS == hos_kernel_thread_set_context(&g_kernel, g_thread_id, &registers));
+
+    script_call(g_thread_id, HOS_SVC_CANCEL_SYNCHRONIZATION);
+    script_call(g_thread_id, HOS_SVC_WAIT_SYNCHRONIZATION);
+
+    // The thread cancels itself. It is running, so it is not in a synchronization call: this
+    // is Horizon's second case, where the *next* call is the one interrupted.
+    POUND_CHECK_EQ_U64(step(), HOS_SCHEDULER_RAN);
+
+    thread_registers(&registers);
+    POUND_CHECK_EQ_U64(registers.x[0], HOS_RESULT_SUCCESS);
+    POUND_CHECK_EQ_U64(registers.pc, TEST_GUEST_BASE + 4U);
+
+    // Now the wait. The arguments replace the cancel call's, as an interpreter would have
+    // fetched them from the instructions that follow; the timeout is zero, a poll.
+    registers.x[0] = TEST_OUT_SLOT_0;
+    registers.x[1] = TEST_HANDLES_ADDRESS;
+    registers.x[2] = 1U;
+    registers.x[3] = 0U;
+    POUND_REQUIRE(POUND_SUCCESS == hos_kernel_thread_set_context(&g_kernel, g_thread_id, &registers));
+
+    memset(host_at(TEST_OUT_SLOT_0), 0xAA, sizeof(uint64_t));
+
+    POUND_CHECK_EQ_U64(step(), HOS_SCHEDULER_RAN);
+
+    thread_registers(&registers);
+    POUND_CHECK_EQ_U64(registers.x[0], HOS_RESULT_INTERRUPTED);
+    POUND_CHECK_EQ_U64(registers.pc, TEST_GUEST_BASE + 8U); // both calls stepped past
+    POUND_CHECK_EQ_U64(read_u64_at(TEST_OUT_SLOT_0), 0xAAAAAAAAAAAAAAAAULL);
+
+    // The ready event was not consumed: the call answered the cancellation before it polled.
+    bool signaled = false;
+    POUND_CHECK_EQ_U64(hos_process_event_is_signaled(&g_process, event, &signaled), POUND_SUCCESS);
+    POUND_CHECK(signaled);
+
+    // And the request was consumed, so the thread did not park.
+    POUND_CHECK_EQ_U64(hos_scheduler_ready_count(&g_scheduler), 1U);
+
+    machine_teardown();
+}
+
+POUND_TEST(hos_syscall, cancel_synchronization_interrupts_a_parked_thread)
+{
+    machine_reset();
+    machine_add_scheduler();
+
+    // The waiter is the more urgent thread, so it runs first and parks; the canceller then
+    // gets the core. Priorities make that order explicit rather than a tie-break.
+    hos_handle_t waiter_handle = HOS_HANDLE_INVALID;
+    uint64_t     waiter_id     = 0U;
+    start_thread_with_priority(HOS_THREAD_PRIORITY_HIGHEST, &waiter_handle, &waiter_id);
+
+    hos_handle_t canceller_handle = HOS_HANDLE_INVALID;
+    uint64_t     canceller_id     = 0U;
+    start_thread_with_priority(HOS_THREAD_PRIORITY_DEFAULT, &canceller_handle, &canceller_id);
+
+    hos_handle_t event = HOS_HANDLE_INVALID;
+    POUND_REQUIRE(POUND_SUCCESS == hos_process_create_event(&g_process, HOS_EVENT_AUTO, false, &event));
+
+    const hos_handle_t handles[1] = { event };
+    put_handles(handles, 1U, TEST_HANDLES_ADDRESS);
+
+    // The waiter waits forever on an event nobody signals.
+    guest_state_t registers;
+    POUND_REQUIRE(POUND_SUCCESS == hos_kernel_thread_context(&g_kernel, waiter_id, &registers));
+    registers.x[0] = TEST_OUT_SLOT_0;
+    registers.x[1] = TEST_HANDLES_ADDRESS;
+    registers.x[2] = 1U;
+    registers.x[3] = (uint64_t)-1;
+    POUND_REQUIRE(POUND_SUCCESS == hos_kernel_thread_set_context(&g_kernel, waiter_id, &registers));
+
+    // The canceller cancels it by handle.
+    POUND_REQUIRE(POUND_SUCCESS == hos_kernel_thread_context(&g_kernel, canceller_id, &registers));
+    registers.x[0] = waiter_handle;
+    POUND_REQUIRE(POUND_SUCCESS == hos_kernel_thread_set_context(&g_kernel, canceller_id, &registers));
+
+    script_call(waiter_id, HOS_SVC_WAIT_SYNCHRONIZATION);
+    script_call(canceller_id, HOS_SVC_CANCEL_SYNCHRONIZATION);
+
+    memset(host_at(TEST_OUT_SLOT_0), 0xAA, sizeof(uint64_t));
+
+    // The waiter parks, leaving only the canceller runnable.
+    POUND_CHECK_EQ_U64(step(), HOS_SCHEDULER_RAN);
+    POUND_CHECK_EQ_U64(hos_scheduler_ready_count(&g_scheduler), 1U);
+
+    // The canceller interrupts it, and its own call reports success.
+    POUND_CHECK_EQ_U64(step(), HOS_SCHEDULER_RAN);
+    POUND_REQUIRE(POUND_SUCCESS == hos_kernel_thread_context(&g_kernel, canceller_id, &registers));
+    POUND_CHECK_EQ_U64(registers.x[0], HOS_RESULT_SUCCESS);
+    POUND_CHECK_EQ_U64(registers.pc, TEST_GUEST_BASE + 4U);
+
+    // The waiter is runnable again and outranks the canceller, so the next decision finishes
+    // its wait with the interruption.
+    POUND_CHECK_EQ_U64(step(), HOS_SCHEDULER_RAN);
+    POUND_CHECK_EQ_U64(g_wake_count, 1U);
+    POUND_CHECK_EQ_U64(g_last_wake.reason, HOS_WAKE_CANCELLED);
+
+    POUND_REQUIRE(POUND_SUCCESS == hos_kernel_thread_context(&g_kernel, waiter_id, &registers));
+    POUND_CHECK_EQ_U64(registers.x[0], HOS_RESULT_INTERRUPTED);
+    POUND_CHECK_EQ_U64(registers.pc, TEST_GUEST_BASE + 4U);
+
+    // No index was reported, because nothing became ready.
+    POUND_CHECK_EQ_U64(read_u64_at(TEST_OUT_SLOT_0), 0xAAAAAAAAAAAAAAAAULL);
 
     machine_teardown();
 }
@@ -1419,8 +1667,7 @@ POUND_TEST(hos_syscall, exit_thread_finishes_the_calling_thread)
     machine_add_scheduler();
     start_a_thread();
 
-    g_call_number  = HOS_SVC_EXIT_THREAD;
-    g_call_pending = true;
+    script_call(g_thread_id, HOS_SVC_EXIT_THREAD);
 
     POUND_CHECK_EQ_U64(step(), HOS_SCHEDULER_RAN);
 
@@ -1779,6 +2026,7 @@ POUND_TEST_SUITE(hos_syscall,
                  POUND_TEST_CASE(hos_syscall, wait_synchronization_treats_a_session_as_never_ready),
                  POUND_TEST_CASE(hos_syscall, wait_synchronization_rejects_what_it_cannot_do),
                  POUND_TEST_CASE(hos_syscall, wait_synchronization_refuses_to_block_without_a_scheduler),
+                 POUND_TEST_CASE(hos_syscall, cancel_synchronization_validates_the_target),
                  POUND_TEST_CASE(hos_syscall, connect_to_named_port_returns_a_session),
                  POUND_TEST_CASE(hos_syscall, connect_to_named_port_accepts_either_padding),
                  POUND_TEST_CASE(hos_syscall, connect_to_named_port_reports_an_unwritable_out_pointer),
@@ -1788,6 +2036,8 @@ POUND_TEST_SUITE(hos_syscall,
                  POUND_TEST_CASE(hos_syscall, a_sleep_parks_the_caller_and_the_clock_wakes_it),
                  POUND_TEST_CASE(hos_syscall, a_wait_parks_the_caller_and_a_signal_wakes_it),
                  POUND_TEST_CASE(hos_syscall, a_wait_parks_the_caller_and_the_deadline_times_it_out),
+                 POUND_TEST_CASE(hos_syscall, cancel_synchronization_interrupts_the_callers_next_wait),
+                 POUND_TEST_CASE(hos_syscall, cancel_synchronization_interrupts_a_parked_thread),
                  POUND_TEST_CASE(hos_syscall, thread_calls_are_refused_without_a_scheduler),
                  POUND_TEST_CASE(hos_syscall, create_start_and_query_a_thread),
                  POUND_TEST_CASE(hos_syscall, thread_calls_report_an_invalid_handle),

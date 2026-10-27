@@ -1230,6 +1230,49 @@ POUND_TEST(hos_kernel, thread_start_and_terminate)
     machine_teardown();
 }
 
+POUND_TEST(hos_kernel, thread_cancel_request_is_a_consumed_flag)
+{
+    machine_reset();
+
+    const hos_handle_t thread = create_test_thread(0x4000U, HOS_THREAD_PRIORITY_DEFAULT);
+
+    uint64_t thread_id = 0U;
+    POUND_CHECK_EQ_U64(hos_process_thread_id(&g_process, thread, &thread_id), POUND_SUCCESS);
+
+    // Asking before anything was requested is not an error: the flag is simply clear, and
+    // reading it clears nothing because there was nothing to clear.
+    bool requested = true;
+    POUND_CHECK_EQ_U64(hos_kernel_thread_take_cancel(&g_kernel, thread_id, &requested), POUND_SUCCESS);
+    POUND_CHECK(!requested);
+
+    // A request is a flag, not a count. Two requests before the thread synchronizes are one
+    // interruption, because Horizon keeps a `bool` and not a queue.
+    POUND_CHECK_EQ_U64(hos_kernel_thread_request_cancel(&g_kernel, thread_id), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(hos_kernel_thread_request_cancel(&g_kernel, thread_id), POUND_SUCCESS);
+
+    POUND_CHECK_EQ_U64(hos_kernel_thread_take_cancel(&g_kernel, thread_id, &requested), POUND_SUCCESS);
+    POUND_CHECK(requested);
+    POUND_CHECK_EQ_U64(hos_kernel_thread_take_cancel(&g_kernel, thread_id, &requested), POUND_SUCCESS);
+    POUND_CHECK(!requested);
+
+    // The flag lives on the thread object, so it survives the thread starting and is there
+    // for the first synchronization call it makes.
+    POUND_CHECK_EQ_U64(hos_kernel_thread_request_cancel(&g_kernel, thread_id), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(hos_kernel_thread_start(&g_kernel, thread_id), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(hos_kernel_thread_take_cancel(&g_kernel, thread_id, &requested), POUND_SUCCESS);
+    POUND_CHECK(requested);
+
+    // A miss is an error rather than a silent "not requested": a request for a thread that
+    // does not exist must not look like one that was accepted.
+    POUND_CHECK_EQ_U64(hos_kernel_thread_request_cancel(&g_kernel, thread_id + 1000U), POUND_ERROR_NOT_FOUND);
+    POUND_CHECK_EQ_U64(hos_kernel_thread_take_cancel(&g_kernel, thread_id + 1000U, &requested),
+                       POUND_ERROR_NOT_FOUND);
+    POUND_CHECK_EQ_U64(hos_kernel_thread_take_cancel(&g_kernel, thread_id, NULL), POUND_ERROR_INVALID_ARGUMENT);
+    POUND_CHECK_EQ_U64(hos_kernel_thread_request_cancel(NULL, thread_id), POUND_ERROR_INVALID_ARGUMENT);
+
+    machine_teardown();
+}
+
 POUND_TEST(hos_kernel, thread_outlives_its_last_handle)
 {
     machine_reset();
@@ -1523,6 +1566,7 @@ POUND_TEST_SUITE(hos_kernel,
                  POUND_TEST_CASE(hos_kernel, thread_outlives_its_last_handle),
                  POUND_TEST_CASE(hos_kernel, thread_arguments_are_validated),
                  POUND_TEST_CASE(hos_kernel, thread_priorities_are_settable_while_terminated),
+                 POUND_TEST_CASE(hos_kernel, thread_cancel_request_is_a_consumed_flag),
                  POUND_TEST_CASE(hos_kernel, wait_any_reports_the_first_ready_handle),
                  POUND_TEST_CASE(hos_kernel, wait_any_never_reports_a_running_thread),
                  POUND_TEST_CASE(hos_kernel, wait_any_rejects_bad_arguments),

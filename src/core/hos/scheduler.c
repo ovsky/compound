@@ -843,6 +843,39 @@ hos_scheduler_block_current(hos_scheduler_t *POUND_RESTRICT     scheduler,
     return park_current(scheduler, handles, count, has_deadline, deadline);
 }
 
+bool
+hos_scheduler_cancel(hos_scheduler_t *POUND_RESTRICT scheduler, uint64_t thread_id)
+{
+    if (require_scheduler(scheduler, "hos_scheduler_cancel") != POUND_SUCCESS)
+    {
+        return false;
+    }
+
+    const uint32_t index = find_entry(scheduler, thread_id);
+
+    if (index == UINT32_MAX)
+    {
+        return false;
+    }
+
+    const hos_scheduler_thread_t *entry = &scheduler->threads[index];
+
+    // `waited_on_handles` rather than `wait_count`: a wait whose handles were all closed is
+    // still a synchronization call Horizon would interrupt, even though there is nothing
+    // left to poll. A sleeping thread is not, and neither is one that is already runnable.
+    if (!entry->waiting || !entry->waited_on_handles)
+    {
+        return false;
+    }
+
+    hos_wake_t wake;
+    wake.reason      = HOS_WAKE_CANCELLED;
+    wake.ready_index = 0U;
+
+    wake_thread(scheduler, index, &wake);
+    return true;
+}
+
 error_t
 hos_scheduler_sleep_current(hos_scheduler_t *POUND_RESTRICT scheduler, uint64_t deadline)
 {

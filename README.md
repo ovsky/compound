@@ -135,6 +135,7 @@ Compound is in **early-stage, active development**. The emulator has:
 - [x] Horizon OS kernel abstraction (objects, handles and services)
 - [x] System call handling (SVC dispatch for handles, events, yields and the tick)
 - [x] Thread scheduling and blocking waits
+- [x] Synchronization cancellation (`svcCancelSynchronization`)
 - [x] Core OS services and memory layout
 
 ### 🎨 Phase 5: Graphics & Completeness
@@ -293,7 +294,7 @@ Native support for Linux, macOS, Windows, Android, and ARM64 architectures.
 
 - **Memory System**: `mimalloc` allocator with host accounting and ownership tracking
 - **JIT Engine**: Ballistic ARM64 recompiler for high-performance execution
-- **Guest OS**: Horizon OS kernel objects, per-process handles, named services, SVC dispatch, a priority round-robin thread scheduler with blocking waits, and a partitioned address space whose region table gates guest access, answers `svcQueryMemory`, and reprotects an existing region with `svcSetMemoryPermission`/`svcSetMemoryAttribute`
+- **Guest OS**: Horizon OS kernel objects, per-process handles, named services, SVC dispatch, a priority round-robin thread scheduler with blocking waits and `svcCancelSynchronization`, and a partitioned address space whose region table gates guest access, answers `svcQueryMemory`, and reprotects an existing region with `svcSetMemoryPermission`/`svcSetMemoryAttribute`
 - **Debug Tools**: GUI with live reload, comprehensive logging, and profiling
 - **Validation**: Extensive unit tests and runtime checks
 - **Filesystem**: Experimental HFS0 parser and reader abstraction
@@ -318,7 +319,7 @@ under the terms of the GPL v3.
 
 - 🧱 **Foundation strengthening**: Memory systems and runtime validation
 - ⚡ **JIT experimentation**: Ballistic ARM64 integration progress
-- 🖥️ **Guest CPU and OS**: A64 interpreter subset, a Horizon OS handle/service kernel, SVC dispatch, a thread scheduler with blocking waits, and a memory-layout slice that partitions the guest address space, answers `svcSetHeapSize`/`svcQueryMemory`, and reprotects regions with `svcSetMemoryPermission`/`svcSetMemoryAttribute`
+- 🖥️ **Guest CPU and OS**: A64 interpreter subset, a Horizon OS handle/service kernel, SVC dispatch, a thread scheduler with blocking waits, synchronization cancellation with `svcCancelSynchronization`, and a memory-layout slice that partitions the guest address space, answers `svcSetHeapSize`/`svcQueryMemory`, and reprotects regions with `svcSetMemoryPermission`/`svcSetMemoryAttribute`
 - 📁 **Filesystem work**: HFS0 parser development (experimental branches)
 - 🔐 **Crypto primitives**: SHA256 and verification systems (experimental)
 - 🐛 **Testing**: Expanded unit test coverage and CI reliability

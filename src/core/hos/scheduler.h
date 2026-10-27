@@ -99,6 +99,11 @@ typedef enum
     /// Its deadline passed while it was simply sleeping -- `svcSleepThread` with a
     /// duration. There was nothing to report, so only the passing of time woke it.
     HOS_WAKE_SLEPT = 2,
+
+    /// Another thread cancelled this one's synchronization call with
+    /// `svcCancelSynchronization`. The call it was parked in answers `0xEC01` and reports
+    /// no index, exactly as Horizon's "Interrupted" result does.
+    HOS_WAKE_CANCELLED = 3,
 } hos_wake_reason_t;
 
 /// What a thread was woken by, and by which of its handles.
@@ -367,6 +372,22 @@ error_t hos_scheduler_block_current(hos_scheduler_t *POUND_RESTRICT        sched
                                     uint32_t                              count,
                                     bool                                  has_deadline,
                                     uint64_t                              deadline);
+
+/// Cancels `thread_id`'s parked wait on handles, if it has one.
+///
+/// Returns `true` when a parked wait was ended -- the thread is now runnable with a
+/// `HOS_WAKE_CANCELLED` wake, which the run loop finishes with `0xEC01` -- and `false`
+/// when the thread is not in such a wait: it is running, runnable, sleeping, not admitted,
+/// or not known at all. A plain sleep is deliberately not cancellable, because Horizon's
+/// cancellation targets synchronization calls rather than the clock.
+///
+/// `false` is not an error and not a claim that nothing happened: the caller is expected to
+/// record the request on the thread object instead (`hos_kernel_thread_request_cancel`), so
+/// that the thread's *next* synchronization call consumes it. Splitting the two is what
+/// reproduces Horizon's two cases without guessing which one the caller meant.
+///
+/// Safe to call with a scheduler that was never initialised: it returns `false`.
+bool hos_scheduler_cancel(hos_scheduler_t *POUND_RESTRICT scheduler, uint64_t thread_id);
 
 /// Parks the current thread until `deadline`, with nothing to wait on.
 ///

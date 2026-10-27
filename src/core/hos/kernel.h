@@ -635,6 +635,35 @@ error_t hos_kernel_thread_set_priority(hos_kernel_t *POUND_RESTRICT kernel,
                                        uint64_t                     id,
                                        uint32_t                     priority);
 
+/// Requests that `id`'s next synchronization call be interrupted.
+///
+/// This is the half of `svcCancelSynchronization` that outlives the request: the flag is
+/// stored on the thread object, survives until the thread makes a synchronization call or
+/// dies, and is consumed exactly once by `hos_kernel_thread_take_cancel`. Requesting it
+/// twice before that call is idempotent -- Horizon keeps a flag, not a queue, so two
+/// cancellations do not interrupt two waits.
+///
+/// The other half is `hos_scheduler_cancel`, which ends a wait that is already parked. A
+/// caller does that first and raises this flag only when the thread had no parked wait to
+/// interrupt, which is how Horizon's "currently in a synchronization call" and "not
+/// currently in one" cases are told apart.
+///
+/// Returns `POUND_ERROR_NOT_FOUND` when no live thread has that identifier, plus the
+/// kernel-state errors.
+error_t hos_kernel_thread_request_cancel(hos_kernel_t *POUND_RESTRICT kernel, uint64_t id);
+
+/// Takes and clears `id`'s pending cancellation request.
+///
+/// `*out_requested` is false both when the thread never had one and when a previous call
+/// already consumed it: the flag is an edge, and reading it twice must not interrupt two
+/// waits. The out-parameter is always written on success.
+///
+/// Returns `POUND_ERROR_INVALID_ARGUMENT` for a NULL `out_requested`, the kernel-state
+/// errors, and `POUND_ERROR_NOT_FOUND` when no live thread has that identifier.
+error_t hos_kernel_thread_take_cancel(hos_kernel_t *POUND_RESTRICT kernel,
+                                      uint64_t                     id,
+                                      bool *POUND_RESTRICT         out_requested);
+
 // -----------------------------------------------------------------------------
 // Sessions
 // -----------------------------------------------------------------------------

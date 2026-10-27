@@ -75,6 +75,7 @@
 /// suite is about the scheduler, and the syscall suite is where the values are checked.
 #define TEST_RESULT_SUCCESS 0x0000U
 #define TEST_RESULT_TIMEOUT 0xEA01U
+#define TEST_RESULT_INTERRUPTED 0xEC01U
 
 POUND_ALIGNED(64) static uint8_t g_memory[TEST_GUEST_SIZE];
 
@@ -432,6 +433,12 @@ stub_run(void *POUND_RESTRICT       context,
             case HOS_WAKE_TIMED_OUT:
                 // A wait on handles that ran out of time: a Result, and so a write to `x[0]`.
                 state->x[0] = TEST_RESULT_TIMEOUT;
+                break;
+
+            case HOS_WAKE_CANCELLED:
+                // Another thread cancelled the wait. The index pointer is not written, for
+                // the same reason a timeout does not write it: nothing became ready.
+                state->x[0] = TEST_RESULT_INTERRUPTED;
                 break;
 
             case HOS_WAKE_SLEPT:
@@ -808,6 +815,79 @@ POUND_TEST(hos_scheduler, a_poll_does_not_park_a_thread)
     POUND_CHECK_EQ_U64(hos_scheduler_current_thread_id(&g_scheduler), poller_id);
     POUND_CHECK_EQ_U64(thread_x0(poller_id), TEST_RESULT_TIMEOUT);
     POUND_CHECK_EQ_U64(thread_pc(poller_id), poller_svc + 4U);
+
+    machine_teardown();
+}
+
+POUND_TEST(hos_scheduler, cancelling_a_parked_wait_wakes_it_with_an_interruption)
+{
+    machine_reset();
+    POUND_REQUIRE(POUND_SUCCESS == hos_scheduler_set_quantum(&g_scheduler, TEST_PARK_QUANTUM));
+
+    hos_handle_t event = HOS_HANDLE_INVALID;
+    POUND_REQUIRE(POUND_SUCCESS == hos_process_create_event(&g_process, HOS_EVENT_AUTO, false, &event));
+
+    const uint64_t handles = place_handles(0U, &event, 1U);
+
+    const uint64_t waiter     = program_begin();
+    const uint64_t waiter_svc = emit_wait(TEST_OUT_SLOT(3U), handles, 1U, -1);
+    emit_spin();
+
+    const uint64_t waiter_id = admit_thread(waiter, HOS_THREAD_PRIORITY_DEFAULT);
+
+    // A wait on an unready handle with no deadline parks the thread, and nothing is runnable
+    // until somebody ends it.
+    POUND_CHECK_EQ_U64(step(), HOS_SCHEDULER_RAN);
+    POUND_CHECK_EQ_U64(g_park_count, 1U);
+    POUND_CHECK_EQ_U64(hos_scheduler_ready_count(&g_scheduler), 0U);
+
+    // A cancellation for a thread the scheduler has never seen is not an interruption, and
+    // neither is a second one for this thread: the first took it out of the parked state.
+    POUND_CHECK(!hos_scheduler_cancel(&g_scheduler, waiter_id + 1000U));
+    POUND_CHECK(hos_scheduler_cancel(&g_scheduler, waiter_id));
+    POUND_CHECK(!hos_scheduler_cancel(&g_scheduler, waiter_id));
+    POUND_CHECK_EQ_U64(hos_scheduler_ready_count(&g_scheduler), 1U);
+
+    // The next decision runs the cancelled thread and finishes its call: the wake is
+    // CANCELLED, X0 is Horizon's `0xEC01`, the index slot is untouched, and the program
+    // counter finally steps past the `SVC` that was left standing.
+    POUND_CHECK_EQ_U64(step(), HOS_SCHEDULER_RAN);
+    POUND_CHECK_EQ_U64(g_wake_count, 1U);
+    POUND_CHECK_EQ_U64(g_last_wake_thread, waiter_id);
+    POUND_CHECK_EQ_U64(g_last_wake.reason, HOS_WAKE_CANCELLED);
+    POUND_CHECK_EQ_U64(g_last_wake.ready_index, 0U);
+    POUND_CHECK_EQ_U64(read_u32(TEST_OUT_SLOT(3U)), 0U);
+    POUND_CHECK_EQ_U64(thread_x0(waiter_id), TEST_RESULT_INTERRUPTED);
+    POUND_CHECK_EQ_U64(thread_pc(waiter_id), waiter_svc + 4U);
+    POUND_CHECK_EQ_U64(g_stub_errors, 0U);
+
+    machine_teardown();
+}
+
+POUND_TEST(hos_scheduler, cancelling_a_sleep_is_not_an_interruption)
+{
+    machine_reset();
+    POUND_REQUIRE(POUND_SUCCESS == hos_scheduler_set_quantum(&g_scheduler, TEST_PARK_QUANTUM));
+
+    const uint64_t sleeper     = program_begin();
+    const uint64_t sleeper_svc = emit_sleep(1000000); // One millisecond.
+    emit_spin();
+
+    const uint64_t sleeper_id = admit_thread(sleeper, HOS_THREAD_PRIORITY_DEFAULT);
+
+    POUND_CHECK_EQ_U64(step(), HOS_SCHEDULER_RAN);
+    POUND_CHECK_EQ_U64(g_park_count, 1U);
+
+    // Horizon cancels synchronization calls, not the clock. A cancellation does not end a
+    // sleep, and the sleep still reports what a sleep reports when its deadline passes.
+    POUND_CHECK(!hos_scheduler_cancel(&g_scheduler, sleeper_id));
+    POUND_CHECK_EQ_U64(hos_scheduler_ready_count(&g_scheduler), 0U);
+
+    POUND_CHECK_EQ_U64(step(), HOS_SCHEDULER_RAN);
+    POUND_CHECK_EQ_U64(g_wake_count, 1U);
+    POUND_CHECK_EQ_U64(g_last_wake.reason, HOS_WAKE_SLEPT);
+    POUND_CHECK_EQ_U64(thread_x0(sleeper_id), 1000000U);
+    POUND_CHECK_EQ_U64(thread_pc(sleeper_id), sleeper_svc + 4U);
 
     machine_teardown();
 }
@@ -1341,6 +1421,8 @@ POUND_TEST_SUITE(hos_scheduler,
                  POUND_TEST_CASE(hos_scheduler, a_signalled_event_wakes_the_waiting_thread),
                  POUND_TEST_CASE(hos_scheduler, a_poll_does_not_park_a_thread),
                  POUND_TEST_CASE(hos_scheduler, a_wait_times_out_when_the_clock_passes_its_deadline),
+                 POUND_TEST_CASE(hos_scheduler, cancelling_a_parked_wait_wakes_it_with_an_interruption),
+                 POUND_TEST_CASE(hos_scheduler, cancelling_a_sleep_is_not_an_interruption),
                  POUND_TEST_CASE(hos_scheduler, a_plain_sleep_wakes_without_a_result),
                  POUND_TEST_CASE(hos_scheduler, the_higher_priority_waiter_takes_an_auto_reset_signal),
                  POUND_TEST_CASE(hos_scheduler, a_wait_nothing_can_satisfy_deadlocks),

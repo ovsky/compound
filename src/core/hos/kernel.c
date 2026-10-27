@@ -56,6 +56,14 @@ struct hos_thread
 
     /// Where the thread is in its life.
     hos_thread_status_t status;
+
+    /// Whether `svcCancelSynchronization` has asked for this thread's next
+    /// synchronization call to be interrupted, and nothing has consumed the request yet.
+    ///
+    /// On the object rather than in the scheduler because Horizon keeps it on the thread:
+    /// a cancellation survives until the thread synchronizes, which may be long after the
+    /// call that requested it, and it applies even to a thread the scheduler never admitted.
+    bool cancel_requested;
 };
 
 /// One object slot, in the kernel's table.
@@ -1605,6 +1613,10 @@ hos_process_create_thread(hos_process_t *POUND_RESTRICT       process,
         thread->status   = HOS_THREAD_CREATED;
         thread->id       = kernel->next_thread_id++;
 
+        // `allocate_object` zeroed the slot, so this is already false; saying it here keeps
+        // the new field visible beside the rest of the thread's initial state.
+        thread->cancel_requested = false;
+
         error = allocate_handle(process, object_index, out_handle);
     }
 
@@ -1932,6 +1944,67 @@ hos_kernel_thread_set_priority(hos_kernel_t *POUND_RESTRICT kernel, uint64_t id,
     if (error == POUND_SUCCESS)
     {
         kernel->objects[object_index].thread.priority = priority;
+    }
+
+    mutex_unlock(&kernel->lock);
+    return error;
+}
+
+error_t
+hos_kernel_thread_request_cancel(hos_kernel_t *POUND_RESTRICT kernel, uint64_t id)
+{
+    const error_t kernel_error = require_kernel(kernel, "hos_kernel_thread_request_cancel");
+
+    if (kernel_error != POUND_SUCCESS)
+    {
+        return kernel_error;
+    }
+
+    mutex_lock(&kernel->lock);
+
+    uint32_t      object_index = 0U;
+    const error_t error        = find_thread_locked(kernel, id, &object_index);
+
+    if (error == POUND_SUCCESS)
+    {
+        // A flag, not a count: Horizon keeps one request per thread, so a second request
+        // before the thread synchronizes must not queue a second interruption.
+        kernel->objects[object_index].thread.cancel_requested = true;
+    }
+
+    mutex_unlock(&kernel->lock);
+    return error;
+}
+
+error_t
+hos_kernel_thread_take_cancel(hos_kernel_t *POUND_RESTRICT kernel,
+                              uint64_t                     id,
+                              bool *POUND_RESTRICT         out_requested)
+{
+    const error_t kernel_error = require_kernel(kernel, "hos_kernel_thread_take_cancel");
+
+    if (kernel_error != POUND_SUCCESS)
+    {
+        return kernel_error;
+    }
+
+    if (out_requested == NULL)
+    {
+        POUND_LOG_ERROR(&thread_logger, "Aborting hos_kernel_thread_take_cancel: out_requested is NULL.");
+        return POUND_ERROR_INVALID_ARGUMENT;
+    }
+
+    mutex_lock(&kernel->lock);
+
+    uint32_t      object_index = 0U;
+    const error_t error        = find_thread_locked(kernel, id, &object_index);
+
+    if (error == POUND_SUCCESS)
+    {
+        struct hos_thread *thread = &kernel->objects[object_index].thread;
+
+        *out_requested           = thread->cancel_requested;
+        thread->cancel_requested = false;
     }
 
     mutex_unlock(&kernel->lock);

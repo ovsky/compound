@@ -46,6 +46,7 @@ static error_t svc_clear_event(hos_syscall_context_t *context, guest_state_t *st
 static error_t svc_close_handle(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_reset_signal(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_wait_synchronization(hos_syscall_context_t *context, guest_state_t *state);
+static error_t svc_cancel_synchronization(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_get_system_tick(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_connect_to_named_port(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_get_thread_id(hos_syscall_context_t *context, guest_state_t *state);
@@ -78,6 +79,7 @@ static const hos_syscall_entry_t HOS_SYSCALLS[] = {
     { HOS_SVC_CLOSE_HANDLE, "svcCloseHandle", svc_close_handle },
     { HOS_SVC_RESET_SIGNAL, "svcResetSignal", svc_reset_signal },
     { HOS_SVC_WAIT_SYNCHRONIZATION, "svcWaitSynchronization", svc_wait_synchronization },
+    { HOS_SVC_CANCEL_SYNCHRONIZATION, "svcCancelSynchronization", svc_cancel_synchronization },
     { HOS_SVC_GET_SYSTEM_TICK, "svcGetSystemTick", svc_get_system_tick },
     { HOS_SVC_CONNECT_TO_NAMED_PORT, "svcConnectToNamedPort", svc_connect_to_named_port },
     { HOS_SVC_GET_THREAD_ID, "svcGetThreadId", svc_get_thread_id },
@@ -94,7 +96,6 @@ static const hos_syscall_entry_t HOS_SYSCALLS[] = {
     { 0x13U, "svcMapSharedMemory", NULL },
     { 0x14U, "svcUnmapSharedMemory", NULL },
     { 0x15U, "svcCreateTransferMemory", NULL },
-    { 0x19U, "svcCancelSynchronization", NULL },
     { 0x20U, "svcSendSyncRequestLight", NULL },
     { 0x21U, "svcSendSyncRequest", NULL },
     { 0x22U, "svcSendSyncRequestWithUserBuffer", NULL },
@@ -752,6 +753,24 @@ svc_reset_signal(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *P
 static error_t
 svc_wait_synchronization(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *POUND_RESTRICT state)
 {
+    // A cancellation requested while this thread was not in a synchronization call is
+    // waiting for this one. Horizon answers it before the wait looks at its handles -- the
+    // flag means "the next synchronization call is interrupted" -- so a cancelled poll
+    // reports no index even when a handle was already ready, and an auto-reset event is not
+    // consumed by a call that never got as far as polling.
+    if (context->scheduler != NULL)
+    {
+        const uint64_t current_id = hos_scheduler_current_thread_id(context->scheduler);
+        bool           cancelled  = false;
+
+        if ((hos_kernel_thread_take_cancel(context->kernel, current_id, &cancelled) == POUND_SUCCESS) &&
+            cancelled)
+        {
+            state->x[0] = HOS_RESULT_INTERRUPTED;
+            return POUND_SUCCESS;
+        }
+    }
+
     // Horizon's signature: X0 is a pointer to the ready index, X1 the handle array, W2 the
     // count and X3 the timeout. X0 is a pointer on entry and the `Result` on return, which
     // is why the index is written *through* it before it is replaced.
@@ -871,6 +890,59 @@ svc_wait_synchronization(hos_syscall_context_t *POUND_RESTRICT context, guest_st
     // still in `X0`, because `hos_syscall_complete_block` needs it when the scheduler
     // wakes the thread.
     context->outcome = HOS_SYSCALL_BLOCKED;
+    return POUND_SUCCESS;
+}
+
+static error_t
+svc_cancel_synchronization(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *POUND_RESTRICT state)
+{
+    // Horizon's signature: W0 is a `Handle<Thread>` and the answer is a `Result` in W0.
+    // Success covers both ways the request can land -- a parked wait is interrupted now, or
+    // a flag is armed for the next one -- so the only guest-visible failure is the handle.
+    uint32_t result = HOS_RESULT_SUCCESS;
+    uint64_t id     = 0U;
+
+    error_t error = hos_process_thread_id(context->process, handle_argument(state->x[0]), &id);
+
+    if (handle_failure_result(error, &result))
+    {
+        state->x[0] = result;
+        return POUND_SUCCESS;
+    }
+
+    if (error != POUND_SUCCESS)
+    {
+        return error;
+    }
+
+    // The refusal is about the *context*, not the request: without a run queue Pound cannot
+    // name the thread that is calling, so a flag set here could never be consumed by a wait
+    // and answering success would promise an interruption that cannot happen. The handle was
+    // still resolved first, because Horizon's `0xE401` is the same on every machine.
+    if (context->scheduler == NULL)
+    {
+        POUND_LOG_ERROR(&thread_logger,
+                        "Refusing svcCancelSynchronization: cancelling a wait needs a scheduler to find "
+                        "the thread, and a context without one cannot consume the request.");
+        return POUND_ERROR_UNSUPPORTED_SYSCALL;
+    }
+
+    // A thread that is parked on handles is ended here, by the layer that owns the park.
+    // Anything else -- the caller itself, a sleeper, a runnable thread, one never admitted
+    // -- gets the durable flag instead, which its next synchronization call consumes.
+    if (!hos_scheduler_cancel(context->scheduler, id))
+    {
+        error = hos_kernel_thread_request_cancel(context->kernel, id);
+
+        if (error != POUND_SUCCESS)
+        {
+            // Unreachable from here: `hos_process_thread_id` resolved the handle a moment
+            // ago, and the thread's own reference keeps the object alive while it can run.
+            return error;
+        }
+    }
+
+    state->x[0] = HOS_RESULT_SUCCESS;
     return POUND_SUCCESS;
 }
 
@@ -1576,6 +1648,13 @@ hos_syscall_complete_block(hos_syscall_context_t *POUND_RESTRICT context,
             // pointer is not written at all -- which is also what keeps a stale index from
             // pointing the guest at a handle it never asked about.
             state->x[0] = HOS_RESULT_TIMEOUT;
+            break;
+
+        case HOS_WAKE_CANCELLED:
+            // Another thread cancelled the wait. Like a timeout, it stopped without anything
+            // becoming ready, so the index pointer is left alone and `W1` keeps whatever the
+            // parked call left there. Horizon's `0xEC01` is the whole answer.
+            state->x[0] = HOS_RESULT_INTERRUPTED;
             break;
 
         case HOS_WAKE_SLEPT:

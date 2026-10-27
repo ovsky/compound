@@ -230,6 +230,14 @@ thread. The `hos_kernel_thread_*` calls take identifiers and enforce no per-proc
 authority, because they are the emulator's own view of a thread rather than anything a
 guest can reach.
 
+A thread also carries one piece of pure request state: the cancellation flag that
+`svcCancelSynchronization` raises when the target is *not* in a synchronization call. It
+lives on the object, not in the scheduler, because it belongs to the thread rather than to
+the current wait — it survives until that thread synchronizes or dies, and it applies to a
+thread the scheduler has never admitted. It is a flag and not a counter, so two requests
+before the next wait interrupt one call, exactly as Horizon's `bool` does. The request that
+lands on a thread which *is* parked is the scheduler's to end, and is described there.
+
 A handle is `(generation << 20) | (index + 1)`, with zero reserved for "no object".
 Closing a handle frees its slot and advances the slot's generation, so a handle that
 outlived its object stops resolving instead of silently naming whatever lands in the
@@ -251,7 +259,7 @@ Shared-memory and port objects, and the Horizon IPC wire format, are out of scop
 is refused rather than half-handled. The module adds `POUND_ERROR_INVALID_HANDLE` for a
 handle that names nothing — always logged, unlike the `POUND_ERROR_NOT_FOUND` it sits
 beside, because a missing service is an ordinary answer and a missing object never is.
-`tests/test_hos_kernel.c` covers it with 40 cases.
+`tests/test_hos_kernel.c` covers it with 41 cases.
 
 ### Horizon OS scheduler — `src/core/hos/scheduler.{h,c}`
 
@@ -282,7 +290,16 @@ ready — a fact about the guest worth reporting) or `FINISHED` (no threads left
 The scheduler has no lock, and that is the concurrency model rather than an omission: one
 scheduler is one guest core driven by one host thread, and stepping it from two host threads
 at once is a caller's bug that a mutex here would not make correct.
-`tests/test_hos_scheduler.c` covers it with 22 cases.
+
+Cancellation is the one wake that does not come from the wait set. `hos_scheduler_cancel`
+finds a thread parked *on handles*, marks it runnable with a `HOS_WAKE_CANCELLED` wake and
+reports that it did so; the run loop answers that call with Horizon's `0xEC01` and reports no
+index. A thread that is running, runnable, sleeping or unknown is deliberately left alone and
+the caller is told so, which is what lets `svcCancelSynchronization` fall back to the
+kernel-side flag: Horizon interrupts a synchronization call that is in progress, and arms the
+next one otherwise, and those two cases are exactly "the scheduler had a wait to end" and "it
+did not". A sleep is not a synchronization call, so cancelling one changes nothing and its
+clock still ends it. `tests/test_hos_scheduler.c` covers it with 24 cases.
 
 ### Horizon OS memory layout — `src/core/hos/memory_layout.{h,c}`
 
@@ -435,6 +452,19 @@ changed") both collapse to the kernel's single `0xD401`, and whose table-full ex
 `0xCE01`. Because both calls write the same table `svcQueryMemory` reads, a change made by
 one is visible in the other.
 
+`svcCancelSynchronization` is the first call here whose *answer* lands on another thread.
+Horizon documents two cases and one result: a target already inside
+`svcWaitSynchronization` has that call interrupted, and a target that is not has its next
+synchronization call interrupted; either way the cancelled wait reports `0xEC01`, writes no
+index, and the cancelling call itself succeeds. The handler asks the scheduler to end a
+parked wait first and, only when there was none, raises the flag on the thread object, so the
+two cases are told apart by the layer that knows which one is true rather than guessed. A
+wait consumes a pending request before it looks at its handles, which is why a cancellation
+wins over a handle that was already ready and an auto-reset event is not consumed by a call
+that never polled. Without a scheduler the call is refused even though setting the flag
+needs no clock: the flag could never be consumed by a wait in that context, so answering
+success would promise an interruption the emulator cannot deliver.
+
 The module adds `POUND_ERROR_UNSUPPORTED_SYSCALL` for a well-formed `svc` whose number or
 feature the OS layer has not implemented — distinct from
 `POUND_ERROR_UNSUPPORTED_INSTRUCTION`, which is a fact about the decoder. The dispatch
@@ -442,7 +472,7 @@ context carries the kernel, the process, the guest memory, the caller's clock an
 number, and — through `hos_syscall_context_set_scheduler` and
 `hos_syscall_context_set_layout` — the scheduler that parks a blocked thread and the address
 space that answers the memory calls, rather than reading a global, so a test can drive any
-of them. `tests/test_hos_syscall.c` covers it with 41 cases.
+of them. `tests/test_hos_syscall.c` covers it with 44 cases.
 
 ---
 
