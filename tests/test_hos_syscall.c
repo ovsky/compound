@@ -76,12 +76,12 @@ static hos_memory_layout_t   g_layout;
 static hos_handle_t g_thread;
 static uint64_t     g_thread_id;
 
-/// The one call a driver turn makes, and whether there is one left to make.
-///
-/// Stands in for an interpreter: a real run loop fetches the next `SVC` from the guest's
-/// `pc` and dispatches it, and these cases dispatch a call they chose instead. What is
-/// being tested is the same either way -- that a call which blocks parks the thread, and
-/// that the thread is finished by `hos_syscall_complete_block` when it is woken.
+// The harness stands in for an interpreter: a real run loop fetches the next `SVC` from the
+// guest's `pc` and dispatches it, and these cases dispatch calls they chose instead. What is
+// being tested is the same either way -- that a call which blocks parks the thread, and that
+// the thread is finished by `hos_syscall_complete_block` when it is woken. A call is scripted
+// for the thread that must make it, so two threads can be made to interact.
+
 /// One call a case has scripted for the thread that must make it.
 ///
 /// Per-thread rather than a single pending call, because a case that needs two threads to
@@ -146,8 +146,8 @@ machine_reset(void)
     memset(&g_scheduler, 0, sizeof(g_scheduler));
     memset(&g_layout, 0, sizeof(g_layout));
 
-    g_thread       = HOS_HANDLE_INVALID;
-    g_thread_id    = 0U;
+    g_thread         = HOS_HANDLE_INVALID;
+    g_thread_id      = 0U;
     g_scripted_count = 0U;
     g_wake_count     = 0U;
     memset(g_scripted_calls, 0, sizeof(g_scripted_calls));
@@ -245,7 +245,9 @@ start_a_thread(void)
 /// A second thread is what a cancellation case needs: one thread has to be parked in a wait
 /// for another one to interrupt it.
 static void
-start_thread_with_priority(const uint32_t priority, hos_handle_t *POUND_RESTRICT out_handle, uint64_t *POUND_RESTRICT out_id)
+start_thread_with_priority(const uint32_t priority,
+                           hos_handle_t *POUND_RESTRICT out_handle,
+                           uint64_t *POUND_RESTRICT     out_id)
 {
     guest_state_t initial;
 
@@ -420,7 +422,8 @@ POUND_TEST(hos_syscall, name_table)
 {
     POUND_CHECK_STR_EQ(hos_syscall_name(HOS_SVC_SIGNAL_EVENT), "svcSignalEvent");
     POUND_CHECK_STR_EQ(hos_syscall_name(HOS_SVC_WAIT_SYNCHRONIZATION), "svcWaitSynchronization");
-    POUND_CHECK_STR_EQ(hos_syscall_name(HOS_SVC_CANCEL_SYNCHRONIZATION), "svcCancelSynchronization");
+    POUND_CHECK_STR_EQ(hos_syscall_name(HOS_SVC_CANCEL_SYNCHRONIZATION),
+                       "svcCancelSynchronization");
     POUND_CHECK_STR_EQ(hos_syscall_name(HOS_SVC_CONNECT_TO_NAMED_PORT), "svcConnectToNamedPort");
 
     // Known to Horizon and named, even though Pound does not implement it: the name is

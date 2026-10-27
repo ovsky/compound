@@ -1264,10 +1264,12 @@ POUND_TEST(hos_kernel, thread_cancel_request_is_a_consumed_flag)
 
     // A miss is an error rather than a silent "not requested": a request for a thread that
     // does not exist must not look like one that was accepted.
-    POUND_CHECK_EQ_U64(hos_kernel_thread_request_cancel(&g_kernel, thread_id + 1000U), POUND_ERROR_NOT_FOUND);
+    POUND_CHECK_EQ_U64(hos_kernel_thread_request_cancel(&g_kernel, thread_id + 1000U),
+                       POUND_ERROR_NOT_FOUND);
     POUND_CHECK_EQ_U64(hos_kernel_thread_take_cancel(&g_kernel, thread_id + 1000U, &requested),
                        POUND_ERROR_NOT_FOUND);
-    POUND_CHECK_EQ_U64(hos_kernel_thread_take_cancel(&g_kernel, thread_id, NULL), POUND_ERROR_INVALID_ARGUMENT);
+    POUND_CHECK_EQ_U64(hos_kernel_thread_take_cancel(&g_kernel, thread_id, NULL),
+                       POUND_ERROR_INVALID_ARGUMENT);
     POUND_CHECK_EQ_U64(hos_kernel_thread_request_cancel(NULL, thread_id), POUND_ERROR_INVALID_ARGUMENT);
 
     machine_teardown();
