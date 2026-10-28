@@ -2135,6 +2135,136 @@ POUND_TEST(hos_syscall, set_memory_attribute_reports_its_refusals_and_changes_th
 
 // -----------------------------------------------------------------------------
 
+// -----------------------------------------------------------------------------
+// svcGetInfo
+// -----------------------------------------------------------------------------
+
+/// The pseudo-handle a guest passes to ask `svcGetInfo` about itself.
+#define TEST_CURRENT_PROCESS 0xFFFF8001ULL
+
+POUND_TEST(hos_syscall, get_info_needs_a_layout)
+{
+    machine_reset();
+
+    g_state.x[0] = TEST_OUT_SLOT_0;
+    g_state.x[1] = 4U;
+    g_state.x[2] = TEST_CURRENT_PROCESS;
+    g_state.x[3] = 0U;
+    pound_test_log_reset();
+
+    POUND_CHECK_EQ_U64(call(HOS_SVC_GET_INFO), POUND_ERROR_UNSUPPORTED_SYSCALL);
+    POUND_CHECK(pound_test_log_contains("no memory layout"));
+    POUND_CHECK_EQ_U64(g_state.pc, TEST_GUEST_BASE);
+
+    machine_teardown();
+}
+
+POUND_TEST(hos_syscall, get_info_refuses_the_types_pound_cannot_answer)
+{
+    machine_reset();
+    machine_add_layout();
+    map_output_page(TEST_GUEST_BASE + 0x4000U);
+
+    // The core mask, the alias region and the stack region are real Horizon answers that
+    // need state Pound does not have. Each must leave the trap standing, not invent one.
+    static const uint64_t types[] = { 0U, 2U, 14U, 15U, 0xF0000002ULL };
+
+    for (size_t index = 0U; index < sizeof(types) / sizeof(types[0]); index++)
+    {
+        g_state.pc   = TEST_GUEST_BASE;
+        g_state.x[0] = TEST_OUT_SLOT_0;
+        g_state.x[1] = types[index];
+        g_state.x[2] = TEST_CURRENT_PROCESS;
+        g_state.x[3] = 0U;
+        pound_test_log_reset();
+
+        POUND_CHECK_EQ_U64(call(HOS_SVC_GET_INFO), POUND_ERROR_UNSUPPORTED_SYSCALL);
+        POUND_CHECK(pound_test_log_contains("svcGetInfo type"));
+        POUND_CHECK_EQ_U64(g_state.pc, TEST_GUEST_BASE);
+        POUND_CHECK_EQ_U64(g_state.x[0], TEST_OUT_SLOT_0);
+    }
+
+    machine_teardown();
+}
+
+POUND_TEST(hos_syscall, get_info_answers_the_heap_and_aslr_regions)
+{
+    machine_reset();
+    machine_add_layout();
+    map_output_page(TEST_GUEST_BASE + 0x4000U);
+
+    // The ASLR region is the whole window; the heap region is its upper half.
+    const uint64_t types[]    = { 4U, 5U, 12U, 13U };
+    const uint64_t expected[] = { g_layout.heap_base, g_layout.heap_region_size, TEST_GUEST_BASE, TEST_GUEST_SIZE };
+
+    POUND_CHECK(g_layout.heap_base > TEST_GUEST_BASE);
+    POUND_CHECK_EQ_U64(g_layout.heap_base + g_layout.heap_region_size, TEST_GUEST_BASE + TEST_GUEST_SIZE);
+
+    for (size_t index = 0U; index < sizeof(types) / sizeof(types[0]); index++)
+    {
+        g_state.pc   = TEST_GUEST_BASE;
+        g_state.x[0] = TEST_OUT_SLOT_0;
+        g_state.x[1] = types[index];
+        g_state.x[2] = 0xAAAAAAAA00000000ULL | TEST_CURRENT_PROCESS;
+        g_state.x[3] = 0U;
+        memset(host_at(TEST_OUT_SLOT_0), 0xCC, sizeof(uint64_t));
+
+        POUND_CHECK_EQ_U64(call(HOS_SVC_GET_INFO), POUND_SUCCESS);
+        POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_SUCCESS);
+        POUND_CHECK_EQ_U64(g_state.x[1], expected[index]);
+        POUND_CHECK_EQ_U64(read_u64_at(TEST_OUT_SLOT_0), expected[index]);
+        POUND_CHECK_EQ_U64(g_state.pc, TEST_GUEST_BASE + 4U);
+    }
+
+    machine_teardown();
+}
+
+POUND_TEST(hos_syscall, get_info_reports_its_refusals)
+{
+    machine_reset();
+    machine_add_layout();
+    map_output_page(TEST_GUEST_BASE + 0x4000U);
+
+    hos_handle_t event = HOS_HANDLE_INVALID;
+    POUND_REQUIRE(POUND_SUCCESS == hos_process_create_event(&g_process, HOS_EVENT_AUTO, false, &event));
+
+    // A non-zero subtype is refused before the handle is looked at, so a bad handle does
+    // not change the answer.
+    g_state.x[0] = TEST_OUT_SLOT_0;
+    g_state.x[1] = 4U;
+    g_state.x[2] = 0U;
+    g_state.x[3] = 1U;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_GET_INFO), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_COMBINATION);
+    POUND_CHECK_EQ_U64(g_state.x[1], 4U);
+
+    // A handle that names nothing, and one that names an object that is not a process.
+    const uint64_t handles[] = { 0U, event };
+
+    for (size_t index = 0U; index < sizeof(handles) / sizeof(handles[0]); index++)
+    {
+        g_state.x[0] = TEST_OUT_SLOT_0;
+        g_state.x[1] = 5U;
+        g_state.x[2] = handles[index];
+        g_state.x[3] = 0U;
+        POUND_CHECK_EQ_U64(call(HOS_SVC_GET_INFO), POUND_SUCCESS);
+        POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_HANDLE);
+        POUND_CHECK_EQ_U64(g_state.x[1], 5U);
+    }
+
+    // An out-pointer that is not writable: the answer has nowhere to go, and `X1` is left
+    // as the guest left it rather than given a value the stub would store regardless.
+    g_state.x[0] = TEST_UNMAPPED_ADDRESS;
+    g_state.x[1] = 12U;
+    g_state.x[2] = TEST_CURRENT_PROCESS;
+    g_state.x[3] = 0U;
+    POUND_CHECK_EQ_U64(call(HOS_SVC_GET_INFO), POUND_SUCCESS);
+    POUND_CHECK_EQ_U64(g_state.x[0], HOS_RESULT_INVALID_POINTER);
+    POUND_CHECK_EQ_U64(g_state.x[1], 12U);
+
+    machine_teardown();
+}
+
 POUND_TEST_SUITE(hos_syscall,
                  POUND_TEST_CASE(hos_syscall, name_table),
                  POUND_TEST_CASE(hos_syscall, unimplemented_call_is_refused_and_leaves_the_trap),
@@ -2181,6 +2311,10 @@ POUND_TEST_SUITE(hos_syscall,
                  POUND_TEST_CASE(hos_syscall, set_memory_permission_needs_a_layout),
                  POUND_TEST_CASE(hos_syscall, set_memory_permission_reports_its_refusals_and_reprotects),
                  POUND_TEST_CASE(hos_syscall, set_memory_attribute_needs_a_layout),
-                 POUND_TEST_CASE(hos_syscall, set_memory_attribute_reports_its_refusals_and_changes_the_bit))
+                 POUND_TEST_CASE(hos_syscall, set_memory_attribute_reports_its_refusals_and_changes_the_bit),
+                 POUND_TEST_CASE(hos_syscall, get_info_needs_a_layout),
+                 POUND_TEST_CASE(hos_syscall, get_info_refuses_the_types_pound_cannot_answer),
+                 POUND_TEST_CASE(hos_syscall, get_info_answers_the_heap_and_aslr_regions),
+                 POUND_TEST_CASE(hos_syscall, get_info_reports_its_refusals))
 
 /*** end of file ***/

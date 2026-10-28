@@ -34,6 +34,7 @@ static error_t svc_set_heap_size(hos_syscall_context_t *context, guest_state_t *
 static error_t svc_set_memory_permission(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_set_memory_attribute(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_query_memory(hos_syscall_context_t *context, guest_state_t *state);
+static error_t svc_get_info(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_create_thread(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_start_thread(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_exit_thread(hos_syscall_context_t *context, guest_state_t *state);
@@ -69,6 +70,7 @@ static const hos_syscall_entry_t HOS_SYSCALLS[] = {
     { HOS_SVC_SET_MEMORY_PERMISSION, "svcSetMemoryPermission", svc_set_memory_permission },
     { HOS_SVC_SET_MEMORY_ATTRIBUTE, "svcSetMemoryAttribute", svc_set_memory_attribute },
     { HOS_SVC_QUERY_MEMORY, "svcQueryMemory", svc_query_memory },
+    { HOS_SVC_GET_INFO, "svcGetInfo", svc_get_info },
     { HOS_SVC_EXIT_PROCESS, "svcExitProcess", svc_exit_process },
     { HOS_SVC_CREATE_THREAD, "svcCreateThread", svc_create_thread },
     { HOS_SVC_START_THREAD, "svcStartThread", svc_start_thread },
@@ -106,7 +108,6 @@ static const hos_syscall_entry_t HOS_SYSCALLS[] = {
     { 0x21U, "svcSendSyncRequest", NULL },
     { 0x22U, "svcSendSyncRequestWithUserBuffer", NULL },
     { 0x24U, "svcGetProcessId", NULL },
-    { 0x29U, "svcGetInfo", NULL },
     { 0x41U, "svcAcceptSession", NULL },
     { 0x42U, "svcReplyAndReceiveLight", NULL },
     { 0x43U, "svcReplyAndReceive", NULL },
@@ -618,6 +619,100 @@ svc_query_memory(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *P
     // X1, so it must be set even though Compound itself has nothing to say with it.
     state->x[0] = HOS_RESULT_SUCCESS;
     state->x[1] = 0U;
+    return POUND_SUCCESS;
+}
+
+/// The `svcGetInfo` types this module answers. Each is a fact the layout already
+/// holds; every other type needs state Pound does not model yet and is refused.
+#define HOS_INFO_TYPE_HEAP_REGION_ADDRESS 4U
+#define HOS_INFO_TYPE_HEAP_REGION_SIZE 5U
+#define HOS_INFO_TYPE_ASLR_REGION_ADDRESS 12U
+#define HOS_INFO_TYPE_ASLR_REGION_SIZE 13U
+
+/// Horizon's pseudo-handle for the calling process. It names no slot in the handle
+/// table: the kernel resolves it to whoever made the call.
+#define HOS_PSEUDO_HANDLE_CURRENT_PROCESS 0xFFFF8001U
+
+static error_t
+svc_get_info(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *POUND_RESTRICT state)
+{
+    // Horizon's signature: X0 is the pointer the stub stores the answer through, X1 the
+    // info type, W2 the handle, X3 the subtype. The answer is the 64-bit `(Out) X1`.
+    const uint64_t     out_address = state->x[0];
+    const uint64_t     info_type   = state->x[1];
+    const hos_handle_t handle      = handle_argument(state->x[2]);
+    const uint64_t     subtype     = state->x[3];
+
+    if ((info_type != HOS_INFO_TYPE_HEAP_REGION_ADDRESS) && (info_type != HOS_INFO_TYPE_HEAP_REGION_SIZE) &&
+        (info_type != HOS_INFO_TYPE_ASLR_REGION_ADDRESS) && (info_type != HOS_INFO_TYPE_ASLR_REGION_SIZE))
+    {
+        // Core and priority masks, memory totals, entropy, the alias and stack regions:
+        // each is a real Horizon answer that needs a process or region Pound does not
+        // have, so the trap is left standing rather than answered with a guess.
+        POUND_LOG_ERROR(&thread_logger,
+                        "Refusing svcGetInfo type %llu: Pound has not implemented it.",
+                        (unsigned long long)info_type);
+        return POUND_ERROR_UNSUPPORTED_SYSCALL;
+    }
+
+    if (memory_call_needs_layout(context, "svcGetInfo"))
+    {
+        return POUND_ERROR_UNSUPPORTED_SYSCALL;
+    }
+
+    // Checked in the kernel's order: a non-zero subtype is refused before the handle is
+    // looked at, so a guest that gets both wrong sees the same word it would on hardware.
+    if (subtype != 0U)
+    {
+        state->x[0] = HOS_RESULT_INVALID_COMBINATION;
+        return POUND_SUCCESS;
+    }
+
+    // These types ask about a process. Pound has no process object a handle could name,
+    // so the only handle that can name one is the pseudo-handle for the caller; anything
+    // else names nothing or names the wrong kind of object, which is `0xE401` either way.
+    if (handle != HOS_PSEUDO_HANDLE_CURRENT_PROCESS)
+    {
+        state->x[0] = HOS_RESULT_INVALID_HANDLE;
+        return POUND_SUCCESS;
+    }
+
+    const hos_memory_layout_t *const layout = context->layout;
+    uint64_t                         value  = 0U;
+
+    switch (info_type)
+    {
+        case HOS_INFO_TYPE_HEAP_REGION_ADDRESS:
+            value = layout->heap_base;
+            break;
+
+        case HOS_INFO_TYPE_HEAP_REGION_SIZE:
+            value = layout->heap_region_size;
+            break;
+
+        case HOS_INFO_TYPE_ASLR_REGION_ADDRESS:
+            // The ASLR region is the span every other region is placed inside, which in
+            // Pound's layout is the whole address space.
+            value = layout->address_space_start;
+            break;
+
+        // The filter above leaves only the ASLR size for the default.
+        case HOS_INFO_TYPE_ASLR_REGION_SIZE:
+        default:
+            value = layout->address_space_end - layout->address_space_start;
+            break;
+    }
+
+    // As `svcGetThreadId`: the stub stores X1 through the pointer it saved, and the write
+    // through X0 serves a guest that reads the slot directly.
+    const bool delivered = write_guest_u64(context, out_address, value);
+
+    if (delivered)
+    {
+        state->x[1] = value;
+    }
+
+    state->x[0] = delivered ? HOS_RESULT_SUCCESS : HOS_RESULT_INVALID_POINTER;
     return POUND_SUCCESS;
 }
 

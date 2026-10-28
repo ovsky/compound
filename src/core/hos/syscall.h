@@ -114,8 +114,9 @@
 //!
 //! # What is not here, and why
 //!
-//! Process objects (`svcGetProcessId`, `svcGetInfo`) need a process model beyond
-//! the handle table. The two memory-layout calls that alias a range
+//! Process objects (`svcGetProcessId`, and every `svcGetInfo` type but the heap and
+//! ASLR regions, which the layout already holds) need a process model beyond the
+//! handle table. The two memory-layout calls that alias a range
 //! (`svcMapMemory`, `svcUnmapMemory`) need an unmap path the region table does not
 //! have yet: Compound's guest memory is one flat buffer, so mapping a range at a
 //! second address would need a real alias rather than a second region. IPC
@@ -250,6 +251,10 @@ typedef enum
 
     /// Writes a guest string to the emulator's log.
     HOS_SVC_OUTPUT_DEBUG_STRING = 0x27,
+
+    /// Answers a fact about the process in `X1` (the caller's stub stores that register
+    /// through the pointer in `X0`). Only the heap and ASLR region types are answered.
+    HOS_SVC_GET_INFO = 0x29,
 
     /// Discards the whole data cache. Returns nothing; a host has no guest cache.
     HOS_SVC_FLUSH_ENTIRE_DATA_CACHE = 0x2A,
