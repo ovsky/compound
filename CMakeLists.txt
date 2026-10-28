@@ -288,6 +288,14 @@ set(SDL_EVENTS ON CACHE BOOL "" FORCE)
 set(SDL_THREADS ON CACHE BOOL "" FORCE)
 set(SDL_TIMERS ON CACHE BOOL "" FORCE)
 
+# SDL's native file dialog, used by the Library page's Browse buttons.
+#
+# This was previously off with the rest of the nonessential subsystems, which
+# compiled SDL without any dialog driver: `SDL_ShowOpenFileDialog` still existed
+# and still returned, but it reported "SDL not built with dialog support" and
+# called its callback with no file, so the buttons opened nothing at all.
+set(SDL_DIALOG ON CACHE BOOL "" FORCE)
+
 # Disable everything nonessential.
 #
 # NOTE: SDL_AUDIO and SDL_JOYSTICK are currently off, which means the emulator
@@ -304,7 +312,6 @@ foreach (sdl_option
         SDL_CAMERA
         SDL_GPU
         SDL_STORAGE
-        SDL_DIALOG
         SDL_FILE
         SDL_FILESYSTEM
         SDL_LOCALE
