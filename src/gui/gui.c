@@ -151,7 +151,8 @@ typedef struct
     /// Its own flag rather than part of the Debug menu: the window is meant to
     /// stay up while the user works through the other pages, so opening the
     /// Debug menu must not be the only way to see it -- and closing it must not
-    /// take the Debug menu with it.
+    /// take the Debug menu with it. It starts closed and is opened by choosing
+    /// the Memory page, so it is never on screen before the user asks for it.
     bool show_memory_window;
 
     /// Set when the theme or the scale changed and the running interface has not
@@ -431,9 +432,10 @@ gui_create(const void *POUND_RESTRICT saved_data, const size_t saved_size, void 
     state->current_page               = (int)POUND_PAGE_LIBRARY;
     state->config_appearance_dirty    = true;
     state->memory_tracker.first_time_run = true;
-    // Open from the first frame: the address-space view is the one window the
-    // user asked to have on screen, not a debugging extra they must find.
-    state->show_memory_window         = true;
+    // Closed until the user chooses the Memory page. The address-space view used
+    // to open with the application, which put a diagnostic window in front of
+    // someone who had not asked for it; the Memory tab is the request now.
+    state->show_memory_window         = false;
     state->view.log_min_level         = LOG_LEVEL_WARN;
     state->view.log_auto_scroll       = true;
     state->view.settings_status[0]    = '\0';
@@ -620,6 +622,15 @@ gui_render_sidebar(gui_state_t *POUND_RESTRICT                  state,
                                      (ImVec2){ 0.0F, row_height }))
             {
                 state->current_page = i;
+
+                // Choosing the page is the one automatic way the window opens.
+                // This runs even when the row is already selected, so clicking
+                // Memory again brings the window back after its close button hid
+                // it while the page stayed open.
+                if ((int)POUND_PAGE_MEMORY == i)
+                {
+                    state->show_memory_window = true;
+                }
             }
         }
 
