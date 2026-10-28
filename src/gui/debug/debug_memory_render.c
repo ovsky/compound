@@ -14,7 +14,7 @@
 POUND_HOT void progress_bar_render(double numerator_mib, double denominator_mib);
 
 void
-debug_memory_render(debug_memory_tracker_t *context)
+debug_memory_render(debug_memory_tracker_t *context, bool *p_open)
 {
     if (POUND_UNLIKELY(NULL == context))
     {
@@ -56,7 +56,12 @@ debug_memory_render(debug_memory_tracker_t *context)
     igSetNextWindowPos((ImVec2){ 24.0F, 96.0F }, ImGuiCond_Appearing, (ImVec2){ 0.0F, 0.0F });
     igSetNextWindowSize((ImVec2){ 620.0F, 360.0F }, ImGuiCond_Appearing);
 
-    if (true == igBegin(title, NULL, window_flags))
+    // A top-level window, not a child of the page: ImGui does not support
+    // `Begin` inside a child window, and nesting it there clipped it to a
+    // sliver. `p_open` gives the title bar a close button that only hides this
+    // window -- the rest of the interface keeps running, and the Debug menu or
+    // the Memory page can bring it back.
+    if (true == igBegin(title, p_open, window_flags))
     {
         ImDrawList *POUND_RESTRICT draw_list   = igGetWindowDrawList();
         const ImVec2_c             origin      = igGetCursorScreenPos();

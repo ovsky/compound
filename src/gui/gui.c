@@ -76,7 +76,7 @@
 /// A blob from a different version is ignored rather than reinterpreted: the whole
 /// point of versioning this is that reading an old layout as if it were the new
 /// one is how a saved state turns into a crash instead of a reset.
-#define GUI_SAVED_STATE_VERSION 2U
+#define GUI_SAVED_STATE_VERSION 3U
 
 /// The durable part of the interface, written on a hot reload and read back.
 ///
@@ -98,6 +98,7 @@ typedef struct
     int32_t  show_debug_menu;
     int32_t  show_hot_reload_guide;
     int32_t  show_imgui_demo;
+    int32_t  show_memory_window;
 } gui_saved_state_t;
 
 /// Everything the shell keeps between frames.
@@ -145,12 +146,20 @@ typedef struct
     /// Whether Dear ImGui's own demo window is open.
     bool show_imgui_demo;
 
+    /// Whether the floating Guest Address Space window is open.
+    ///
+    /// Its own flag rather than part of the Debug menu: the window is meant to
+    /// stay up while the user works through the other pages, so opening the
+    /// Debug menu must not be the only way to see it -- and closing it must not
+    /// take the Debug menu with it.
+    bool show_memory_window;
+
     /// Set when the theme or the scale changed and the running interface has not
     /// picked the change up yet. Cleared at the top of the next frame.
     bool config_appearance_dirty;
 
     /// Explicit tail padding; see the note on member order.
-    char pad[4];
+    char pad[3];
 } gui_state_t;
 
 static gui_plugin_error_t gui_create(const void *saved_data, size_t saved_size, void **out);
@@ -353,6 +362,7 @@ gui_apply_saved_state(gui_state_t *POUND_RESTRICT state,
     state->show_debug_menu         = (0 != saved.show_debug_menu);
     state->show_hot_reload_guide   = (0 != saved.show_hot_reload_guide);
     state->show_imgui_demo         = (0 != saved.show_imgui_demo);
+    state->show_memory_window      = (0 != saved.show_memory_window);
 }
 
 /// Pushes the config's appearance into the running interface.
@@ -421,6 +431,9 @@ gui_create(const void *POUND_RESTRICT saved_data, const size_t saved_size, void 
     state->current_page               = (int)POUND_PAGE_LIBRARY;
     state->config_appearance_dirty    = true;
     state->memory_tracker.first_time_run = true;
+    // Open from the first frame: the address-space view is the one window the
+    // user asked to have on screen, not a debugging extra they must find.
+    state->show_memory_window         = true;
     state->view.log_min_level         = LOG_LEVEL_WARN;
     state->view.log_auto_scroll       = true;
     state->view.settings_status[0]    = '\0';
@@ -741,6 +754,7 @@ gui_render_content_window(gui_state_t *POUND_RESTRICT                  state,
         context.log_scratch          = state->log_scratch;
         context.log_scratch_capacity = (size_t)POUND_LOG_SNAPSHOT_MAX;
         context.memory_tracker       = &state->memory_tracker;
+        context.memory_window_open   = &state->show_memory_window;
         context.view                 = &state->view;
         context.config_dirty         = &state->config_appearance_dirty;
 
@@ -757,21 +771,25 @@ gui_render_content_window(gui_state_t *POUND_RESTRICT                  state,
 static void
 gui_render_debug_windows(gui_state_t *POUND_RESTRICT state)
 {
+    if (true == state->show_memory_window)
+    {
+        // Drawn every frame regardless of the page or of the Debug menu: this is
+        // a floating diagnostic window the user keeps in view while they work,
+        // not a part of whichever page happens to be selected. Passing its flag
+        // in gives the title bar a close button that hides it on its own.
+        debug_memory_render(&state->memory_tracker, &state->show_memory_window);
+    }
+
     if (true == state->show_debug_menu)
     {
         if (igBegin("Debug##debug_menu", &state->show_debug_menu, ImGuiWindowFlags_None))
         {
             igSeparatorText("Interface");
+            igCheckbox("Guest Address Space", &state->show_memory_window);
             igCheckbox("Hot reload guide", &state->show_hot_reload_guide);
             igCheckbox("Dear ImGui demo", &state->show_imgui_demo);
         }
         igEnd();
-
-        // The address-space view is its own top-level window: ImGui does not
-        // support `Begin` inside a child window, and nesting it there left it
-        // clipped to a sliver. It also gets an explicit size and position so
-        // it opens expanded on the left instead of collapsed to its content.
-        debug_memory_render(&state->memory_tracker);
     }
 
     if (true == state->show_hot_reload_guide)
@@ -958,6 +976,7 @@ gui_save(void *gui_state, void *out_gui, const size_t capacity, size_t *out_size
     saved.show_debug_menu        = (0 != state->show_debug_menu) ? 1 : 0;
     saved.show_hot_reload_guide  = (0 != state->show_hot_reload_guide) ? 1 : 0;
     saved.show_imgui_demo        = (0 != state->show_imgui_demo) ? 1 : 0;
+    saved.show_memory_window     = (0 != state->show_memory_window) ? 1 : 0;
 
     memcpy(out_gui, &saved, sizeof(saved));
 

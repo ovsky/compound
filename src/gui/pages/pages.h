@@ -137,6 +137,13 @@ typedef struct
     /// Guest-memory visualisation state. The Memory page renders and advances it.
     debug_memory_tracker_t *POUND_RESTRICT memory_tracker;
 
+    /// Whether the floating Guest Address Space window is open.
+    ///
+    /// The window itself belongs to the shell so it stays up across pages; a
+    /// page may read this to explain its state and may set it to reopen the
+    /// window after the user closed it.
+    bool *POUND_RESTRICT memory_window_open;
+
     /// Scroll position and log filter. The shell owns the storage.
     pound_pages_view_t *POUND_RESTRICT view;
 

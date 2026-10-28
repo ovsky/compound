@@ -2,10 +2,12 @@
 
 /// The Memory page.
 ///
-/// A thin frame around `debug_memory_render`, which already owns the drawing of
-/// the address-space map, its boxes and its detail panel. The only thing this page
-/// adds is the heading, and the refusal to draw when the tracker is not there --
-/// passing NULL into the renderer would be a crash rather than an empty state.
+/// The address-space map is not drawn here. It lives in a floating window the
+/// shell owns (`debug_memory_render`, driven from `gui.c`), because ImGui does
+/// not support `Begin` inside a child window and the map used to be clipped to a
+/// sliver when this page tried to draw it inside its card. What is left for the
+/// page is the heading, an explanation of what the window shows, and a way to
+/// bring the window back after its own close button hid it.
 void
 pound_page_render_memory(const pound_page_context_t *POUND_RESTRICT context)
 {
@@ -30,7 +32,24 @@ pound_page_render_memory(const pound_page_context_t *POUND_RESTRICT context)
 
     if (pound_page_begin_card(context, "##memory_map_card", 0.0F))
     {
-        debug_memory_render(context->memory_tracker);
+        const bool *const window_open = context->memory_window_open;
+
+        if ((NULL != window_open) && (true == *window_open))
+        {
+            igTextWrapped("The Guest Address Space window is open on the left. It stays there "
+                          "while you move between pages; close it with its own close button.");
+        }
+        else
+        {
+            igTextWrapped("The Guest Address Space window is closed. Reopen it to see the code, "
+                          "data and framebuffer ranges and the memory in use against the heap.");
+            igSpacing();
+
+            if ((NULL != window_open) && (true == igButton("Show Guest Address Space", (ImVec2){ 0.0F, 0.0F })))
+            {
+                *context->memory_window_open = true;
+            }
+        }
     }
 
     pound_page_end_card();
