@@ -63,7 +63,12 @@ bool            debug_memory_get_host_address_space_range(debug_memory_tracker_t
 
 // debug_memory_render.c
 
-void debug_memory_render(debug_memory_tracker_t *context);
+/// Draws the floating Guest Address Space window.
+///
+/// `p_open` is the shell's visibility flag: the title bar's close button clears
+/// it, and the caller stops drawing once it is false. May be NULL for a window
+/// that cannot be closed.
+void debug_memory_render(debug_memory_tracker_t *context, bool *p_open);
 
 /// Renders `box` onto `draw_list`
 ///
