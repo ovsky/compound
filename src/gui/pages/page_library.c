@@ -6,6 +6,7 @@
 #include "loader/title_loader.h"
 
 #include <SDL3/SDL.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -39,6 +40,15 @@ static char library_keys_path[POUND_CONFIG_PATH_MAX];
 /// written from the render thread.
 static bool library_game_chosen;
 static bool library_keys_chosen;
+
+/// Set when SDL could not even show a picker, so the page can say why.
+///
+/// SDL reports a picker that failed to open as a callback with a NULL filelist;
+/// a picker the user simply cancelled arrives as a list whose first entry is
+/// NULL. Distinguishing them is what turns "the button did nothing" into an
+/// error the user can act on.
+static bool library_dialog_failed;
+static char library_dialog_error[POUND_LIBRARY_STATUS_MAX];
 
 /// The parsed key store, and whether it has been initialised.
 static key_store_t library_keys;
@@ -135,7 +145,17 @@ pound_library_game_dialog_done(void *userdata, const char *const *filelist, int 
     (void)userdata;
     (void)filter;
 
-    if ((NULL == filelist) || (NULL == filelist[0]))
+    if (NULL == filelist)
+    {
+        (void)snprintf(library_dialog_error,
+                       sizeof(library_dialog_error),
+                       "The file picker could not open: %s",
+                       SDL_GetError());
+        library_dialog_failed = true;
+        return;
+    }
+
+    if (NULL == filelist[0])
     {
         return;
     }
@@ -151,7 +171,17 @@ pound_library_key_dialog_done(void *userdata, const char *const *filelist, int f
     (void)userdata;
     (void)filter;
 
-    if ((NULL == filelist) || (NULL == filelist[0]))
+    if (NULL == filelist)
+    {
+        (void)snprintf(library_dialog_error,
+                       sizeof(library_dialog_error),
+                       "The file picker could not open: %s",
+                       SDL_GetError());
+        library_dialog_failed = true;
+        return;
+    }
+
+    if (NULL == filelist[0])
     {
         return;
     }
@@ -160,13 +190,33 @@ pound_library_key_dialog_done(void *userdata, const char *const *filelist, int f
     library_keys_chosen = true;
 }
 
+/// The window a picker should be modal to.
+///
+/// SDL runs the Windows picker on its own thread and owns it to the window it is
+/// given. The ImGui backend keeps the main viewport's SDL window ID, so the page
+/// can recover the window without the shell having to hand it down. A NULL
+/// parent still works, but the dialog can then open behind the emulator, which
+/// looks exactly like a button that did nothing.
+static SDL_Window *
+pound_library_parent_window(void)
+{
+    const ImGuiViewport *const viewport = igGetMainViewport();
+
+    if ((NULL == viewport) || (0 == (intptr_t)viewport->PlatformHandle))
+    {
+        return NULL;
+    }
+
+    return SDL_GetWindowFromID((SDL_WindowID)(intptr_t)viewport->PlatformHandle);
+}
+
 /// Opens the native picker for a game image.
 static void
 pound_library_browse_game(void)
 {
     SDL_ShowOpenFileDialog(pound_library_game_dialog_done,
                            NULL,
-                           NULL,
+                           pound_library_parent_window(),
                            POUND_LIBRARY_GAME_FILTERS,
                            (int)SDL_arraysize(POUND_LIBRARY_GAME_FILTERS),
                            NULL,
@@ -179,7 +229,7 @@ pound_library_browse_keys(void)
 {
     SDL_ShowOpenFileDialog(pound_library_key_dialog_done,
                            NULL,
-                           NULL,
+                           pound_library_parent_window(),
                            POUND_LIBRARY_KEY_FILTERS,
                            (int)SDL_arraysize(POUND_LIBRARY_KEY_FILTERS),
                            NULL,
@@ -376,6 +426,12 @@ pound_page_render_library(const pound_page_context_t *POUND_RESTRICT context)
     }
 
     pound_pages_view_t *const view = context->view;
+
+    if (true == library_dialog_failed)
+    {
+        library_dialog_failed = false;
+        pound_library_set_status(view, true, library_dialog_error);
+    }
 
     pound_page_heading(context,
                        "LIBRARY",
