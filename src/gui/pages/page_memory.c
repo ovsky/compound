@@ -41,11 +41,12 @@ pound_page_render_memory(const pound_page_context_t *POUND_RESTRICT context)
         }
         else
         {
-            igTextWrapped("The Guest Address Space window is closed. Reopen it to see the code, "
-                          "data and framebuffer ranges and the memory in use against the heap.");
+            igTextWrapped("The Guest Address Space window is closed. Choose Memory in the sidebar "
+                          "again to bring it back, or use the button below.");
             igSpacing();
 
-            if ((NULL != window_open) && (true == igButton("Show Guest Address Space", (ImVec2){ 0.0F, 0.0F })))
+            if ((NULL != window_open)
+                && (true == igButton("Show Guest Address Space", (ImVec2){ 0.0F, 0.0F })))
             {
                 *context->memory_window_open = true;
             }
