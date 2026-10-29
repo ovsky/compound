@@ -5,6 +5,8 @@ How Compound is put together, and why.
 - [Shape](#shape)
 - [Targets and dependencies](#targets-and-dependencies)
 - [Core](#core)
+- [Loader and guest boot](#loader-and-guest-boot)
+- [Platform services](#platform-services)
 - [Debug GUI and hot reload](#debug-gui-and-hot-reload)
 - [Memory accounting](#memory-accounting)
 - [Ballistic](#ballistic)
@@ -17,8 +19,11 @@ How Compound is put together, and why.
 
 Compound is a C11 emulator shell with a C++ debug GUI. The guest side now reaches
 from an ARM64 interpreter through a Horizon OS kernel, system call layer and
-thread scheduler; a graphics backend and the rest of the OS surface are still
-missing, so nothing boots a title yet.
+thread scheduler; the loader can detect, validate and map an unencrypted NRO/NSO
+image and prepare its initial register state, but nothing yet drives that state
+through the execution loop. Encrypted NCA/NSP/XCI packages and Switch 2 content
+are refused rather than approximated, and a graphics backend and the rest of the
+OS surface are still missing.
 
 ```
                              ┌──────────────────────────┐
@@ -45,6 +50,9 @@ missing, so nothing boots a title yet.
      │  guest_memory.c  guest↔host address translation            │
      │  guest_state.c    emulated register file                   │
      │  safe_math.c      checked arithmetic                       │
+     │  validation.c     shared range/overflow predicates         │
+     │  arena.c          rewindable bump allocator                │
+     │  rsa.c            RSA-2048 PKCS#1 v1.5 verification        │
      └───────────────────────────┬────────────────────────────────┘
                                  │
                        ┌─────────▼──────────┐
@@ -103,6 +111,29 @@ unsigned overflow, because the guest cares which one occurred.
 Contract: on failure the result is **zeroed**, so a caller that ignores the
 status cannot accidentally use stale data.
 
+### Hardened validation — `src/core/validation.{h,c}`
+
+Containers, loaders and allocators all need to answer "does this range fit?" and
+"does `offset + length` wrap?". Before this module each parser spelled the check
+out itself, with a slightly different overflow rule and error code. This is the
+shared, allocation-free version:
+
+- `validation_add_size` / `validation_mul_size` refuse `size_t` overflow.
+- `validation_align_up_size` rounds up without wrapping at the top of the
+  address space and refuses a zero or non-power-of-two alignment.
+- `validation_range_size` / `validation_range_u64` prove that a range lies
+  inside a total or limit, arranging the subtraction so no intermediate value
+  can wrap.
+- `validation_range_contains` is the predicate form for hot paths that only
+  need yes or no.
+
+The arithmetic failures (`POUND_ERROR_GUEST_ADDRESS_OVERFLOW`) are distinct from
+the range failures (`POUND_ERROR_GUEST_ADDRESS_OUT_OF_BOUNDS`), because a
+wrapped offset and an out-of-bounds one usually mean different things to the
+caller. The module never logs: it is called on file and guest data, where an
+invalid range is an ordinary answer and the caller has the context. `tests/test_validation.c`
+covers it with 14 cases.
+
 ### Guest memory — `src/core/memory/guest_memory.{h,c}`
 
 `guest_memory_t` is the only translation layer between guest virtual addresses
@@ -131,6 +162,58 @@ table has no gate and accepts any access in its window, which is what keeps the
 translation layer usable on its own. `guest_memory_translate_execute` is the
 fetch-side entry point the interpreter and JIT use, so a page mapped
 non-executable faults on fetch rather than on load.
+
+### Arena allocator — `src/core/memory/arena.{h,c}`
+
+Compound already had a fixed-block pool and a size-class slab. Both answer "give
+me one object" and pay for a free list so individual objects can be returned. A
+loader has the opposite shape: it carves an image's text, read-only data,
+writable data, a stack and a few metadata blocks once, hands them to the guest,
+and releases them together when the title unloads. For that, a free list is pure
+overhead and a failed allocation halfway through is the common case.
+
+`pound_arena_t` is one contiguous caller-owned buffer, a cursor, an owner tag and
+a checkpoint/rewind pair. It cannot return a single block, and does not pretend
+to. What it does provide is what a loader needs to be safe:
+
+- every allocation is aligned, overflow-checked and zeroed, so an uninitialised
+  read cannot leak the previous title's data;
+- the owner tag lets memory accounting charge the allocation to a title rather
+  than to "somewhere in the loader";
+- a checkpoint records the cursor, allocation count and generation, so a
+  checkpoint taken before a reset is refused instead of being mistaken for one
+  at the start of the new scope; and
+- the high-water mark survives a reset, so a loader can size the next arena
+  from observed demand.
+
+The arena owns no host memory. `boot.c` allocates the guest window through the
+memory subsystem and gives the arena a view of it. `tests/test_arena.c` covers
+it with 10 cases, including zeroing, stale checkpoints and overflow.
+
+### RSA verification — `src/core/crypto/rsa.{h,c}`
+
+The Switch family authenticates containers with RSA-2048, and a parser that
+accepts any 256 bytes because "the hash was checked elsewhere" is authenticating
+nothing. This module implements the verification direction only: RSA-2048,
+PKCS#1 v1.5, SHA-256, over a caller-supplied public key. It never signs,
+generates keys, or handles private material, and it does not ship or guess
+Nintendo's keys.
+
+A legitimate signature is accepted. A malformed key — even modulus, wrong high
+bit, zero or even exponent — is `POUND_ERROR_INVALID_ARGUMENT`, because retrying
+with the same key cannot help. A signature that is numerically out of range, has
+the wrong padding, or encodes a different digest is
+`POUND_ERROR_SIGNATURE_INVALID`, which is deliberately distinct from
+`POUND_ERROR_HASH_MISMATCH`: a wrong key is not evidence that the payload is
+corrupt.
+
+The arithmetic uses 64 little-endian 32-bit limbs and Montgomery multiplication
+with `R = 2^2048`, so every intermediate fits in a `uint64_t` without a
+compiler-specific `__int128`. Carry propagation is bounds-guarded rather than
+allowed to wrap silently. `tests/test_rsa.c` pins a known-answer vector in
+`tests/rsa_test_vector.h` plus the malformed-key and wrong-message paths (9
+cases). The vector was generated once for this test; the private key was
+discarded.
 
 ### Guest state — `src/core/guest_state.{h,c}`
 
@@ -504,6 +587,127 @@ number, and — through `hos_syscall_context_set_scheduler` and
 `hos_syscall_context_set_layout` — the scheduler that parks a blocked thread and the address
 space that answers the memory calls, rather than reading a global, so a test can drive any
 of them. `tests/test_hos_syscall.c` covers it with 46 cases.
+
+---
+
+## Loader and guest boot
+
+### File-backed reader — `src/core/fs/file_reader.{h,c}`
+
+The parsers are written against `fs_reader_t`, so they can run on a buffer in a
+test and on a real image without a second code path. This module is the bridge to
+a host file: it opens the file, records its size, and installs a seek-and-read
+callback with the same random-access contract as `fs_reader_from_buffer`.
+
+Offsets are 64-bit on every platform. Windows' `long` is 32 bits, so a plain
+`fseek` would silently truncate an offset past 2 GiB — exactly where a real
+image starts having interesting data. The handle is borrowed by the reader and
+closed only by `fs_file_close`. `tests/test_file_reader.c` covers the open,
+size, seek, read, range and close paths (4 cases).
+
+### Title detection and layout — `src/core/loader/title_loader.{h,c}`
+
+Detection is by content, never by extension. A file called `game.nro` that starts
+with something else is not an NRO, and a real NRO without an extension still is.
+The module reads a small prefix and recognises:
+
+| Magic | Format | This build |
+| --- | --- | --- |
+| `NRO0` at 0x10 | NRO | parsed and bootable |
+| `NSO0` at 0 | NSO | parsed and bootable unless LZ4-compressed |
+| `NCA` at 0x200 | NCA | recognised, refused (needs keys) |
+| `PFS0` at 0 | NSP | recognised, refused (needs keys) |
+| `HEAD` at 0 | XCI | recognised, refused (needs keys) |
+
+NRO and NSO are parsed into explicit text, rodata and data segments plus BSS and
+an entry offset. Every file offset, memory offset, size and sum is checked for
+64-bit overflow and against the file before it is stored. A compressed NSO is
+`POUND_ERROR_UNSUPPORTED_FEATURE`, not a silently misinterpreted segment. NCA,
+NSP and XCI are refused by name for the same reason: mapping a package's outer
+filesystem is not decrypting or booting its content.
+
+`is_switch2_compatible` is always false. Detecting a Switch 2 container's magic
+is not evidence that Compound can decrypt or execute it, and setting the flag
+from an extension would be exactly the fabricated capability the project
+forbids. `tests/test_loader.c` covers detection, NRO/NSO layouts, overflow,
+compressed NSO and package refusal (7 cases).
+
+### Guest boot — `src/core/loader/boot/boot.{h,c}`
+
+`title_loader` says where the bytes are; `hos_memory_layout` says where they
+belong. This module is the only place that knows both halves. It validates the
+configured address space, refuses anything that is not an uncompressed NRO/NSO,
+checks the image fits below the stack, and only then allocates and zeroes the
+guest window. Allocation happens after every format check so a refused title
+costs no guest memory.
+
+It partitions the window through `hos_memory_layout_init`, maps text as
+`Code`/read-execute, rodata as `Code`/read-only, data and BSS as
+`Normal`/read-write, and reserves the top of the map half as a read-write stack.
+Segments must be page-aligned in memory and are mapped in order; a segment that
+overlaps the previous one, extends past the declared image, or wraps is refused
+rather than clipped. On success it sets `PC` to the image entry and `SP` sixteen
+bytes below the stack top, leaves the heap half `Free`, and moves the state
+through `IDLE → READY → RUNNING`. A failed load marks the state `FAILED` and
+releases the buffer, so a partially mapped image is never presented as ready.
+
+The boot layer does not run the interpreter. `pound_boot_start` only moves the
+state to `RUNNING`; wiring that state into the execution loop is the next
+integration step. A Switch 2 title is refused before mapping because
+`switch2_mode` can never be set by this build.
+
+---
+
+## Platform services
+
+The input, audio and lifecycle surface is split so the core stays headless:
+`platform/input.{h,c}`, `platform/audio.{h,c}` and `platform/services.{h,c}` have
+no SDL types, and `src/main.c` is the only place that maps host events into them.
+
+### Input — `src/core/platform/input.{h,c}`
+
+A plain value type: a bitmask of Switch buttons, two signed 16-bit sticks, and
+`connected` / `keyboard_active` flags. Sticks are applied with a 0.15 per-axis
+deadzone, clamped to full deflection, with NaN treated as centred; consumers do
+not reapply the deadzone. Invalid buttons are refused without changing state.
+`tests/test_input.c` covers independent button bits, deadzone and clamp, invalid
+indices, and clear semantics (6 cases).
+
+`src/main.c` maps SDL positional gamepad buttons to Nintendo labels — SDL south
+is Switch `B`, east is `A` — polls the analogue sticks and triggers, and falls
+back to keyboard bindings when no gamepad is open. The keyboard drives the same
+state type, so the guest has one input surface regardless of the device.
+
+### Audio — `src/core/platform/audio.{h,c}`
+
+A mutex-protected ring of interleaved S16 frames shared by the emulation thread
+and SDL's audio thread. A full ring refuses the whole block with
+`POUND_ERROR_BUSY` and counts the dropped frames. It never writes a partial
+block: half an audio frame is a click, and half a block is a discontinuity no
+consumer can repair. The critical sections copy whole frames and never call into
+SDL. `tests/test_audio.c` covers format reporting, validation, wrap-around,
+whole-block refusal, clear, and uninitialised calls (7 cases).
+
+`src/main.c` opens a 48 kHz stereo S16 stream with
+`SDL_OpenAudioDeviceStream`, resumes it, and drains the ring in the stream
+callback. An underrun is padded with silence rather than returned short, so the
+device does not stutter on a guest that has not produced audio yet.
+
+### Lifecycle and timing — `src/core/platform/services.{h,c}`
+
+The shared host state a UI needs: whether shutdown was requested, which
+capabilities actually started, how many gamepads are attached, and the frame
+budget. Capabilities are reported, not assumed: audio is available only after
+the device opened, gamepads only after the subsystem started, and a count of
+zero is distinct from "input is available". `pound_platform_services_tick`
+rejects a timestamp earlier than the last one rather than clamping it, because a
+negative frame time silently corrupts every later measurement.
+`tests/test_platform_services.c` covers initialisation, capabilities, bounded
+gamepad counts, monotonic ticks and idempotent shutdown (6 cases).
+
+`src/main.c` creates the service set at startup, records audio/gamepad/keyboard
+capabilities as each subsystem starts, ticks it once per frame, and ends the loop
+when shutdown is requested.
 
 ---
 

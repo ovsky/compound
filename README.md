@@ -17,11 +17,12 @@
 
 # 🎮 Compound Emulator
 
-**🌟 Open-Source and the World's First Nintendo Switch 2 Emulator**
+**🌟 An Open-Source Nintendo Switch Emulator Written in C**
 
-It is the Nintendo Switch 1 Emulator too!
+Switch 2 support is a research target, not a shipping capability: this build has
+no console keys, no content decryption, and no Switch 2 execution layer.
 
-**Ultra-high-fidelity system emulation. Highly experimental, but steadily growing.**
+**High-fidelity system emulation. Highly experimental, but steadily growing.**
 
 [![Stars](https://img.shields.io/github/stars/ovsky/compound?style=flat-square)](https://github.com/ovsky/compound/stargazers)
 [![License](https://img.shields.io/badge/license-GPLv3-blue?style=flat-square)](LICENSE)
@@ -74,13 +75,14 @@ It is the Nintendo Switch 1 Emulator too!
 | Feature | Status | Details |
 |---------|--------|---------|
 | 🧱 **Build & CI Infrastructure** | ✅ Complete | Presets, CMake 3.25+, cross-platform CI |
-| 🏭 **Runtime & Memory System** | ✅ Complete | `mimalloc` allocator, checked arithmetic, host accounting |
+| 🏭 **Runtime & Memory System** | ✅ Complete | `mimalloc` allocator, checked arithmetic, pool/slab/arena allocators, host accounting |
 | 🐛 **Debug Tooling** | ✅ Working | GUI with live reload, comprehensive logging |
 | ⚡ **Ballistic ARM64 JIT** | 🚧 Experimental | In-progress recompiler integration |
-| 💾 **Filesystem & Crypto** | 🚧 Experimental | HFS0 parser, SHA256, verification systems |
+| 💾 **Filesystem & Crypto** | 🚧 Experimental | HFS0 parser, 64-bit file reader, SHA-256, RSA-2048 PKCS#1 v1.5 verification |
 | 🖥️ **Guest CPU & OS** | 🚧 Experimental | A64 interpreter subset; kernel objects, one-sided event handles and services |
-| 🎨 **Graphics & Audio** | 🚧 Experimental | SM86→SPIR-V translation, Vulkan backend implemented |
-| 🎮 **Commercial Titles** | 🚧 Experimental | Title loading support for NRO/NSP/XCI/NCA with Switch 2 compatibility |
+| 🎨 **Graphics & Audio** | 🚧 Experimental | SM86→SPIR-V translation, Vulkan scaffolding, SDL audio output and gamepad input |
+| 🎮 **Title Support** | 🚧 Experimental | Content-based NRO/NSO parsing and boot mapping; encrypted packages are recognised and refused |
+| 🎮 **Switch 2** | ❌ Not implemented | No keys, decryption, or execution layer; compatibility is always reported false |
 
 ---
 
@@ -101,10 +103,16 @@ Compound is in **early-stage, active development**. The emulator has:
 ✓ CI/CD (Linux, macOS, Windows, Android, ARM64)
 ✓ Unit testing and validation
 ✓ Memory accounting and profiling
+✓ Pool, slab, and rewindable arena allocators
 ✓ Debug GUI with real-time diagnostics
 ✓ Logging framework
 ✓ Guest CPU baseline (A64 interpreter subset, Horizon OS kernel objects, SVC dispatch, guest-created events, thread scheduler, memory layout)
-✓ Title loading support (NRO/NSP/XCI/NCA, Switch 2 compatibility)
+✓ Title detection and validation (NRO/NSO images; NCA/NSP/XCI recognised and explicitly refused)
+✓ RSA-2048 PKCS#1 v1.5 signature verification (caller-supplied keys only)
+✓ Boot mapping for NRO/NSO images (segments, permissions, stack, initial PC/SP)
+✓ Input, audio ring, SDL audio output, gamepad and keyboard mapping, platform services
+✗ Commercial title boot (needs user-supplied keys, decryption, and a filesystem stack)
+✗ Switch 2 execution (no keys, no decryption, no execution layer)
 ```
 
 ---
@@ -115,14 +123,14 @@ Compound is in **early-stage, active development**. The emulator has:
 - [x] `mimalloc` host allocator integration
 - [x] Build and CI infrastructure
 - [x] Unit tests and debug instrumentation
-- [ ] Advanced memory ownership and allocation strategies
-- [ ] Hardened validation paths
+- [x] Advanced memory ownership and allocation strategies (pool, slab, rewindable arena)
+- [x] Hardened validation paths (checked arithmetic, ranges, alignment, overlap predicates)
 
 ### 📁 Phase 2: Filesystem & Cryptography
 - [x] HFS0 filesystem parser
 - [x] Filesystem reader abstraction
 - [x] SHA256 and crypto primitives
-- [ ] Verification and signature handling
+- [x] Verification and signature handling (RSA-2048 PKCS#1 v1.5, verification only)
 
 ### ⚡ Phase 3: JIT & Execution Engine
 - [x] Ballistic ARM64 code cache allocator
@@ -142,8 +150,8 @@ Compound is in **early-stage, active development**. The emulator has:
 ### 🎨 Phase 5: Graphics & Completeness
 - [x] SM86 → SPIR-V translation
 - [x] Vulkan render backend (stub implementation, ready for integration)
-- [ ] Input, audio, and platform services
-- [ ] Bootable guest state and title compatibility
+- [x] Input, audio, and platform services (SDL gamepad/keyboard, S16 audio ring and output, lifecycle/timing)
+- [x] Bootable guest state for validated NRO/NSO images (commercial packages and Switch 2 titles are refused)
 
 ---
 
@@ -293,14 +301,16 @@ Native support for Linux, macOS, Windows, Android, and ARM64 architectures.
 
 ### Key Systems
 
-- **Memory System**: `mimalloc` allocator with host accounting and ownership tracking
+- **Memory System**: `mimalloc` allocator with host accounting; pool, slab, and rewindable arena strategies; shared checked-arithmetic validation
 - **JIT Engine**: Ballistic ARM64 recompiler for high-performance execution
 - **Guest OS**: Horizon OS kernel objects, per-process handles with one-sided event rights, named services, SVC dispatch including `svcCreateEvent`, `svcMapMemory`, `svcUnmapMemory`, a priority round-robin thread scheduler with blocking waits and `svcCancelSynchronization`, and a partitioned address space whose region table gates guest access, answers `svcQueryMemory`, and reprotects an existing region with `svcSetMemoryPermission`/`svcSetMemoryAttribute`
-- **Graphics**: SM86→SPIR-V translation with Vulkan render backend
-- **Title Loading**: Support for NRO/NSP/XCI/NCA formats with Switch 2 compatibility layer
+- **Graphics**: SM86→SPIR-V translation with Vulkan render backend scaffolding
+- **Title Loading**: Content-based NRO/NSO detection, layout validation, and boot mapping; NCA/NSP/XCI are recognised and refused because this build has no keys or decryption
+- **Crypto**: SHA-256 and RSA-2048 PKCS#1 v1.5 verification over caller-supplied public keys
+- **Platform**: SDL audio output, gamepad/keyboard mapping, and host lifecycle/timing services, with an SDL-free core input/audio layer
 - **Debug Tools**: GUI with live reload, comprehensive logging, and profiling
 - **Validation**: Extensive unit tests and runtime checks
-- **Filesystem**: Experimental HFS0 parser and reader abstraction
+- **Filesystem**: Experimental HFS0 parser and file-backed reader abstraction
 
 ---
 
@@ -320,20 +330,21 @@ under the terms of the GPL v3.
 
 ### Recent Work
 
-- 🧱 **Foundation strengthening**: Memory systems and runtime validation
+- 🧱 **Foundation strengthening**: Shared validation helpers, an arena allocator with ownership tags and checkpoints, and a 64-bit file reader
 - ⚡ **JIT experimentation**: Ballistic ARM64 integration progress
 - 🖥️ **Guest CPU and OS**: A64 interpreter subset, a Horizon OS handle/service kernel with one-sided readable and writable event handles, SVC dispatch including `svcCreateEvent`, `svcMapMemory`, `svcUnmapMemory`, a thread scheduler with blocking waits, synchronization cancellation with `svcCancelSynchronization`, and a memory-layout slice that partitions the guest address space, answers `svcSetHeapSize`/`svcQueryMemory`, and reprotects regions with `svcSetMemoryPermission`/`svcSetMemoryAttribute`
-- 📁 **Filesystem work**: HFS0 parser development (experimental branches)
-- 🔐 **Crypto primitives**: SHA256 and verification systems (experimental)
-- 🎨 **Graphics**: SM86→SPIR-V translation complete with Vulkan render backend framework
-- 🎮 **Title loading**: Support for NRO/NSP/XCI/NCA with Switch 2 compatibility
-- 🐛 **Testing**: Expanded unit test coverage and CI reliability
+- 📁 **Filesystem work**: HFS0 parser and a file-backed reader with 64-bit offsets
+- 🔐 **Crypto**: SHA-256 plus RSA-2048 PKCS#1 v1.5 signature verification over caller-supplied keys; no Nintendo keys are shipped
+- 🎨 **Graphics**: SM86→SPIR-V translation with Vulkan render backend scaffolding
+- 🎮 **Title loading**: Content-based NRO/NSO detection, validated segment layouts, and boot mapping; encrypted NCA/NSP/XCI packages are refused by name rather than approximated
+- 🔊 **Platform services**: Thread-safe S16 audio ring, SDL audio output, gamepad/keyboard input mapping, and lifecycle/timing capability reporting
+- 🐛 **Testing**: 32 registered CTest suites, including validation, arena, RSA, file reader, loader, input, audio, and platform services
 
 ### Next Focus
 
 1. Integration of Vulkan render backend with main render loop
-2. Full commercial/dumped title boot path integration
-3. Input, audio, and platform services implementation
+2. Key handling, package decryption, and a filesystem stack for commercial titles
+3. IPC/CMIF shared memory and the remaining `svcMapMemory`/`svcUnmapMemory` alias path
 
 ---
 
