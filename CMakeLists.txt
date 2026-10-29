@@ -281,12 +281,15 @@ set(SDL_TESTS OFF CACHE BOOL "" FORCE)
 set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
 set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
 
-# Bare minimum required for rendering.
+# Video, audio, and gamepads are the subsystems the emulator actually uses.
 set(SDL_VIDEO ON CACHE BOOL "" FORCE)
 set(SDL_RENDER ON CACHE BOOL "" FORCE)
 set(SDL_EVENTS ON CACHE BOOL "" FORCE)
 set(SDL_THREADS ON CACHE BOOL "" FORCE)
 set(SDL_TIMERS ON CACHE BOOL "" FORCE)
+set(SDL_AUDIO ON CACHE BOOL "" FORCE)
+set(SDL_JOYSTICK ON CACHE BOOL "" FORCE)
+set(SDL_HIDAPI ON CACHE BOOL "" FORCE)
 
 # SDL's native file dialog, used by the Library page's Browse buttons.
 #
@@ -298,17 +301,13 @@ set(SDL_DIALOG ON CACHE BOOL "" FORCE)
 
 # Disable everything nonessential.
 #
-# NOTE: SDL_AUDIO and SDL_JOYSTICK are currently off, which means the emulator
-# has no audio output and no gamepad input on any platform. See docs/BUILDING.md
-# for how to re-enable them; they are left off here to preserve the existing
-# build configuration.
+# Audio, joystick, and HIDAPI are enabled above because the emulator has an
+# audio output path and reads gamepads; the rest of the optional subsystems are
+# still off to keep the build small.
 foreach (sdl_option
-        SDL_AUDIO
-        SDL_JOYSTICK
         SDL_HAPTIC
         SDL_SENSOR
         SDL_POWER
-        SDL_HIDAPI
         SDL_CAMERA
         SDL_GPU
         SDL_STORAGE
@@ -339,13 +338,16 @@ add_library(CompoundCore OBJECT
         src/core/errors.c
         src/core/memory/memory.c
         src/core/memory/guest_memory.c
+        src/core/memory/arena.c
         src/core/memory/pool_allocator.c
         src/core/memory/slab_allocator.c
         src/core/jit/jit_cache.c
         src/core/jit/jit_metadata.c
         src/core/jit/jit_execution.c
         src/core/crypto/sha256.c
+        src/core/crypto/rsa.c
         src/core/fs/fs_reader.c
+        src/core/fs/file_reader.c
         src/core/fs/keys.c
         src/core/fs/pfs0.c
         src/core/fs/hfs0.c
@@ -369,6 +371,10 @@ add_library(CompoundCore OBJECT
         src/core/loader/boot/boot.c
         src/core/log.c
         src/core/safe_math.c
+        src/core/validation.c
+        src/core/platform/input.c
+        src/core/platform/audio.c
+        src/core/platform/services.c
 )
 target_include_directories(CompoundCore PUBLIC src/core)
 target_link_libraries(CompoundCore PRIVATE ${POUND_MIMALLOC_TARGET} Threads::Threads)

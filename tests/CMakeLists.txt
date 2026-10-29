@@ -33,6 +33,9 @@ set(POUND_TEST_SUITES
         fs_reader
         file_reader
         loader
+        input
+        audio
+        platform_services
         keys
         pfs0
         hfs0
@@ -63,6 +66,9 @@ set(POUND_TEST_SOURCES
         test_fs.c
         test_file_reader.c
         test_loader.c
+        test_input.c
+        test_audio.c
+        test_platform_services.c
         test_hfs0.c
         test_jit_metadata.c
         test_jit_execution.c
