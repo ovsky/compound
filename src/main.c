@@ -4,6 +4,9 @@
 #include "gpu/vulkan/vulkan_backend.h"
 #include "loader/title_loader.h"
 #include "loader/boot/boot.h"
+#include "platform/audio.h"
+#include "platform/input.h"
+#include "platform/services.h"
 
 #include <SDL3/SDL.h>
 
@@ -61,6 +64,23 @@ typedef struct
     char          pad[5];
 } app_t;
 
+/// Host services the event loop owns: input, audio, and lifecycle state.
+///
+/// Kept beside `app_t` rather than inside it so the large GUI plugin and the
+/// per-frame runtime state stay independent: `app_t` is about the window and
+/// hot-reloaded UI, this is about what the emulator is doing.
+typedef struct
+{
+    pound_platform_services_t services;
+    pound_input_state_t       input;
+    pound_audio_t             audio;
+    SDL_AudioStream          *audio_stream;
+    SDL_Gamepad              *gamepad;
+    uint32_t                  gamepad_count;
+    bool                      audio_ready;
+    char                      pad[3];
+} app_runtime_t;
+
 static bool app_video_init(app_t *app);
 static bool app_video_shutdown(app_t *app);
 static bool app_gui_init(app_t *app);
@@ -73,7 +93,15 @@ static bool app_hot_reload_shutdown(app_t *app);
 #if !POUND_PLATFORM_SUPPORTS_HOT_RELOAD
 static bool app_gui_bind_static(app_t *app);
 #endif // !POUND_PLATFORM_SUPPORTS_HOT_RELOAD
-static void app_poll_events(app_t *app);
+static void app_runtime_init(app_runtime_t *runtime);
+static void app_runtime_shutdown(app_runtime_t *runtime);
+static bool app_audio_start(app_runtime_t *runtime);
+static void app_audio_stop(app_runtime_t *runtime);
+static void app_gamepad_scan(app_runtime_t *runtime);
+static void app_gamepad_close(app_runtime_t *runtime);
+static void app_poll_keyboard(app_runtime_t *runtime);
+static void app_poll_gamepad(app_runtime_t *runtime);
+static void app_poll_events(app_t *app, app_runtime_t *runtime);
 static void app_render_frame(app_t *app);
 static void app_render_frozen_overlay(app_t *app);
 static void app_memory_churn(void);
