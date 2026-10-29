@@ -539,7 +539,7 @@ pound_boot_shutdown(pound_boot_state_t *POUND_RESTRICT state)
 const guest_state_t *
 pound_boot_get_guest_state(const pound_boot_state_t *POUND_RESTRICT state)
 {
-    if ((NULL == state) || !state->initialized) 
+    if ((NULL == state) || !state->initialized)
     {
         return NULL;
     }
