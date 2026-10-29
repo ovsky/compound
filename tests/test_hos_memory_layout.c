@@ -234,7 +234,7 @@ POUND_TEST(hos_memory_layout, map_carves_free_space_and_splits_around_it)
     POUND_CHECK_EQ_U64(g_layout.regions[0].base, LAYOUT_GUEST_BASE);
     POUND_CHECK_EQ_U64(g_layout.regions[0].state, HOS_MEMORY_STATE_CODE);
 
-    // ... and the code page is executable and readable but not writable.
+    // The code page is executable and readable but not writable.
     POUND_CHECK_PTR_NON_NULL(guest_memory_translate_execute(&g_memory_region, LAYOUT_GUEST_BASE, &bytes));
     POUND_CHECK_PTR_NULL(guest_memory_translate_write(&g_memory_region, LAYOUT_GUEST_BASE, &bytes));
 }
