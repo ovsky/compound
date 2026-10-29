@@ -623,6 +623,78 @@ app_poll_gamepad(app_runtime_t *runtime)
     (void)pound_input_set_button(&runtime->input, POUND_INPUT_BUTTON_ZR, zr > 8192);
 }
 
+/// Maps SDL's positional gamepad buttons to Switch's labelled buttons.
+///
+/// SDL names the diamond by position (south/east/west/north) because Nintendo
+/// and Xbox disagree about where A is. Switch's A is the east face button and B
+/// is the south one, so the mapping is deliberately not south-to-A.
+static void
+app_gamepad_button(app_runtime_t *runtime, const Uint8 button, const bool pressed)
+{
+    if (NULL == runtime)
+    {
+        return;
+    }
+
+    pound_input_button_t target;
+
+    switch ((SDL_GamepadButton)button)
+    {
+        case SDL_GAMEPAD_BUTTON_SOUTH:
+            target = POUND_INPUT_BUTTON_B;
+            break;
+        case SDL_GAMEPAD_BUTTON_EAST:
+            target = POUND_INPUT_BUTTON_A;
+            break;
+        case SDL_GAMEPAD_BUTTON_WEST:
+            target = POUND_INPUT_BUTTON_X;
+            break;
+        case SDL_GAMEPAD_BUTTON_NORTH:
+            target = POUND_INPUT_BUTTON_Y;
+            break;
+        case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER:
+            target = POUND_INPUT_BUTTON_L;
+            break;
+        case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER:
+            target = POUND_INPUT_BUTTON_R;
+            break;
+        case SDL_GAMEPAD_BUTTON_BACK:
+            target = POUND_INPUT_BUTTON_MINUS;
+            break;
+        case SDL_GAMEPAD_BUTTON_START:
+            target = POUND_INPUT_BUTTON_PLUS;
+            break;
+        case SDL_GAMEPAD_BUTTON_GUIDE:
+            target = POUND_INPUT_BUTTON_HOME;
+            break;
+        case SDL_GAMEPAD_BUTTON_MISC1:
+            target = POUND_INPUT_BUTTON_CAPTURE;
+            break;
+        case SDL_GAMEPAD_BUTTON_DPAD_UP:
+            target = POUND_INPUT_BUTTON_DPAD_UP;
+            break;
+        case SDL_GAMEPAD_BUTTON_DPAD_DOWN:
+            target = POUND_INPUT_BUTTON_DPAD_DOWN;
+            break;
+        case SDL_GAMEPAD_BUTTON_DPAD_LEFT:
+            target = POUND_INPUT_BUTTON_DPAD_LEFT;
+            break;
+        case SDL_GAMEPAD_BUTTON_DPAD_RIGHT:
+            target = POUND_INPUT_BUTTON_DPAD_RIGHT;
+            break;
+        case SDL_GAMEPAD_BUTTON_LEFT_STICK:
+            target = POUND_INPUT_BUTTON_STICK_LEFT;
+            break;
+        case SDL_GAMEPAD_BUTTON_RIGHT_STICK:
+            target = POUND_INPUT_BUTTON_STICK_RIGHT;
+            break;
+        default:
+            return;
+    }
+
+    (void)pound_input_set_button(&runtime->input, target, pressed);
+}
+
 // -----------------------------------------------------------------------------
 // Video
 // -----------------------------------------------------------------------------
@@ -1315,7 +1387,7 @@ app_hot_reload_shutdown(app_t *app)
 // -----------------------------------------------------------------------------
 
 static void
-app_poll_events(app_t *app)
+app_poll_events(app_t *app, app_runtime_t *runtime)
 {
     if (NULL == app)
     {
@@ -1340,6 +1412,10 @@ app_poll_events(app_t *app)
             case SDL_EVENT_QUIT: {
                 POUND_LOG_INFO(&thread_logger, "Received SDL quit event.");
                 app->running = false;
+                if (NULL != runtime)
+                {
+                    pound_platform_services_request_shutdown(&runtime->services);
+                }
                 break;
             }
 
@@ -1348,6 +1424,10 @@ app_poll_events(app_t *app)
                 {
                     POUND_LOG_INFO(&thread_logger, "Received window close request.");
                     app->running = false;
+                    if (NULL != runtime)
+                    {
+                        pound_platform_services_request_shutdown(&runtime->services);
+                    }
                 }
                 break;
             }
@@ -1361,10 +1441,47 @@ app_poll_events(app_t *app)
                 break;
             }
 
+            case SDL_EVENT_GAMEPAD_ADDED: {
+                if (NULL != runtime)
+                {
+                    POUND_LOG_INFO(&thread_logger, "A gamepad was added; rescanning.");
+                    app_gamepad_scan(runtime);
+                }
+                break;
+            }
+
+            case SDL_EVENT_GAMEPAD_REMOVED: {
+                if ((NULL != runtime) && (NULL != runtime->gamepad)
+                    && (event.gdevice.which == SDL_GetGamepadID(runtime->gamepad)))
+                {
+                    POUND_LOG_INFO(&thread_logger, "The active gamepad was removed.");
+                    app_gamepad_scan(runtime);
+                }
+                break;
+            }
+
+            case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+            case SDL_EVENT_GAMEPAD_BUTTON_UP: {
+                if ((NULL != runtime) && (NULL != runtime->gamepad)
+                    && (event.gbutton.which == SDL_GetGamepadID(runtime->gamepad)))
+                {
+                    app_gamepad_button(runtime,
+                                       event.gbutton.button,
+                                       SDL_EVENT_GAMEPAD_BUTTON_DOWN == event.type);
+                }
+                break;
+            }
+
             default: {
                 break;
             }
         }
+    }
+
+    if (NULL != runtime)
+    {
+        app_poll_keyboard(runtime);
+        app_poll_gamepad(runtime);
     }
 }
 
