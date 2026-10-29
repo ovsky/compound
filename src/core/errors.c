@@ -57,6 +57,12 @@ pound_error_to_string(error_t error)
         case POUND_ERROR_HASH_MISMATCH:
             return "POUND_ERROR_HASH_MISMATCH";
 
+        case POUND_ERROR_SIGNATURE_INVALID:
+            return "POUND_ERROR_SIGNATURE_INVALID";
+
+        case POUND_ERROR_UNSUPPORTED_FEATURE:
+            return "POUND_ERROR_UNSUPPORTED_FEATURE";
+
         case POUND_ERROR_MALFORMED_HEADER:
             return "POUND_ERROR_MALFORMED_HEADER";
 
