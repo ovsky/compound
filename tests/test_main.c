@@ -13,15 +13,23 @@
 #include <string.h>
 
 void pound_register_safe_math_tests(void);
+void pound_register_validation_tests(void);
 void pound_register_guest_memory_tests(void);
 void pound_register_guest_state_tests(void);
 void pound_register_memory_tests(void);
+void pound_register_arena_tests(void);
 void pound_register_pool_allocator_tests(void);
 void pound_register_mutex_tests(void);
 void pound_register_slab_allocator_tests(void);
 void pound_register_jit_cache_tests(void);
 void pound_register_sha256_tests(void);
+void pound_register_rsa_tests(void);
 void pound_register_fs_reader_tests(void);
+void pound_register_file_reader_tests(void);
+void pound_register_loader_tests(void);
+void pound_register_input_tests(void);
+void pound_register_audio_tests(void);
+void pound_register_platform_services_tests(void);
 void pound_register_keys_tests(void);
 void pound_register_pfs0_tests(void);
 void pound_register_hfs0_tests(void);
@@ -75,15 +83,23 @@ main(int argc, char **argv)
     }
 
     pound_register_safe_math_tests();
+    pound_register_validation_tests();
     pound_register_guest_memory_tests();
     pound_register_guest_state_tests();
     pound_register_memory_tests();
+    pound_register_arena_tests();
     pound_register_pool_allocator_tests();
     pound_register_mutex_tests();
     pound_register_slab_allocator_tests();
     pound_register_jit_cache_tests();
     pound_register_sha256_tests();
+    pound_register_rsa_tests();
     pound_register_fs_reader_tests();
+    pound_register_file_reader_tests();
+    pound_register_loader_tests();
+    pound_register_input_tests();
+    pound_register_audio_tests();
+    pound_register_platform_services_tests();
     pound_register_keys_tests();
     pound_register_pfs0_tests();
     pound_register_hfs0_tests();

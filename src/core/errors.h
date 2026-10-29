@@ -69,6 +69,25 @@ typedef enum
     /// A partition's SHA-256 did not match the hash recorded in its header.
     POUND_ERROR_HASH_MISMATCH,
 
+    /// A cryptographic signature did not verify against the supplied key.
+    ///
+    /// Distinct from `POUND_ERROR_HASH_MISMATCH`, which reports that the bytes
+    /// changed after they were hashed. A signature failure can also mean the
+    /// wrong key was supplied, or that a well-formed signature belongs to a
+    /// different message; neither is evidence that the payload itself is
+    /// corrupt, and a caller deciding whether to re-prompt for keys needs to
+    /// tell the two apart.
+    POUND_ERROR_SIGNATURE_INVALID,
+
+    /// A recognised format uses a feature Compound does not implement.
+    ///
+    /// Distinct from `POUND_ERROR_UNSUPPORTED_FORMAT`: the bytes matched a
+    /// container Compound knows, but the container needs something this build
+    /// cannot honestly provide -- encrypted content without keys, LZ4-compressed
+    /// NSO segments, or a title package that is not an executable image. The
+    /// loader refuses instead of guessing at the missing step.
+    POUND_ERROR_UNSUPPORTED_FEATURE,
+
     /// A header field held a value outside its documented range.
     POUND_ERROR_MALFORMED_HEADER,
 

@@ -4,6 +4,9 @@
 #include "gpu/vulkan/vulkan_backend.h"
 #include "loader/title_loader.h"
 #include "loader/boot/boot.h"
+#include "platform/audio.h"
+#include "platform/input.h"
+#include "platform/services.h"
 
 #include <SDL3/SDL.h>
 
@@ -61,6 +64,23 @@ typedef struct
     char          pad[5];
 } app_t;
 
+/// Host services the event loop owns: input, audio, and lifecycle state.
+///
+/// Kept beside `app_t` rather than inside it so the large GUI plugin and the
+/// per-frame runtime state stay independent: `app_t` is about the window and
+/// hot-reloaded UI, this is about what the emulator is doing.
+typedef struct
+{
+    pound_platform_services_t services;
+    pound_input_state_t       input;
+    pound_audio_t             audio;
+    SDL_AudioStream          *audio_stream;
+    SDL_Gamepad              *gamepad;
+    uint32_t                  gamepad_count;
+    bool                      audio_ready;
+    char                      pad[3];
+} app_runtime_t;
+
 static bool app_video_init(app_t *app);
 static bool app_video_shutdown(app_t *app);
 static bool app_gui_init(app_t *app);
@@ -73,7 +93,15 @@ static bool app_hot_reload_shutdown(app_t *app);
 #if !POUND_PLATFORM_SUPPORTS_HOT_RELOAD
 static bool app_gui_bind_static(app_t *app);
 #endif // !POUND_PLATFORM_SUPPORTS_HOT_RELOAD
-static void app_poll_events(app_t *app);
+static void app_runtime_init(app_runtime_t *runtime);
+static void app_runtime_shutdown(app_runtime_t *runtime);
+static bool app_audio_start(app_runtime_t *runtime);
+static void app_audio_stop(app_runtime_t *runtime);
+static void app_gamepad_scan(app_runtime_t *runtime);
+static void app_gamepad_close(app_runtime_t *runtime);
+static void app_poll_keyboard(app_runtime_t *runtime);
+static void app_poll_gamepad(app_runtime_t *runtime);
+static void app_poll_events(app_t *app, app_runtime_t *runtime);
 static void app_render_frame(app_t *app);
 static void app_render_frozen_overlay(app_t *app);
 static void app_memory_churn(void);
@@ -163,15 +191,60 @@ main(int argc, char *argv[])
         POUND_LOG_WARN(&thread_logger, "Window was shown but remains hidden, continuing anyway.");
     }
 
+    app_runtime_t runtime;
+    app_runtime_init(&runtime);
+
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO))
+    {
+        (void)app_audio_start(&runtime);
+    }
+    else
+    {
+        POUND_LOG_WARN(&thread_logger, "Audio is unavailable because %s.", SDL_GetError());
+    }
+
+    if (SDL_InitSubSystem(SDL_INIT_GAMEPAD))
+    {
+        (void)pound_platform_services_set_capability(
+            &runtime.services, POUND_PLATFORM_CAPABILITY_GAMEPADS, true);
+        app_gamepad_scan(&runtime);
+    }
+    else
+    {
+        POUND_LOG_WARN(&thread_logger, "Gamepad input is unavailable because %s.", SDL_GetError());
+    }
+
     POUND_LOG_INFO(&thread_logger, "Starting main loop on %s.", POUND_PLATFORM_NAME);
     if (argc > 1)
     {
         pound_title_info_t title_info;
-        if (pound_title_detect(argv[1], &title_info) == POUND_SUCCESS)
+        const error_t detect_error = pound_title_detect(argv[1], &title_info);
+        if (POUND_SUCCESS == detect_error)
         {
-            (void)pound_title_load(&title_info);
-            (void)pound_boot_load_title(&boot_state, &title_info);
-            (void)pound_boot_start(&boot_state);
+            const error_t load_error = pound_title_load(&title_info);
+            if (POUND_SUCCESS == load_error)
+            {
+                const error_t boot_error = pound_boot_load_title(&boot_state, &title_info);
+                if (POUND_SUCCESS == boot_error)
+                {
+                    (void)pound_boot_start(&boot_state);
+                }
+                else
+                {
+                    POUND_LOG_ERROR(&thread_logger, "Boot refused the title: %s.",
+                                    pound_error_to_string(boot_error));
+                }
+            }
+            else
+            {
+                POUND_LOG_ERROR(&thread_logger, "Loading the title failed: %s.",
+                                pound_error_to_string(load_error));
+            }
+        }
+        else
+        {
+            POUND_LOG_ERROR(&thread_logger, "Detecting %s failed: %s.", argv[1],
+                            pound_error_to_string(detect_error));
         }
     }
 
@@ -183,11 +256,12 @@ main(int argc, char *argv[])
         POUND_LOG_INFO(&thread_logger, "Memory tracker self-test enabled (--selftest-memory).");
     }
 
-    while (app.running)
+    while (app.running && !pound_platform_services_should_shutdown(&runtime.services))
     {
         const uint64_t frame_start = SDL_GetTicks();
 
-        app_poll_events(&app);
+        app_poll_events(&app, &runtime);
+        (void)pound_platform_services_tick(&runtime.services, SDL_GetTicks());
 
         if (run_memory_selftest)
         {
@@ -198,6 +272,8 @@ main(int argc, char *argv[])
         app_frame_limit(frame_start);
     }
 
+    app_runtime_shutdown(&runtime);
+    pound_boot_shutdown(&boot_state);
     app_gui_shutdown(&app);
     app_video_shutdown(&app);
     if (vulkan_backend != NULL)
@@ -208,6 +284,415 @@ main(int argc, char *argv[])
     SDL_Quit();
 
     return EXIT_SUCCESS;
+}
+
+// -----------------------------------------------------------------------------
+// Platform services: audio, gamepads, keyboard
+// -----------------------------------------------------------------------------
+
+static void
+app_runtime_init(app_runtime_t *runtime)
+{
+    if (NULL == runtime)
+    {
+        return;
+    }
+
+    memset(runtime, 0, sizeof(*runtime));
+    pound_input_init(&runtime->input);
+
+    if (POUND_SUCCESS != pound_platform_services_init(&runtime->services, SDL_GetTicks(), 60U))
+    {
+        POUND_LOG_ERROR(&thread_logger, "Platform services did not initialise; using defaults.");
+    }
+
+    (void)pound_platform_services_set_capability(
+        &runtime->services, POUND_PLATFORM_CAPABILITY_KEYBOARD, true);
+}
+
+static void
+app_runtime_shutdown(app_runtime_t *runtime)
+{
+    if (NULL == runtime)
+    {
+        return;
+    }
+
+    app_audio_stop(runtime);
+    app_gamepad_close(runtime);
+    pound_platform_services_shutdown(&runtime->services);
+    memset(runtime, 0, sizeof(*runtime));
+}
+
+/// SDL audio thread callback: drain the core ring and pad an underrun with
+/// silence.
+///
+/// The ring is allowed to be empty; SDL wants exactly the requested number of
+/// bytes, and returning fewer causes a device underrun. Filling the tail with
+/// zeros is the correct sound for "the guest has not produced audio yet".
+static void SDLCALL
+app_audio_callback(void *userdata, SDL_AudioStream *stream, const int additional_amount,
+                   const int total_amount)
+{
+    POUND_UNUSED(total_amount);
+
+    if ((NULL == stream) || (additional_amount <= 0))
+    {
+        return;
+    }
+
+    pound_audio_t *audio = (pound_audio_t *)userdata;
+    int16_t        samples[1024U * 2U];
+    int            remaining = additional_amount;
+
+    while (remaining > 0)
+    {
+        const int frames_per_chunk = (int)(sizeof(samples) / (2U * sizeof(int16_t)));
+        int       frames           = remaining / (int)(2U * sizeof(int16_t));
+
+        if (frames > frames_per_chunk)
+        {
+            frames = frames_per_chunk;
+        }
+
+        if (frames <= 0)
+        {
+            // Fewer than one frame left; SDL normally only asks for whole
+            // frames, so drop the remainder rather than writing a torn sample.
+            break;
+        }
+
+        size_t got = 0U;
+        if (NULL != audio)
+        {
+            got = pound_audio_read(audio, samples, (size_t)frames);
+        }
+
+        if (got < (size_t)frames)
+        {
+            memset(samples + (got * 2U), 0, ((size_t)frames - got) * 2U * sizeof(int16_t));
+        }
+
+        if (!SDL_PutAudioStreamData(stream, samples, frames * (int)(2U * sizeof(int16_t))))
+        {
+            POUND_LOG_ERROR(&thread_logger, "Queueing audio to SDL failed because %s.", SDL_GetError());
+            break;
+        }
+
+        remaining -= frames * (int)(2U * sizeof(int16_t));
+    }
+}
+
+static bool
+app_audio_start(app_runtime_t *runtime)
+{
+    if (NULL == runtime)
+    {
+        return false;
+    }
+
+    if (POUND_SUCCESS
+        != pound_audio_init(&runtime->audio, 48000U, 2U, 4096U))
+    {
+        POUND_LOG_ERROR(&thread_logger, "The core audio ring could not be created.");
+        return false;
+    }
+
+    const SDL_AudioSpec spec = {
+        .format   = SDL_AUDIO_S16,
+        .channels = 2,
+        .freq     = 48000,
+    };
+
+    runtime->audio_stream = SDL_OpenAudioDeviceStream(
+        SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, app_audio_callback, &runtime->audio);
+
+    if (NULL == runtime->audio_stream)
+    {
+        POUND_LOG_WARN(&thread_logger, "Opening the default audio device failed because %s.",
+                       SDL_GetError());
+        pound_audio_shutdown(&runtime->audio);
+        return false;
+    }
+
+    if (!SDL_ResumeAudioStreamDevice(runtime->audio_stream))
+    {
+        POUND_LOG_WARN(&thread_logger, "Resuming the audio device failed because %s.", SDL_GetError());
+        SDL_DestroyAudioStream(runtime->audio_stream);
+        runtime->audio_stream = NULL;
+        pound_audio_shutdown(&runtime->audio);
+        return false;
+    }
+
+    runtime->audio_ready = true;
+    (void)pound_platform_services_set_capability(
+        &runtime->services, POUND_PLATFORM_CAPABILITY_AUDIO_OUTPUT, true);
+
+    POUND_LOG_INFO(&thread_logger, "Audio output opened at 48000 Hz, stereo S16.");
+    return true;
+}
+
+static void
+app_audio_stop(app_runtime_t *runtime)
+{
+    if (NULL == runtime)
+    {
+        return;
+    }
+
+    if (NULL != runtime->audio_stream)
+    {
+        SDL_DestroyAudioStream(runtime->audio_stream);
+        runtime->audio_stream = NULL;
+    }
+
+    if (runtime->audio_ready)
+    {
+        pound_audio_shutdown(&runtime->audio);
+        runtime->audio_ready = false;
+    }
+}
+
+static void
+app_gamepad_close(app_runtime_t *runtime)
+{
+    if (NULL == runtime)
+    {
+        return;
+    }
+
+    if (NULL != runtime->gamepad)
+    {
+        SDL_CloseGamepad(runtime->gamepad);
+        runtime->gamepad = NULL;
+    }
+
+    runtime->gamepad_count = 0U;
+    pound_input_set_connected(&runtime->input, false);
+    pound_input_clear(&runtime->input);
+    (void)pound_platform_services_set_gamepad_count(&runtime->services, 0U);
+}
+
+/// Closes any open gamepad and opens the first one SDL reports.
+///
+/// Compound currently exposes one guest controller. Counting every attached
+/// gamepad is still useful to the UI, and is reported separately, but opening
+/// more than one would create a second source of buttons with no guest object
+/// to route them to.
+static void
+app_gamepad_scan(app_runtime_t *runtime)
+{
+    if (NULL == runtime)
+    {
+        return;
+    }
+
+    app_gamepad_close(runtime);
+
+    int             count = 0;
+    SDL_JoystickID *ids   = SDL_GetGamepads(&count);
+
+    if (NULL != ids)
+    {
+        uint32_t gamepads = 0U;
+
+        for (int index = 0; index < count; ++index)
+        {
+            if (!SDL_IsGamepad(ids[index]))
+            {
+                continue;
+            }
+
+            ++gamepads;
+
+            if (NULL == runtime->gamepad)
+            {
+                runtime->gamepad = SDL_OpenGamepad(ids[index]);
+
+                if (NULL == runtime->gamepad)
+                {
+                    POUND_LOG_WARN(&thread_logger, "Opening a gamepad failed because %s.",
+                                   SDL_GetError());
+                }
+                else
+                {
+                    const char *name = SDL_GetGamepadName(runtime->gamepad);
+                    POUND_LOG_INFO(&thread_logger, "Gamepad connected: %s.",
+                                   (NULL != name) ? name : "unnamed");
+                }
+            }
+        }
+
+        SDL_free(ids);
+
+        runtime->gamepad_count = (gamepads > POUND_PLATFORM_MAX_GAMEPADS)
+                                   ? POUND_PLATFORM_MAX_GAMEPADS
+                                   : gamepads;
+        (void)pound_platform_services_set_gamepad_count(&runtime->services,
+                                                        runtime->gamepad_count);
+    }
+
+    pound_input_set_connected(&runtime->input, NULL != runtime->gamepad);
+}
+
+static void
+app_poll_keyboard(app_runtime_t *runtime)
+{
+    if ((NULL == runtime) || (NULL != runtime->gamepad))
+    {
+        return;
+    }
+
+    const bool *keys = SDL_GetKeyboardState(NULL);
+    if (NULL == keys)
+    {
+        return;
+    }
+
+    const struct
+    {
+        SDL_Scancode        scancode;
+        pound_input_button_t button;
+    } bindings[] = {
+        { SDL_SCANCODE_Z, POUND_INPUT_BUTTON_A },
+        { SDL_SCANCODE_X, POUND_INPUT_BUTTON_B },
+        { SDL_SCANCODE_C, POUND_INPUT_BUTTON_X },
+        { SDL_SCANCODE_V, POUND_INPUT_BUTTON_Y },
+        { SDL_SCANCODE_Q, POUND_INPUT_BUTTON_L },
+        { SDL_SCANCODE_E, POUND_INPUT_BUTTON_R },
+        { SDL_SCANCODE_1, POUND_INPUT_BUTTON_ZL },
+        { SDL_SCANCODE_3, POUND_INPUT_BUTTON_ZR },
+        { SDL_SCANCODE_RETURN, POUND_INPUT_BUTTON_PLUS },
+        { SDL_SCANCODE_BACKSPACE, POUND_INPUT_BUTTON_MINUS },
+        { SDL_SCANCODE_M, POUND_INPUT_BUTTON_HOME },
+        { SDL_SCANCODE_P, POUND_INPUT_BUTTON_CAPTURE },
+        { SDL_SCANCODE_UP, POUND_INPUT_BUTTON_DPAD_UP },
+        { SDL_SCANCODE_DOWN, POUND_INPUT_BUTTON_DPAD_DOWN },
+        { SDL_SCANCODE_LEFT, POUND_INPUT_BUTTON_DPAD_LEFT },
+        { SDL_SCANCODE_RIGHT, POUND_INPUT_BUTTON_DPAD_RIGHT },
+        { SDL_SCANCODE_T, POUND_INPUT_BUTTON_STICK_LEFT },
+        { SDL_SCANCODE_G, POUND_INPUT_BUTTON_STICK_RIGHT },
+    };
+
+    bool active = false;
+
+    for (size_t index = 0U; index < (sizeof(bindings) / sizeof(bindings[0])); ++index)
+    {
+        const bool pressed = keys[bindings[index].scancode];
+        (void)pound_input_set_button(&runtime->input, bindings[index].button, pressed);
+        active = active || pressed;
+    }
+
+    const float left_x = (keys[SDL_SCANCODE_D] ? 1.0f : 0.0f) - (keys[SDL_SCANCODE_A] ? 1.0f : 0.0f);
+    const float left_y = (keys[SDL_SCANCODE_W] ? 1.0f : 0.0f) - (keys[SDL_SCANCODE_S] ? 1.0f : 0.0f);
+    const float right_x = (keys[SDL_SCANCODE_L] ? 1.0f : 0.0f) - (keys[SDL_SCANCODE_J] ? 1.0f : 0.0f);
+    const float right_y = (keys[SDL_SCANCODE_I] ? 1.0f : 0.0f) - (keys[SDL_SCANCODE_K] ? 1.0f : 0.0f);
+
+    (void)pound_input_set_stick(&runtime->input, POUND_INPUT_STICK_LEFT, left_x, left_y);
+    (void)pound_input_set_stick(&runtime->input, POUND_INPUT_STICK_RIGHT, right_x, right_y);
+
+    active = active || (left_x != 0.0f) || (left_y != 0.0f) || (right_x != 0.0f) || (right_y != 0.0f);
+    pound_input_set_keyboard_active(&runtime->input, active);
+}
+
+static void
+app_poll_gamepad(app_runtime_t *runtime)
+{
+    if ((NULL == runtime) || (NULL == runtime->gamepad))
+    {
+        return;
+    }
+
+    const float left_x = (float)SDL_GetGamepadAxis(runtime->gamepad, SDL_GAMEPAD_AXIS_LEFTX)
+                       / (float)POUND_INPUT_AXIS_MAX;
+    const float left_y = (float)SDL_GetGamepadAxis(runtime->gamepad, SDL_GAMEPAD_AXIS_LEFTY)
+                       / (float)POUND_INPUT_AXIS_MAX;
+    const float right_x = (float)SDL_GetGamepadAxis(runtime->gamepad, SDL_GAMEPAD_AXIS_RIGHTX)
+                        / (float)POUND_INPUT_AXIS_MAX;
+    const float right_y = (float)SDL_GetGamepadAxis(runtime->gamepad, SDL_GAMEPAD_AXIS_RIGHTY)
+                        / (float)POUND_INPUT_AXIS_MAX;
+
+    // SDL's Y axis grows downward; Horizon's grows upward.
+    (void)pound_input_set_stick(&runtime->input, POUND_INPUT_STICK_LEFT, left_x, -left_y);
+    (void)pound_input_set_stick(&runtime->input, POUND_INPUT_STICK_RIGHT, right_x, -right_y);
+
+    const Sint16 zl = SDL_GetGamepadAxis(runtime->gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
+    const Sint16 zr = SDL_GetGamepadAxis(runtime->gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
+
+    (void)pound_input_set_button(&runtime->input, POUND_INPUT_BUTTON_ZL, zl > 8192);
+    (void)pound_input_set_button(&runtime->input, POUND_INPUT_BUTTON_ZR, zr > 8192);
+}
+
+/// Maps SDL's positional gamepad buttons to Switch's labelled buttons.
+///
+/// SDL names the diamond by position (south/east/west/north) because Nintendo
+/// and Xbox disagree about where A is. Switch's A is the east face button and B
+/// is the south one, so the mapping is deliberately not south-to-A.
+static void
+app_gamepad_button(app_runtime_t *runtime, const Uint8 button, const bool pressed)
+{
+    if (NULL == runtime)
+    {
+        return;
+    }
+
+    pound_input_button_t target;
+
+    switch ((SDL_GamepadButton)button)
+    {
+        case SDL_GAMEPAD_BUTTON_SOUTH:
+            target = POUND_INPUT_BUTTON_B;
+            break;
+        case SDL_GAMEPAD_BUTTON_EAST:
+            target = POUND_INPUT_BUTTON_A;
+            break;
+        case SDL_GAMEPAD_BUTTON_WEST:
+            target = POUND_INPUT_BUTTON_X;
+            break;
+        case SDL_GAMEPAD_BUTTON_NORTH:
+            target = POUND_INPUT_BUTTON_Y;
+            break;
+        case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER:
+            target = POUND_INPUT_BUTTON_L;
+            break;
+        case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER:
+            target = POUND_INPUT_BUTTON_R;
+            break;
+        case SDL_GAMEPAD_BUTTON_BACK:
+            target = POUND_INPUT_BUTTON_MINUS;
+            break;
+        case SDL_GAMEPAD_BUTTON_START:
+            target = POUND_INPUT_BUTTON_PLUS;
+            break;
+        case SDL_GAMEPAD_BUTTON_GUIDE:
+            target = POUND_INPUT_BUTTON_HOME;
+            break;
+        case SDL_GAMEPAD_BUTTON_MISC1:
+            target = POUND_INPUT_BUTTON_CAPTURE;
+            break;
+        case SDL_GAMEPAD_BUTTON_DPAD_UP:
+            target = POUND_INPUT_BUTTON_DPAD_UP;
+            break;
+        case SDL_GAMEPAD_BUTTON_DPAD_DOWN:
+            target = POUND_INPUT_BUTTON_DPAD_DOWN;
+            break;
+        case SDL_GAMEPAD_BUTTON_DPAD_LEFT:
+            target = POUND_INPUT_BUTTON_DPAD_LEFT;
+            break;
+        case SDL_GAMEPAD_BUTTON_DPAD_RIGHT:
+            target = POUND_INPUT_BUTTON_DPAD_RIGHT;
+            break;
+        case SDL_GAMEPAD_BUTTON_LEFT_STICK:
+            target = POUND_INPUT_BUTTON_STICK_LEFT;
+            break;
+        case SDL_GAMEPAD_BUTTON_RIGHT_STICK:
+            target = POUND_INPUT_BUTTON_STICK_RIGHT;
+            break;
+        default:
+            return;
+    }
+
+    (void)pound_input_set_button(&runtime->input, target, pressed);
 }
 
 // -----------------------------------------------------------------------------
@@ -902,7 +1387,7 @@ app_hot_reload_shutdown(app_t *app)
 // -----------------------------------------------------------------------------
 
 static void
-app_poll_events(app_t *app)
+app_poll_events(app_t *app, app_runtime_t *runtime)
 {
     if (NULL == app)
     {
@@ -927,6 +1412,10 @@ app_poll_events(app_t *app)
             case SDL_EVENT_QUIT: {
                 POUND_LOG_INFO(&thread_logger, "Received SDL quit event.");
                 app->running = false;
+                if (NULL != runtime)
+                {
+                    pound_platform_services_request_shutdown(&runtime->services);
+                }
                 break;
             }
 
@@ -935,6 +1424,10 @@ app_poll_events(app_t *app)
                 {
                     POUND_LOG_INFO(&thread_logger, "Received window close request.");
                     app->running = false;
+                    if (NULL != runtime)
+                    {
+                        pound_platform_services_request_shutdown(&runtime->services);
+                    }
                 }
                 break;
             }
@@ -948,10 +1441,47 @@ app_poll_events(app_t *app)
                 break;
             }
 
+            case SDL_EVENT_GAMEPAD_ADDED: {
+                if (NULL != runtime)
+                {
+                    POUND_LOG_INFO(&thread_logger, "A gamepad was added; rescanning.");
+                    app_gamepad_scan(runtime);
+                }
+                break;
+            }
+
+            case SDL_EVENT_GAMEPAD_REMOVED: {
+                if ((NULL != runtime) && (NULL != runtime->gamepad)
+                    && (event.gdevice.which == SDL_GetGamepadID(runtime->gamepad)))
+                {
+                    POUND_LOG_INFO(&thread_logger, "The active gamepad was removed.");
+                    app_gamepad_scan(runtime);
+                }
+                break;
+            }
+
+            case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+            case SDL_EVENT_GAMEPAD_BUTTON_UP: {
+                if ((NULL != runtime) && (NULL != runtime->gamepad)
+                    && (event.gbutton.which == SDL_GetGamepadID(runtime->gamepad)))
+                {
+                    app_gamepad_button(runtime,
+                                       event.gbutton.button,
+                                       SDL_EVENT_GAMEPAD_BUTTON_DOWN == event.type);
+                }
+                break;
+            }
+
             default: {
                 break;
             }
         }
+    }
+
+    if (NULL != runtime)
+    {
+        app_poll_keyboard(runtime);
+        app_poll_gamepad(runtime);
     }
 }
 

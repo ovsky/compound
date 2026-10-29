@@ -19,15 +19,23 @@ endif ()
 
 set(POUND_TEST_SUITES
         safe_math
+        validation
         guest_memory
         guest_state
         memory
+        arena
         pool_allocator
         mutex
         slab_allocator
         jit_cache
         sha256
+        rsa
         fs_reader
+        file_reader
+        loader
+        input
+        audio
+        platform_services
         keys
         pfs0
         hfs0
@@ -45,14 +53,22 @@ set(POUND_TEST_SOURCES
         pound_test.c
         test_main.c
         test_safe_math.c
+        test_validation.c
         test_guest_memory.c
         test_guest_state.c
         test_memory.c
+        test_arena.c
         test_pool_allocator.c
         test_slab_allocator.c
         test_jit_cache.c
         test_sha256.c
+        test_rsa.c
         test_fs.c
+        test_file_reader.c
+        test_loader.c
+        test_input.c
+        test_audio.c
+        test_platform_services.c
         test_hfs0.c
         test_jit_metadata.c
         test_jit_execution.c
