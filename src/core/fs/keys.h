@@ -49,10 +49,17 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/// Length of every key Compound uses. All of the Switch and Switch 2 keys are AES-128, so
-/// a single fixed width is enough and avoids carrying a length around as a second
-/// source of truth that could disagree with the first.
+/// Length of the AES-128 keys that make up most of a key file.
+///
+/// This remains the size accepted by the original fixed-width API. A small number of
+/// keys -- most importantly `header_key`, which is two AES-128 keys used as one
+/// AES-256 XTS key -- are 32 bytes, so the store carries a per-entry length rather
+/// than assuming every key is one width.
 #define POUND_KEY_SIZE 16U
+
+/// Largest supported key, in bytes. An entry is never truncated to this size: a value
+/// longer than the store can represent is refused.
+#define POUND_KEY_MAX_SIZE 32U
 
 /// Capacity of a key's name, including the terminating NUL.
 ///
@@ -62,9 +69,10 @@
 /// rejecting a pathological name at load time instead of storing it.
 #define POUND_KEY_NAME_MAX 64U
 
-/// Number of characters a key's value occupies in the text file: two hex digits per
-/// byte, plus the terminating NUL.
-#define POUND_KEY_HEX_MAX (POUND_KEY_SIZE * 2U)
+/// Number of characters the longest key's value occupies in the text file: two hex
+/// digits per byte. A shorter value is accepted only when its length names a supported
+/// key size.
+#define POUND_KEY_HEX_MAX (POUND_KEY_MAX_SIZE * 2U)
 
 // --- Names of the keys Compound itself asks for by name -----------------------------
 //
@@ -83,14 +91,18 @@
 #define POUND_KEY_PACKAGE2_KEY "package2_key_00"
 
 /// Number of entries in the `master_key_NN` family.
-#define POUND_KEY_MASTER_KEY_COUNT 3U
+///
+/// A key file may contain more generations than Compound knows how to use. The bound
+/// says which indices this build will ask for; an out-of-range request is a programming
+/// error, not a cue to read an arbitrary name a user happened to define.
+#define POUND_KEY_MASTER_KEY_COUNT 7U
 
 /// Number of entries in the `key_area_key_application_NN` family.
-#define POUND_KEY_APPLICATION_KEY_AREA_COUNT 8U
+#define POUND_KEY_APPLICATION_KEY_AREA_COUNT 32U
 
 /// Number of entries in the `titlekek_NN` family, which is what titles on the newer
 /// hardware use in place of the application key area keys.
-#define POUND_KEY_TITLEKEK_COUNT 16U
+#define POUND_KEY_TITLEKEK_COUNT 32U
 
 /// One stored key.
 typedef struct
@@ -98,8 +110,15 @@ typedef struct
     /// Name, NUL-terminated. Never empty.
     char name[POUND_KEY_NAME_MAX];
 
-    /// The key itself.
-    uint8_t value[POUND_KEY_SIZE];
+    /// The key itself, in the first `size` bytes. Bytes past `size` are always zero.
+    uint8_t value[POUND_KEY_MAX_SIZE];
+
+    /// Number of valid bytes in `value`: 16 or 32 for every key format this build reads.
+    uint8_t size;
+
+    /// Explicit tail padding. `key_entry_t` is copied as raw storage when the array
+    /// grows, so every byte must have a defined value.
+    uint8_t pad[7];
 } key_entry_t;
 
 /// A set of keys supplied by the user.
@@ -141,6 +160,15 @@ void key_store_destroy(key_store_t *POUND_RESTRICT store);
 error_t key_store_add(key_store_t *POUND_RESTRICT store, const char *POUND_RESTRICT name,
                       const uint8_t *POUND_RESTRICT value);
 
+/// Inserts or replaces a key of an explicit length.
+///
+/// `size` must be 16 or 32. Those are the two widths the formats Compound reads use:
+/// one AES-128 key, or a pair of AES-128 keys consumed as one AES-256 XTS key. Any
+/// other length is refused with `POUND_ERROR_KEY_SIZE`; it is not rounded up, truncated,
+/// or padded.
+error_t key_store_add_sized(key_store_t *POUND_RESTRICT store, const char *POUND_RESTRICT name,
+                            const uint8_t *POUND_RESTRICT value, size_t size);
+
 /// Parses a key file's contents into `store`.
 ///
 /// `text` need not be NUL-terminated, so a file read through an `fs_reader_t` can be
@@ -171,6 +199,19 @@ error_t key_store_load_text(key_store_t *POUND_RESTRICT store, const char *POUND
 /// previous lookup.
 error_t key_store_get(const key_store_t *POUND_RESTRICT store, const char *POUND_RESTRICT name,
                       uint8_t out[POUND_KEY_SIZE]);
+
+/// Looks up a key of an explicit length.
+///
+/// Missing and wrong-sized are different errors. The key store is not allowed to make
+/// a 16-byte key satisfy a 32-byte request or to drop the second half of a 32-byte key:
+/// either would produce a plausible-looking decryption failure later, far from the file
+/// that caused it. A present key of the wrong length therefore reports
+/// `POUND_ERROR_KEY_SIZE`, and a missing one reports `POUND_ERROR_KEY_MISSING`.
+error_t key_store_get_sized(const key_store_t *POUND_RESTRICT store, const char *POUND_RESTRICT name,
+                            uint8_t *POUND_RESTRICT out, size_t size);
+
+/// Returns the stored length of `name` without copying its value.
+error_t key_store_get_size(const key_store_t *POUND_RESTRICT store, const char *POUND_RESTRICT name, size_t *out_size);
 
 /// Whether `name` is present, without copying the value out.
 bool key_store_has(const key_store_t *POUND_RESTRICT store, const char *POUND_RESTRICT name);

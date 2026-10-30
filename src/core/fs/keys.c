@@ -178,8 +178,8 @@ store_reserve(key_store_t *POUND_RESTRICT store, const size_t wanted)
 }
 
 error_t
-key_store_add(key_store_t *POUND_RESTRICT store, const char *POUND_RESTRICT name,
-              const uint8_t *POUND_RESTRICT value)
+key_store_add_sized(key_store_t *POUND_RESTRICT store, const char *POUND_RESTRICT name,
+                    const uint8_t *POUND_RESTRICT value, const size_t size)
 {
     if (POUND_UNLIKELY(NULL == store))
     {
@@ -191,6 +191,18 @@ key_store_add(key_store_t *POUND_RESTRICT store, const char *POUND_RESTRICT name
     {
         POUND_LOG_ERROR(&thread_logger, "Aborting function: a key was given an empty name.");
         return POUND_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (POUND_UNLIKELY((POUND_KEY_SIZE != size) && (POUND_KEY_MAX_SIZE != size)))
+    {
+        POUND_LOG_ERROR(&thread_logger,
+                        "Aborting function: the key '%s' was given a %zu-byte value, but a key "
+                        "is either %u or %u bytes.",
+                        name,
+                        size,
+                        POUND_KEY_SIZE,
+                        POUND_KEY_MAX_SIZE);
+        return POUND_ERROR_KEY_SIZE;
     }
 
     if (POUND_UNLIKELY(NULL == value))
@@ -230,8 +242,13 @@ key_store_add(key_store_t *POUND_RESTRICT store, const char *POUND_RESTRICT name
         if (0 == order)
         {
             // A later line in the file replaces an earlier one, so appending a
-            // corrected key to an existing file behaves the way a user expects.
-            memcpy(store->entries[middle].value, value, POUND_KEY_SIZE);
+            // corrected key to an existing file behaves the way a user expects. The
+            // whole value buffer is cleared first: a 32-byte key replaced by a 16-byte
+            // one must not leave the old second half sitting in the entry, where a
+            // future bug that ignored `size` could read it as part of the new key.
+            memset(store->entries[middle].value, 0, sizeof(store->entries[middle].value));
+            memcpy(store->entries[middle].value, value, size);
+            store->entries[middle].size = (uint8_t)size;
             return POUND_SUCCESS;
         }
 
@@ -267,11 +284,21 @@ key_store_add(key_store_t *POUND_RESTRICT store, const char *POUND_RESTRICT name
     memcpy(store->entries[low].name, name, name_length + 1U);
     memset(store->entries[low].name + (name_length + 1U), 0, POUND_KEY_NAME_MAX - (name_length + 1U));
 
-    memcpy(store->entries[low].value, value, POUND_KEY_SIZE);
+    memset(store->entries[low].value, 0, sizeof(store->entries[low].value));
+    memset(store->entries[low].pad, 0, sizeof(store->entries[low].pad));
+    memcpy(store->entries[low].value, value, size);
+    store->entries[low].size = (uint8_t)size;
 
     ++store->count;
 
     return POUND_SUCCESS;
+}
+
+error_t
+key_store_add(key_store_t *POUND_RESTRICT store, const char *POUND_RESTRICT name,
+              const uint8_t *POUND_RESTRICT value)
+{
+    return key_store_add_sized(store, name, value, POUND_KEY_SIZE);
 }
 
 /// Parses one line, reporting whether it was rejected.
@@ -374,22 +401,27 @@ parse_line(key_store_t *POUND_RESTRICT store, const char *POUND_RESTRICT line, c
         }
     }
 
-    if (value_length != POUND_KEY_HEX_MAX)
+    const bool is_128_bit = (value_length == (POUND_KEY_SIZE * 2U));
+    const bool is_256_bit = (value_length == (POUND_KEY_MAX_SIZE * 2U));
+
+    if (!is_128_bit && !is_256_bit)
     {
         POUND_LOG_ERROR(&thread_logger,
-                        "Line %zu of the key file gives the key '%.*s' %zu hex digits, but "
-                        "every key is exactly %u.",
+                        "Line %zu of the key file gives the key '%.*s' %zu hex digits, but a key "
+                        "is either %u or %u hex digits.",
                         line_number,
                         (int)name_length,
                         line + name_start,
                         value_length,
-                        POUND_KEY_HEX_MAX);
+                        POUND_KEY_SIZE * 2U,
+                        POUND_KEY_MAX_SIZE * 2U);
         return true;
     }
 
-    uint8_t value[POUND_KEY_SIZE];
+    const size_t value_size = is_128_bit ? POUND_KEY_SIZE : POUND_KEY_MAX_SIZE;
+    uint8_t      value[POUND_KEY_MAX_SIZE];
 
-    for (size_t byte = 0U; byte < POUND_KEY_SIZE; ++byte)
+    for (size_t byte = 0U; byte < value_size; ++byte)
     {
         const int high = hex_value(line[value_start + (byte * 2U)]);
         const int low  = hex_value(line[value_start + (byte * 2U) + 1U]);
@@ -428,7 +460,7 @@ parse_line(key_store_t *POUND_RESTRICT store, const char *POUND_RESTRICT line, c
     memcpy(name, line + name_start, name_length);
     name[name_length] = '\0';
 
-    const error_t status = key_store_add(store, name, value);
+    const error_t status = key_store_add_sized(store, name, value, value_size);
 
     if (POUND_UNLIKELY(POUND_SUCCESS != status))
     {
@@ -505,8 +537,8 @@ key_store_load_text(key_store_t *POUND_RESTRICT store, const char *POUND_RESTRIC
 }
 
 error_t
-key_store_get(const key_store_t *POUND_RESTRICT store, const char *POUND_RESTRICT name,
-              uint8_t out[POUND_KEY_SIZE])
+key_store_get_sized(const key_store_t *POUND_RESTRICT store, const char *POUND_RESTRICT name,
+                    uint8_t *POUND_RESTRICT out, const size_t size)
 {
     if (POUND_UNLIKELY(NULL == store))
     {
@@ -517,6 +549,18 @@ key_store_get(const key_store_t *POUND_RESTRICT store, const char *POUND_RESTRIC
     if (POUND_UNLIKELY((NULL == name) || ('\0' == name[0])))
     {
         POUND_LOG_ERROR(&thread_logger, "Aborting function: a key lookup was given an empty name.");
+        return POUND_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (POUND_UNLIKELY((POUND_KEY_SIZE != size) && (POUND_KEY_MAX_SIZE != size)))
+    {
+        POUND_LOG_ERROR(&thread_logger,
+                        "Aborting function: the key '%s' was requested at %zu bytes, but a key is "
+                        "either %u or %u bytes.",
+                        name,
+                        size,
+                        POUND_KEY_SIZE,
+                        POUND_KEY_MAX_SIZE);
         return POUND_ERROR_INVALID_ARGUMENT;
     }
 
@@ -538,7 +582,18 @@ key_store_get(const key_store_t *POUND_RESTRICT store, const char *POUND_RESTRIC
 
         if (0 == order)
         {
-            memcpy(out, store->entries[middle].value, POUND_KEY_SIZE);
+            if (POUND_UNLIKELY(store->entries[middle].size != size))
+            {
+                POUND_LOG_ERROR(&thread_logger,
+                                "The key '%s' is %u bytes in the key file, but this format needs "
+                                "%zu. Compound will not truncate or pad it.",
+                                name,
+                                store->entries[middle].size,
+                                size);
+                return POUND_ERROR_KEY_SIZE;
+            }
+
+            memcpy(out, store->entries[middle].value, size);
             return POUND_SUCCESS;
         }
 
@@ -560,6 +615,50 @@ key_store_get(const key_store_t *POUND_RESTRICT store, const char *POUND_RESTRIC
                     "The key '%s' is not in the key file. Compound ships no keys and will not "
                     "substitute one; add it to your own key file to load this title.",
                     name);
+
+    return POUND_ERROR_KEY_MISSING;
+}
+
+error_t
+key_store_get(const key_store_t *POUND_RESTRICT store, const char *POUND_RESTRICT name,
+              uint8_t out[POUND_KEY_SIZE])
+{
+    return key_store_get_sized(store, name, out, POUND_KEY_SIZE);
+}
+
+error_t
+key_store_get_size(const key_store_t *POUND_RESTRICT store, const char *POUND_RESTRICT name, size_t *out_size)
+{
+    if (POUND_UNLIKELY(NULL == store) || POUND_UNLIKELY(NULL == out_size)
+        || POUND_UNLIKELY((NULL == name) || ('\0' == name[0])))
+    {
+        POUND_LOG_ERROR(&thread_logger, "Aborting function: a key size query was given a NULL argument.");
+        return POUND_ERROR_INVALID_ARGUMENT;
+    }
+
+    size_t low  = 0U;
+    size_t high = store->count;
+
+    while (low < high)
+    {
+        const size_t middle = low + ((high - low) / 2U);
+        const int    order  = strcmp(store->entries[middle].name, name);
+
+        if (0 == order)
+        {
+            *out_size = store->entries[middle].size;
+            return POUND_SUCCESS;
+        }
+
+        if (order < 0)
+        {
+            low = middle + 1U;
+        }
+        else
+        {
+            high = middle;
+        }
+    }
 
     return POUND_ERROR_KEY_MISSING;
 }
