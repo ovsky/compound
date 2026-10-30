@@ -344,6 +344,8 @@ add_library(CompoundCore OBJECT
         src/core/jit/jit_cache.c
         src/core/jit/jit_metadata.c
         src/core/jit/jit_execution.c
+        src/core/compression/lz4.c
+        src/core/crypto/aes.c
         src/core/crypto/sha256.c
         src/core/crypto/rsa.c
         src/core/fs/fs_reader.c
@@ -351,6 +353,9 @@ add_library(CompoundCore OBJECT
         src/core/fs/keys.c
         src/core/fs/pfs0.c
         src/core/fs/hfs0.c
+        src/core/loader/package/nca.c
+        src/core/loader/package/package.c
+        src/core/loader/package/ticket.c
         src/core/config/config.c
         src/core/log_ring.c
         src/core/sync/mutex.c
