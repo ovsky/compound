@@ -53,6 +53,8 @@ pound_error_to_string(error_t error)
 
         case POUND_ERROR_KEY_MISSING:
             return "POUND_ERROR_KEY_MISSING";
+        case POUND_ERROR_KEY_SIZE:
+            return "POUND_ERROR_KEY_SIZE";
 
         case POUND_ERROR_HASH_MISMATCH:
             return "POUND_ERROR_HASH_MISMATCH";
@@ -60,6 +62,8 @@ pound_error_to_string(error_t error)
         case POUND_ERROR_SIGNATURE_INVALID:
             return "POUND_ERROR_SIGNATURE_INVALID";
 
+        case POUND_ERROR_BUFFER_TOO_SMALL:
+            return "POUND_ERROR_BUFFER_TOO_SMALL";
         case POUND_ERROR_UNSUPPORTED_FEATURE:
             return "POUND_ERROR_UNSUPPORTED_FEATURE";
 

@@ -66,6 +66,15 @@ typedef enum
     /// is distinguishable from a corrupt image.
     POUND_ERROR_KEY_MISSING,
 
+    /// A key was present under the requested name but has a different length than
+    /// the format requires.
+    ///
+    /// Distinct from `POUND_ERROR_KEY_MISSING`: the user did supply that key, so
+    /// asking them to add it again would be wrong. A 16-byte `header_key` where an
+    /// NCA header needs 32 bytes is the canonical case. The key is never truncated
+    /// or zero-padded to make the lookup succeed.
+    POUND_ERROR_KEY_SIZE,
+
     /// A partition's SHA-256 did not match the hash recorded in its header.
     POUND_ERROR_HASH_MISMATCH,
 
@@ -78,6 +87,13 @@ typedef enum
     /// corrupt, and a caller deciding whether to re-prompt for keys needs to
     /// tell the two apart.
     POUND_ERROR_SIGNATURE_INVALID,
+
+    /// A caller-provided destination is too small for the data that must be written.
+    ///
+    /// The operation is refused before any byte is written. It is distinct from
+    /// `POUND_ERROR_CORRUPTED`, which says the source data is wrong: here the source
+    /// may be perfectly valid and the caller simply needs a larger buffer.
+    POUND_ERROR_BUFFER_TOO_SMALL,
 
     /// A recognised format uses a feature Compound does not implement.
     ///
