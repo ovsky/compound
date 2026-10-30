@@ -73,6 +73,35 @@ typedef struct
     size_t buffer_size;
 } fs_reader_t;
 
+/// A bounded view of a subrange of another reader.
+///
+/// The view does not copy or own the source and does not allocate. `reader` must be
+/// the first member: `fs_reader_slice_init` points its context at the slice itself,
+/// so a read finds both the parent and the base offset without a separate
+/// allocation. The parent must outlive the slice.
+typedef struct
+{
+    fs_reader_t reader;
+
+    /// Parent source. Owned by the caller, never freed here.
+    const fs_reader_t *source;
+
+    /// Offset in `source` where this view begins.
+    uint64_t base;
+
+    /// Size of the view.
+    size_t size;
+} fs_reader_slice_t;
+
+/// Binds `slice` to `[offset, offset + size)` of `source`.
+///
+/// Returns `POUND_ERROR_INVALID_ARGUMENT` for NULL pointers, and
+/// `POUND_ERROR_IO` when the range is outside the source. On failure both `slice`
+/// and its embedded reader are zeroed, so every later read refuses rather than
+/// falling back to offset zero of the parent.
+error_t fs_reader_slice_init(fs_reader_slice_t *POUND_RESTRICT slice, const fs_reader_t *POUND_RESTRICT source,
+                             uint64_t offset, size_t size);
+
 /// Wraps a caller-owned buffer in an `fs_reader_t`.
 ///
 /// The buffer must outlive the reader; the reader stores the pointer and does not copy
@@ -82,7 +111,8 @@ typedef struct
 /// `data` may be NULL only when `size` is zero. On failure the reader is left zeroed,
 /// so a caller that ignores the return value gets a reader whose `read_at` is NULL and
 /// therefore refuses every read, rather than a reader pointing at freed memory.
-void fs_reader_from_buffer(fs_reader_t *POUND_RESTRICT reader, void *POUND_RESTRICT data, const size_t size);
+void fs_reader_from_buffer(fs_reader_t *POUND_RESTRICT reader, const void *POUND_RESTRICT data,
+                           const size_t size);
 
 /// Reads `size` bytes at `offset` through `reader`.
 ///

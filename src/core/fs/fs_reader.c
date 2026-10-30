@@ -47,7 +47,8 @@ buffer_read_at(void *POUND_RESTRICT context, const uint64_t offset, void *POUND_
 }
 
 void
-fs_reader_from_buffer(fs_reader_t *POUND_RESTRICT reader, void *POUND_RESTRICT data, const size_t size)
+fs_reader_from_buffer(fs_reader_t *POUND_RESTRICT reader, const void *POUND_RESTRICT data,
+                      const size_t size)
 {
     if (POUND_UNLIKELY(NULL == reader))
     {
@@ -79,6 +80,66 @@ fs_reader_from_buffer(fs_reader_t *POUND_RESTRICT reader, void *POUND_RESTRICT d
     // `read_at` receives the reader, so the bounds it copies from and the bounds
     // `fs_reader_read_at` checked against are the same two fields.
     reader->context = reader;
+}
+
+/// `read_at` for a bounded view over another reader.
+static error_t
+slice_read_at(void *POUND_RESTRICT context, const uint64_t offset, void *POUND_RESTRICT destination,
+              const size_t size)
+{
+    const fs_reader_slice_t *POUND_RESTRICT slice = (const fs_reader_slice_t *)context;
+
+    if (POUND_UNLIKELY(NULL == slice) || POUND_UNLIKELY(NULL == slice->source))
+    {
+        POUND_LOG_ERROR(&thread_logger, "Aborting function: the sliced reader has no source.");
+        return POUND_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (offset > (UINT64_MAX - slice->base))
+    {
+        POUND_LOG_ERROR(&thread_logger, "Aborting function: a sliced read offset wraps the source.");
+        return POUND_ERROR_IO;
+    }
+
+    return fs_reader_read_at(slice->source, slice->base + offset, destination, size);
+}
+
+error_t
+fs_reader_slice_init(fs_reader_slice_t *POUND_RESTRICT slice, const fs_reader_t *POUND_RESTRICT source,
+                     const uint64_t offset, const size_t size)
+{
+    if (POUND_UNLIKELY(NULL == slice))
+    {
+        POUND_LOG_ERROR(&thread_logger, "Aborting function: the slice destination is NULL.");
+        return POUND_ERROR_INVALID_ARGUMENT;
+    }
+
+    memset(slice, 0, sizeof(*slice));
+
+    if (POUND_UNLIKELY(NULL == source))
+    {
+        POUND_LOG_ERROR(&thread_logger, "Aborting function: the slice source is NULL.");
+        return POUND_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (!fs_reader_range_is_valid(source, offset, size))
+    {
+        POUND_LOG_ERROR(&thread_logger,
+                        "A %zu-byte slice at offset %llu runs past the end of a %llu-byte source.",
+                        size,
+                        (unsigned long long)offset,
+                        (unsigned long long)source->size);
+        return POUND_ERROR_IO;
+    }
+
+    slice->source      = source;
+    slice->base        = offset;
+    slice->size        = size;
+    slice->reader.size = (uint64_t)size;
+    slice->reader.read_at = slice_read_at;
+    slice->reader.context = slice;
+
+    return POUND_SUCCESS;
 }
 
 bool
