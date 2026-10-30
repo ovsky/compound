@@ -90,7 +90,40 @@ build_nro(uint8_t *POUND_RESTRICT image, const uint32_t declared_size)
     put_le32(image, 0U, 0xD503201FU);
 }
 
-/// Builds an NSO with uncompressed, page-aligned segments.
+/// Writes a raw LZ4 block that expands to `size` copies of `value` at `destination`.
+///
+/// The block is one literal followed by a match at offset one, which is the shape a
+/// compressed run of identical bytes has and which exercises the decoder's
+/// byte-at-a-time overlap copy rather than a `memcpy`.
+static size_t
+write_repeat_lz4(uint8_t *POUND_RESTRICT destination, const size_t size, const uint8_t value)
+{
+    if (size < 5U)
+    {
+        return 0U;
+    }
+
+    size_t cursor = 0U;
+    destination[cursor++] = 0x1FU; // one literal; match length needs extensions
+    destination[cursor++] = value;
+
+    size_t extension = (size - 1U) - 4U - 15U;
+
+    while (extension >= 255U)
+    {
+        destination[cursor++] = 0xFFU;
+        extension -= 255U;
+    }
+
+    destination[cursor++] = (uint8_t)extension;
+    destination[cursor++] = 0x01U;
+    destination[cursor++] = 0x00U;
+
+    return cursor;
+}
+
+/// Builds an NSO with page-aligned segments. A flag bit makes that segment one raw
+/// LZ4 block whose expansion is a repeated byte, not the dummy header bytes.
 static void
 build_nso(uint8_t *POUND_RESTRICT image, const uint32_t flags)
 {
@@ -121,6 +154,24 @@ build_nso(uint8_t *POUND_RESTRICT image, const uint32_t flags)
     put_le32(image, 0x68U, TEST_TEXT_SIZE);
 
     put_le32(image, 0x100U, 0xD503201FU);
+
+    if (0U != (flags & 1U))
+    {
+        const size_t stored = write_repeat_lz4(image + 0x100U, TEST_TEXT_SIZE, 'A');
+        put_le32(image, 0x60U, (uint32_t)stored);
+    }
+
+    if (0U != (flags & 2U))
+    {
+        const size_t stored = write_repeat_lz4(image + 0x1100U, TEST_TEXT_SIZE, 'B');
+        put_le32(image, 0x64U, (uint32_t)stored);
+    }
+
+    if (0U != (flags & 4U))
+    {
+        const size_t stored = write_repeat_lz4(image + 0x2100U, TEST_TEXT_SIZE, 'C');
+        put_le32(image, 0x68U, (uint32_t)stored);
+    }
 }
 
 static void
@@ -286,7 +337,7 @@ POUND_TEST(loader, nso_boot_copies_segments_at_their_memory_offsets)
     (void)remove(path);
 }
 
-POUND_TEST(loader, compressed_nso_is_refused_by_name)
+POUND_TEST(loader, compressed_nso_expands_its_segments)
 {
     char path[128];
     make_path(path, sizeof(path), "compressed.nso");
@@ -305,15 +356,51 @@ POUND_TEST(loader, compressed_nso_is_refused_by_name)
     POUND_REQUIRE(POUND_SUCCESS == fs_file_reader(&file, &reader));
 
     pound_title_layout_t layout;
-    POUND_CHECK_EQ_I64(pound_title_parse_reader(&reader, POUND_TITLE_NSO, &layout),
-                       POUND_ERROR_UNSUPPORTED_FEATURE);
+    POUND_REQUIRE(POUND_SUCCESS == pound_title_parse_reader(&reader, POUND_TITLE_NSO, &layout));
+    POUND_CHECK(layout.segments[0].compressed);
+    POUND_CHECK_EQ_U64(layout.segments[0].size, TEST_TEXT_SIZE);
+    POUND_CHECK(layout.segments[0].stored_size < layout.segments[0].size);
     fs_file_close(&file);
 
     pound_boot_config_t config;
     boot_config(&config);
     pound_boot_state_t state;
     POUND_REQUIRE(POUND_SUCCESS == pound_boot_init_with_config(&state, &config));
-    POUND_CHECK_EQ_I64(pound_boot_load_title(&state, &info), POUND_ERROR_UNSUPPORTED_FEATURE);
+    POUND_REQUIRE(POUND_SUCCESS == pound_boot_load_title(&state, &info));
+
+    size_t code_bytes = 0U;
+    const uint8_t *code = guest_memory_translate_execute(&state.guest_memory, TEST_BOOT_BASE, &code_bytes);
+    POUND_REQUIRE_PTR_NON_NULL(code);
+    POUND_CHECK(code_bytes >= TEST_TEXT_SIZE);
+    POUND_CHECK_EQ_U64(code[0], 'A');
+    POUND_CHECK_EQ_U64(code[TEST_TEXT_SIZE - 1U], 'A');
+
+    pound_boot_shutdown(&state);
+    (void)remove(path);
+}
+
+POUND_TEST(loader, a_corrupt_compressed_segment_fails_the_boot)
+{
+    char path[128];
+    make_path(path, sizeof(path), "corrupt-compressed.nso");
+
+    uint8_t image[TEST_IMAGE_SIZE];
+    build_nso(image, 0x1U);
+
+    // Keep the compressed flag and stored length but break the match offset, so the
+    // failure comes from the decoder rather than from the layout checks.
+    image[0x104U] = 0x00U;
+
+    POUND_REQUIRE(POUND_SUCCESS == write_image(path, image, TEST_NSO_SIZE));
+
+    pound_title_info_t info;
+    POUND_REQUIRE(POUND_SUCCESS == pound_title_detect(path, &info));
+
+    pound_boot_config_t config;
+    boot_config(&config);
+    pound_boot_state_t state;
+    POUND_REQUIRE(POUND_SUCCESS == pound_boot_init_with_config(&state, &config));
+    POUND_CHECK_EQ_I64(pound_boot_load_title(&state, &info), POUND_ERROR_CORRUPTED);
     POUND_CHECK_PTR_NULL(state.host_base);
     pound_boot_shutdown(&state);
 
@@ -357,6 +444,7 @@ POUND_TEST_SUITE(loader,
                  POUND_TEST_CASE(loader, packages_are_recognised_but_never_reported_bootable),
                  POUND_TEST_CASE(loader, nro_boot_maps_text_data_bss_and_stack),
                  POUND_TEST_CASE(loader, nso_boot_copies_segments_at_their_memory_offsets),
-                 POUND_TEST_CASE(loader, compressed_nso_is_refused_by_name),
+                 POUND_TEST_CASE(loader, compressed_nso_expands_its_segments),
+                 POUND_TEST_CASE(loader, a_corrupt_compressed_segment_fails_the_boot),
                  POUND_TEST_CASE(loader, malformed_nro_size_is_refused_before_mapping),
                  POUND_TEST_CASE(loader, boot_start_requires_a_loaded_title))

@@ -692,7 +692,7 @@ POUND_TEST(keys, a_key_family_index_outside_the_family_is_rejected)
     // With the key actually present, the in-range index succeeds and still holds its own
     // value, so the bound is not rejecting valid indices along with invalid ones.
     static const char PARTIAL[] = "master_key_00 = 000102030405060708090a0b0c0d0e0f\n"
-                                  "master_key_02 = 202122232425262728292a2b2c2d2e2f\n";
+                                  "master_key_06 = 202122232425262728292a2b2c2d2e2f\n";
 
     POUND_REQUIRE(POUND_SUCCESS == key_store_load_text(&store, PARTIAL, sizeof(PARTIAL) - 1U));
 
