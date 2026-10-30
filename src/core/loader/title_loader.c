@@ -60,12 +60,14 @@ store_segment(const fs_reader_t *POUND_RESTRICT reader,
               const uint64_t                      file_offset,
               const uint64_t                      memory_offset,
               const uint64_t                      size,
+              const uint64_t                      stored_size,
+              const bool                          compressed,
               const uint64_t                      limit,
               pound_title_segment_t *POUND_RESTRICT segment,
               uint64_t *POUND_RESTRICT              image_end)
 {
     uint64_t file_end = 0U;
-    if (false == add_u64(file_offset, size, &file_end))
+    if (false == add_u64(file_offset, stored_size, &file_end))
     {
         POUND_LOG_ERROR(&thread_logger, "Title segment wraps the 64-bit file address space.");
         return POUND_ERROR_MALFORMED_HEADER;
@@ -88,7 +90,7 @@ store_segment(const fs_reader_t *POUND_RESTRICT reader,
         return POUND_ERROR_MALFORMED_HEADER;
     }
 
-    if (false == fs_reader_range_is_valid(reader, file_offset, (size_t)size))
+    if (false == fs_reader_range_is_valid(reader, file_offset, (size_t)stored_size))
     {
         POUND_LOG_ERROR(&thread_logger,
                         "Title segment [%llu, %llu) is outside the %llu-byte file.",
@@ -101,6 +103,9 @@ store_segment(const fs_reader_t *POUND_RESTRICT reader,
     segment->file_offset   = file_offset;
     segment->memory_offset = memory_offset;
     segment->size          = size;
+    segment->stored_size   = stored_size;
+    segment->compressed    = compressed;
+    memset(segment->pad, 0, sizeof(segment->pad));
 
     if (memory_end > *image_end)
     {
@@ -296,6 +301,8 @@ parse_nro(const fs_reader_t *POUND_RESTRICT reader, pound_title_layout_t *POUND_
                                                     file_offset,
                                                     file_offset,
                                                     size,
+                                                    size,
+                                                    false,
                                                     declared_size,
                                                     &layout->segments[index],
                                                     &image_end);
@@ -350,17 +357,6 @@ parse_nso(const fs_reader_t *POUND_RESTRICT reader, pound_title_layout_t *POUND_
     layout->version = load_le32(header + 0x04U);
     layout->flags   = load_le32(header + 0x0CU);
 
-    // Bits 0, 1 and 2 say text, rodata and data are LZ4-compressed. Decompression
-    // is a separate subsystem; pretending the compressed bytes are code would
-    // hand the interpreter garbage.
-    if ((layout->flags & 0x7U) != 0U)
-    {
-        POUND_LOG_ERROR(&thread_logger,
-                        "NSO uses LZ4-compressed segments (flags=0x%X); this build does not decompress them.",
-                        layout->flags);
-        return POUND_ERROR_UNSUPPORTED_FEATURE;
-    }
-
     struct
     {
         size_t file_offset_field;
@@ -380,8 +376,19 @@ parse_nso(const fs_reader_t *POUND_RESTRICT reader, pound_title_layout_t *POUND_
         const uint64_t memory_offset = load_le32(header + fields[index].memory_offset_field);
         const uint64_t size          = load_le32(header + fields[index].size_field);
         const uint64_t stored_size   = load_le32(header + fields[index].stored_size_field);
+        const bool     compressed    = (0U != (layout->flags & (1U << index)));
 
-        if ((0U != stored_size) && (stored_size != size))
+        if (compressed)
+        {
+            if (0U == stored_size)
+            {
+                POUND_LOG_ERROR(&thread_logger,
+                                "NSO segment %u is marked compressed but stores no bytes.",
+                                index);
+                return POUND_ERROR_MALFORMED_HEADER;
+            }
+        }
+        else if ((0U != stored_size) && (stored_size != size))
         {
             POUND_LOG_ERROR(&thread_logger,
                             "NSO segment %u declares size %llu but stores %llu bytes without the compressed flag.",
@@ -391,10 +398,14 @@ parse_nso(const fs_reader_t *POUND_RESTRICT reader, pound_title_layout_t *POUND_
             return POUND_ERROR_MALFORMED_HEADER;
         }
 
+        const uint64_t effective_stored_size = compressed ? stored_size : size;
+
         const error_t segment_error = store_segment(reader,
                                                     file_offset,
                                                     memory_offset,
                                                     size,
+                                                    effective_stored_size,
+                                                    compressed,
                                                     reader->size,
                                                     &layout->segments[index],
                                                     &image_end);

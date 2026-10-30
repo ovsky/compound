@@ -58,7 +58,19 @@ typedef struct
 {
     uint64_t file_offset;
     uint64_t memory_offset;
+
+    /// Uncompressed length, which is what the segment occupies in guest memory.
     uint64_t size;
+
+    /// Bytes the file actually stores at `file_offset`. Equal to `size` for an
+    /// uncompressed segment; smaller for an NSO segment whose compression flag is
+    /// set. The boot layer reads this many bytes and expands them to `size`.
+    uint64_t stored_size;
+
+    /// True when `stored_size` bytes are one raw LZ4 block. NRO never sets this.
+    bool compressed;
+
+    uint8_t pad[7];
 } pound_title_segment_t;
 
 /// Everything the boot layer needs to place an executable image.
