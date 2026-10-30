@@ -124,6 +124,7 @@ write_repeat_lz4(uint8_t *POUND_RESTRICT destination, const size_t size, const u
 
 /// Builds an NSO with page-aligned segments. A flag bit makes that segment one raw
 /// LZ4 block whose expansion is a repeated byte, not the dummy header bytes.
+/// Builds an NSO with uncompressed, page-aligned segments.
 static void
 build_nso(uint8_t *POUND_RESTRICT image, const uint32_t flags)
 {
@@ -338,6 +339,7 @@ POUND_TEST(loader, nso_boot_copies_segments_at_their_memory_offsets)
 }
 
 POUND_TEST(loader, compressed_nso_expands_its_segments)
+POUND_TEST(loader, compressed_nso_is_refused_by_name)
 {
     char path[128];
     make_path(path, sizeof(path), "compressed.nso");
@@ -360,6 +362,8 @@ POUND_TEST(loader, compressed_nso_expands_its_segments)
     POUND_CHECK(layout.segments[0].compressed);
     POUND_CHECK_EQ_U64(layout.segments[0].size, TEST_TEXT_SIZE);
     POUND_CHECK(layout.segments[0].stored_size < layout.segments[0].size);
+    POUND_CHECK_EQ_I64(pound_title_parse_reader(&reader, POUND_TITLE_NSO, &layout),
+                       POUND_ERROR_UNSUPPORTED_FEATURE);
     fs_file_close(&file);
 
     pound_boot_config_t config;
@@ -401,6 +405,7 @@ POUND_TEST(loader, a_corrupt_compressed_segment_fails_the_boot)
     pound_boot_state_t state;
     POUND_REQUIRE(POUND_SUCCESS == pound_boot_init_with_config(&state, &config));
     POUND_CHECK_EQ_I64(pound_boot_load_title(&state, &info), POUND_ERROR_CORRUPTED);
+    POUND_CHECK_EQ_I64(pound_boot_load_title(&state, &info), POUND_ERROR_UNSUPPORTED_FEATURE);
     POUND_CHECK_PTR_NULL(state.host_base);
     pound_boot_shutdown(&state);
 
@@ -446,5 +451,6 @@ POUND_TEST_SUITE(loader,
                  POUND_TEST_CASE(loader, nso_boot_copies_segments_at_their_memory_offsets),
                  POUND_TEST_CASE(loader, compressed_nso_expands_its_segments),
                  POUND_TEST_CASE(loader, a_corrupt_compressed_segment_fails_the_boot),
+                 POUND_TEST_CASE(loader, compressed_nso_is_refused_by_name),
                  POUND_TEST_CASE(loader, malformed_nro_size_is_refused_before_mapping),
                  POUND_TEST_CASE(loader, boot_start_requires_a_loaded_title))

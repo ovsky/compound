@@ -64,6 +64,7 @@ pound_error_to_string(error_t error)
 
         case POUND_ERROR_BUFFER_TOO_SMALL:
             return "POUND_ERROR_BUFFER_TOO_SMALL";
+            
         case POUND_ERROR_UNSUPPORTED_FEATURE:
             return "POUND_ERROR_UNSUPPORTED_FEATURE";
 
