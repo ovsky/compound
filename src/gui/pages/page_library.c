@@ -1,8 +1,10 @@
 #include "pages.h"
 
 #include "config/config.h"
+#include "fs/file_reader.h"
 #include "fs/keys.h"
 #include "loader/boot/boot.h"
+#include "loader/package/package.h"
 #include "loader/title_loader.h"
 
 #include <SDL3/SDL.h>
@@ -285,20 +287,132 @@ pound_library_load_game(pound_pages_view_t *POUND_RESTRICT view)
         return;
     }
 
+    if (false == library_boot_initialized)
+    {
+        const error_t boot_error = pound_boot_init(&library_boot);
+        if (POUND_SUCCESS != boot_error)
+        {
+            pound_library_set_status(view, true, "The boot layer could not allocate its address space.");
+            return;
+        }
+
+        library_boot_initialized = true;
+    }
+
+    if ((POUND_TITLE_NCA == title_info.type) || (POUND_TITLE_NSP == title_info.type)
+        || (POUND_TITLE_XCI == title_info.type))
+    {
+        if (false == library_keys_initialized)
+        {
+            pound_library_set_status(view,
+                                     true,
+                                     "Load a keys file first. Compound never supplies Nintendo keys.");
+            return;
+        }
+
+        fs_file_t file;
+        error_t   file_error = fs_file_open(&file, library_game_path);
+        if (POUND_SUCCESS != file_error)
+        {
+            (void)snprintf(status,
+                           sizeof(status),
+                           "Cannot open '%s': %s",
+                           pound_library_file_name(library_game_path),
+                           pound_error_to_string(file_error));
+            pound_library_set_status(view, true, status);
+            return;
+        }
+
+        fs_reader_t reader;
+        file_error = fs_file_reader(&file, &reader);
+        if (POUND_SUCCESS != file_error)
+        {
+            fs_file_close(&file);
+            pound_library_set_status(view, true, "The file could not be read.");
+            return;
+        }
+
+        pound_package_t package;
+        const error_t package_error = pound_package_load(&reader, &library_keys, &package);
+        fs_file_close(&file);
+
+        if (POUND_SUCCESS != package_error)
+        {
+            (void)snprintf(status,
+                           sizeof(status),
+                           "Package refused: %s.",
+                           pound_error_to_string(package_error));
+            pound_library_set_status(view, true, status);
+            return;
+        }
+
+        const error_t load_error
+            = pound_boot_load_memory(&library_boot, library_game_path, package.main_data, package.main_size);
+
+        if (POUND_SUCCESS != load_error)
+        {
+            (void)snprintf(status,
+                           sizeof(status),
+                           "Boot refused the executable: %s.",
+                           pound_error_to_string(load_error));
+            pound_package_close(&package);
+            pound_library_set_status(view, true, status);
+            return;
+        }
+
+        pound_package_log_summary(&package);
+        const size_t main_size = package.main_size;
+        pound_package_close(&package);
+
+        const error_t start_error = pound_boot_start(&library_boot);
+        if (POUND_SUCCESS != start_error)
+        {
+            (void)snprintf(status,
+                           sizeof(status),
+                           "The title could not start: %s.",
+                           pound_error_to_string(start_error));
+            pound_library_set_status(view, true, status);
+            return;
+        }
+
+        (void)snprintf(status,
+                       sizeof(status),
+                       "Loaded %s - %s, %.1f MiB package, %.1f MiB executable.",
+                       pound_library_file_name(library_game_path),
+                       pound_library_type_name(title_info.type),
+                       (double)path_info.size / (1024.0 * 1024.0),
+                       (double)main_size / (1024.0 * 1024.0));
+        pound_library_set_status(view, false, status);
+        return;
+    }
+
     if (POUND_SUCCESS != pound_title_load(&title_info))
     {
         pound_library_set_status(view, true, "The title loader refused that file.");
         return;
     }
 
-    if (false == library_boot_initialized)
+    const error_t load_error = pound_boot_load_title(&library_boot, &title_info);
+    if (POUND_SUCCESS != load_error)
     {
-        (void)pound_boot_init(&library_boot);
-        library_boot_initialized = true;
+        (void)snprintf(status,
+                       sizeof(status),
+                       "Boot refused the executable: %s.",
+                       pound_error_to_string(load_error));
+        pound_library_set_status(view, true, status);
+        return;
     }
 
-    (void)pound_boot_load_title(&library_boot, &title_info);
-    (void)pound_boot_start(&library_boot);
+    const error_t start_error = pound_boot_start(&library_boot);
+    if (POUND_SUCCESS != start_error)
+    {
+        (void)snprintf(status,
+                       sizeof(status),
+                       "The title could not start: %s.",
+                       pound_error_to_string(start_error));
+        pound_library_set_status(view, true, status);
+        return;
+    }
 
     (void)snprintf(status,
                    sizeof(status),
