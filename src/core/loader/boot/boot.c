@@ -1,8 +1,10 @@
 #include "loader/boot/boot.h"
 
+#include "compression/lz4.h"
 #include "fs/file_reader.h"
 #include "log.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -211,28 +213,66 @@ boot_map_segment(pound_boot_state_t *POUND_RESTRICT state,
     }
 
     uint8_t *POUND_RESTRICT destination = state->host_base + (size_t)segment->memory_offset;
-    const error_t read_error = fs_reader_read_at(reader, segment->file_offset, destination, (size_t)segment->size);
-    if (POUND_SUCCESS != read_error)
+
+    if (!segment->compressed)
     {
-        POUND_LOG_ERROR(&thread_logger, "Reading image segment at file offset 0x%llX failed.",
-                        (unsigned long long)segment->file_offset);
-        return read_error;
+        const error_t read_error
+            = fs_reader_read_at(reader, segment->file_offset, destination, (size_t)segment->size);
+        if (POUND_SUCCESS != read_error)
+        {
+            POUND_LOG_ERROR(&thread_logger, "Reading image segment at file offset 0x%llX failed.",
+                            (unsigned long long)segment->file_offset);
+            return read_error;
+        }
+    }
+    else
+    {
+        if ((segment->stored_size > SIZE_MAX) || (segment->size > SIZE_MAX))
+        {
+            POUND_LOG_ERROR(&thread_logger, "Refusing image: a compressed segment does not fit a host size_t.");
+            return POUND_ERROR_MALFORMED_HEADER;
+        }
+
+        uint8_t *compressed = (uint8_t *)malloc((size_t)segment->stored_size);
+        if (NULL == compressed)
+        {
+            POUND_LOG_ERROR(&thread_logger, "Allocating %llu bytes for a compressed segment failed.",
+                            (unsigned long long)segment->stored_size);
+            return POUND_ERROR_ALLOCATION_FAILED;
+        }
+
+        error_t read_error
+            = fs_reader_read_at(reader, segment->file_offset, compressed, (size_t)segment->stored_size);
+        if (POUND_SUCCESS == read_error)
+        {
+            size_t decoded_size = 0U;
+            read_error = pound_lz4_decompress_block(compressed,
+                                                    (size_t)segment->stored_size,
+                                                    destination,
+                                                    (size_t)segment->size,
+                                                    &decoded_size);
+        }
+
+        free(compressed);
+
+        if (POUND_SUCCESS != read_error)
+        {
+            POUND_LOG_ERROR(&thread_logger,
+                            "Decompressing the segment at file offset 0x%llX failed: %s.",
+                            (unsigned long long)segment->file_offset,
+                            pound_error_to_string(read_error));
+            return read_error;
+        }
     }
 
     *mapped_end = page_end;
     return POUND_SUCCESS;
 }
 
-error_t
-pound_boot_load_title(pound_boot_state_t *POUND_RESTRICT state,
-                      const pound_title_info_t *POUND_RESTRICT info)
+static error_t
+boot_load_reader(pound_boot_state_t *POUND_RESTRICT state, const pound_title_info_t *POUND_RESTRICT info,
+                 const fs_reader_t *POUND_RESTRICT reader)
 {
-    if (POUND_UNLIKELY(NULL == state) || POUND_UNLIKELY(NULL == info))
-    {
-        POUND_LOG_ERROR(&thread_logger, "Rejecting boot load: state=%p, info=%p.",
-                        (const void *)state, (const void *)info);
-        return POUND_ERROR_INVALID_ARGUMENT;
-    }
 
     if (!state->initialized)
     {
@@ -261,48 +301,29 @@ pound_boot_load_title(pound_boot_state_t *POUND_RESTRICT state,
         return POUND_ERROR_UNSUPPORTED_FEATURE;
     }
 
-    fs_file_t file;
-    error_t   result = fs_file_open(&file, info->path);
-    if (POUND_SUCCESS != result)
-    {
-        return result;
-    }
-
-    fs_reader_t reader;
-    result = fs_file_reader(&file, &reader);
-    if (POUND_SUCCESS != result)
-    {
-        fs_file_close(&file);
-        return result;
-    }
-
     pound_title_info_t detected;
-    result = pound_title_detect_reader(&reader, &detected);
+    error_t result = pound_title_detect_reader(reader, &detected);
     if (POUND_SUCCESS != result)
     {
-        fs_file_close(&file);
         return result;
     }
 
     if (detected.type != info->type)
     {
         POUND_LOG_ERROR(&thread_logger, "Title type changed between detection and boot.");
-        fs_file_close(&file);
         return POUND_ERROR_MALFORMED_HEADER;
     }
 
     pound_title_layout_t layout;
-    result = pound_title_parse_reader(&reader, detected.type, &layout);
+    result = pound_title_parse_reader(reader, detected.type, &layout);
     if (POUND_SUCCESS != result)
     {
-        fs_file_close(&file);
         return result;
     }
 
     if ((layout.segments[0].size < 4U) || (layout.entry_offset >= layout.image_size))
     {
         POUND_LOG_ERROR(&thread_logger, "Refusing image: it has no executable text or no entry point.");
-        fs_file_close(&file);
         return POUND_ERROR_MALFORMED_HEADER;
     }
 
@@ -310,7 +331,6 @@ pound_boot_load_title(pound_boot_state_t *POUND_RESTRICT state,
     if (false == align_up_u64(layout.image_size, POUND_BOOT_PAGE_SIZE, &image_extent))
     {
         POUND_LOG_ERROR(&thread_logger, "Refusing image: its extent wraps the address space.");
-        fs_file_close(&file);
         return POUND_ERROR_MALFORMED_HEADER;
     }
 
@@ -322,7 +342,6 @@ pound_boot_load_title(pound_boot_state_t *POUND_RESTRICT state,
     if (state->stack_size >= map_limit)
     {
         POUND_LOG_ERROR(&thread_logger, "Refusing image: the stack reservation leaves no map area.");
-        fs_file_close(&file);
         return POUND_ERROR_INVALID_ARGUMENT;
     }
 
@@ -333,7 +352,6 @@ pound_boot_load_title(pound_boot_state_t *POUND_RESTRICT state,
                         "Refusing image: 0x%llX bytes do not fit below the stack at 0x%llX.",
                         (unsigned long long)image_extent,
                         (unsigned long long)stack_base);
-        fs_file_close(&file);
         return POUND_ERROR_MALFORMED_HEADER;
     }
 
@@ -343,7 +361,6 @@ pound_boot_load_title(pound_boot_state_t *POUND_RESTRICT state,
     if (NULL == host_base)
     {
         POUND_LOG_ERROR(&thread_logger, "Allocating %zu bytes for guest memory failed.", state->host_size);
-        fs_file_close(&file);
         return POUND_ERROR_ALLOCATION_FAILED;
     }
     memset(host_base, 0, state->host_size);
@@ -364,7 +381,6 @@ pound_boot_load_title(pound_boot_state_t *POUND_RESTRICT state,
     {
         POUND_LOG_ERROR(&thread_logger, "Preparing the guest address space failed: %s.",
                         pound_error_to_string(result));
-        fs_file_close(&file);
         boot_release_buffer(state);
         state->phase = POUND_BOOT_PHASE_FAILED;
         return result;
@@ -381,7 +397,7 @@ pound_boot_load_title(pound_boot_state_t *POUND_RESTRICT state,
     // format says, so the entry point is the first byte after the NRO start block
     // or the NSO text memory offset.
     result = boot_map_segment(state,
-                              &reader,
+                              reader,
                               &layout.segments[0],
                               HOS_MEMORY_STATE_CODE,
                               GUEST_MEMORY_PERM_READ | GUEST_MEMORY_PERM_EXEC,
@@ -391,7 +407,7 @@ pound_boot_load_title(pound_boot_state_t *POUND_RESTRICT state,
     if (POUND_SUCCESS == result)
     {
         result = boot_map_segment(state,
-                                  &reader,
+                                  reader,
                                   &layout.segments[1],
                                   HOS_MEMORY_STATE_CODE,
                                   GUEST_MEMORY_PERM_READ,
@@ -402,7 +418,7 @@ pound_boot_load_title(pound_boot_state_t *POUND_RESTRICT state,
     if (POUND_SUCCESS == result)
     {
         result = boot_map_segment(state,
-                                  &reader,
+                                  reader,
                                   &layout.segments[2],
                                   HOS_MEMORY_STATE_NORMAL,
                                   GUEST_MEMORY_PERM_READ | GUEST_MEMORY_PERM_WRITE,
@@ -462,13 +478,11 @@ pound_boot_load_title(pound_boot_state_t *POUND_RESTRICT state,
     if (POUND_SUCCESS != result)
     {
         POUND_LOG_ERROR(&thread_logger, "Mapping the title image failed: %s.", pound_error_to_string(result));
-        fs_file_close(&file);
         boot_release_buffer(state);
         state->phase = POUND_BOOT_PHASE_FAILED;
         return result;
     }
 
-    fs_file_close(&file);
 
     memset(&state->guest_state, 0, sizeof(state->guest_state));
     state->guest_state.pc     = state->guest_base + layout.entry_offset;
@@ -490,6 +504,69 @@ pound_boot_load_title(pound_boot_state_t *POUND_RESTRICT state,
                    (unsigned long long)state->stack_base,
                    (unsigned long long)state->stack_top);
     return POUND_SUCCESS;
+}
+
+error_t
+pound_boot_load_title(pound_boot_state_t *POUND_RESTRICT state, const pound_title_info_t *POUND_RESTRICT info)
+{
+    if (POUND_UNLIKELY(NULL == state) || POUND_UNLIKELY(NULL == info))
+    {
+        POUND_LOG_ERROR(&thread_logger, "Rejecting boot load: state=%p, info=%p.",
+                        (const void *)state, (const void *)info);
+        return POUND_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (!state->initialized)
+    {
+        POUND_LOG_ERROR(&thread_logger, "Rejecting boot load: boot state is not initialized.");
+        return POUND_ERROR_NOT_INITIALIZED;
+    }
+
+    fs_file_t file;
+    error_t   result = fs_file_open(&file, info->path);
+    if (POUND_SUCCESS != result)
+    {
+        return result;
+    }
+
+    fs_reader_t reader;
+    result = fs_file_reader(&file, &reader);
+    if (POUND_SUCCESS == result)
+    {
+        result = boot_load_reader(state, info, &reader);
+    }
+
+    fs_file_close(&file);
+    return result;
+}
+
+error_t
+pound_boot_load_memory(pound_boot_state_t *POUND_RESTRICT state, const char *POUND_RESTRICT label,
+                       const uint8_t *POUND_RESTRICT data, const size_t size)
+{
+    if (POUND_UNLIKELY(NULL == state) || POUND_UNLIKELY(NULL == data) || (0U == size))
+    {
+        POUND_LOG_ERROR(&thread_logger, "Rejecting boot load: memory image is empty or NULL.");
+        return POUND_ERROR_INVALID_ARGUMENT;
+    }
+
+    fs_reader_t reader;
+    fs_reader_from_buffer(&reader, data, size);
+
+    pound_title_info_t info;
+    memset(&info, 0, sizeof(info));
+    info.type             = POUND_TITLE_NSO;
+    info.format_version   = 1U;
+    info.is_bootable      = true;
+    info.is_encrypted     = false;
+    info.requires_keys    = false;
+
+    if (NULL != label)
+    {
+        snprintf(info.path, sizeof(info.path), "%s", label);
+    }
+
+    return boot_load_reader(state, &info, &reader);
 }
 
 error_t
@@ -515,6 +592,179 @@ pound_boot_start(pound_boot_state_t *POUND_RESTRICT state)
     state->phase = POUND_BOOT_PHASE_RUNNING;
     POUND_LOG_INFO(&thread_logger, "Boot: starting guest execution at 0x%llX.",
                    (unsigned long long)state->guest_state.pc);
+    return POUND_SUCCESS;
+}
+
+error_t
+pound_boot_run(pound_boot_state_t *POUND_RESTRICT state,
+               hos_syscall_context_t *POUND_RESTRICT context,
+               const uint32_t budget,
+               uint32_t *POUND_RESTRICT executed,
+               interpreter_trap_t *POUND_RESTRICT trap_out)
+{
+    if (POUND_UNLIKELY(NULL == state))
+    {
+        POUND_LOG_ERROR(&thread_logger, "Rejecting boot run: state is NULL.");
+        return POUND_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (!state->initialized)
+    {
+        return POUND_ERROR_NOT_INITIALIZED;
+    }
+
+    if (POUND_BOOT_PHASE_RUNNING != state->phase)
+    {
+        POUND_LOG_ERROR(&thread_logger, "Rejecting boot run: the title is not running (%d).", (int)state->phase);
+        return POUND_ERROR_INVALID_STATE;
+    }
+
+    uint32_t total_executed = 0U;
+
+    while (total_executed < budget)
+    {
+        uint32_t              slice_executed = 0U;
+        interpreter_trap_t    trap;
+
+        const error_t run_error = interpreter_run(&state->guest_state,
+                                                 &state->guest_memory,
+                                                 budget - total_executed,
+                                                 &slice_executed,
+                                                 &trap);
+
+        total_executed += slice_executed;
+
+        if (POUND_SUCCESS != run_error)
+        {
+            if (NULL != executed)
+            {
+                *executed = total_executed;
+            }
+
+            state->phase = POUND_BOOT_PHASE_FAILED;
+            POUND_LOG_ERROR(&thread_logger, "Guest execution failed at 0x%llX: %s.",
+                            (unsigned long long)state->guest_state.pc,
+                            pound_error_to_string(run_error));
+            return run_error;
+        }
+
+        if (INTERPRETER_TRAP_NONE == trap.kind)
+        {
+            if (0U == slice_executed)
+            {
+                // A zero-budget slice that reports no trap would otherwise spin
+                // forever. It should be impossible, but refusing is cheaper than
+                // making a runaway emulator the way this is discovered.
+                state->phase = POUND_BOOT_PHASE_FAILED;
+                return POUND_ERROR_INVALID_STATE;
+            }
+
+            break;
+        }
+
+        if (INTERPRETER_TRAP_SVC == trap.kind)
+        {
+            if (NULL == context)
+            {
+                if (NULL != trap_out)
+                {
+                    *trap_out = trap;
+                }
+
+                if (NULL != executed)
+                {
+                    *executed = total_executed;
+                }
+
+                return POUND_SUCCESS;
+            }
+
+            const error_t call_error = hos_syscall_dispatch(context, (uint32_t)trap.imm, &state->guest_state);
+
+            if (POUND_SUCCESS != call_error)
+            {
+                if (NULL != executed)
+                {
+                    *executed = total_executed;
+                }
+
+                if (NULL != trap_out)
+                {
+                    *trap_out = trap;
+                }
+
+                state->phase = POUND_BOOT_PHASE_FAILED;
+                POUND_LOG_ERROR(&thread_logger, "System call 0x%llX failed: %s.",
+                                (unsigned long long)trap.imm,
+                                pound_error_to_string(call_error));
+                return call_error;
+            }
+
+            if (HOS_SYSCALL_COMPLETED == context->outcome)
+            {
+                continue;
+            }
+
+            state->phase = POUND_BOOT_PHASE_STOPPED;
+
+            if (NULL != trap_out)
+            {
+                *trap_out = trap;
+            }
+
+            if (NULL != executed)
+            {
+                *executed = total_executed;
+            }
+
+            return POUND_SUCCESS;
+        }
+
+        if (INTERPRETER_TRAP_UNDEFINED == trap.kind)
+        {
+            if (NULL != executed)
+            {
+                *executed = total_executed;
+            }
+
+            if (NULL != trap_out)
+            {
+                *trap_out = trap;
+            }
+
+            state->phase = POUND_BOOT_PHASE_FAILED;
+            POUND_LOG_ERROR(&thread_logger, "Guest executed an instruction the interpreter does not implement at 0x%llX.",
+                            (unsigned long long)trap.pc);
+            return POUND_ERROR_UNSUPPORTED_INSTRUCTION;
+        }
+
+        // BRK and HLT are deliberate halts. They stop the boot but are not a
+        // failure: a debugger or a test may be waiting for exactly this trap.
+        state->phase = POUND_BOOT_PHASE_STOPPED;
+
+        if (NULL != trap_out)
+        {
+            *trap_out = trap;
+        }
+
+        if (NULL != executed)
+        {
+            *executed = total_executed;
+        }
+
+        return POUND_SUCCESS;
+    }
+
+    if (NULL != executed)
+    {
+        *executed = total_executed;
+    }
+
+    if (NULL != trap_out)
+    {
+        memset(trap_out, 0, sizeof(*trap_out));
+    }
+
     return POUND_SUCCESS;
 }
 
