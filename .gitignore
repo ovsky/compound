@@ -76,3 +76,4 @@ Thumbs.db
 *.jks
 # OpenChamber session state, local to a checkout.
 /.openchamber/
+/.kilo
