@@ -77,11 +77,11 @@ no console keys, no content decryption, and no Switch 2 execution layer.
 | 🧱 **Build & CI Infrastructure** | ✅ Complete | Presets, CMake 3.25+, cross-platform CI |
 | 🏭 **Runtime & Memory System** | ✅ Complete | `mimalloc` allocator, checked arithmetic, pool/slab/arena allocators, host accounting |
 | 🐛 **Debug Tooling** | ✅ Working | GUI with live reload, comprehensive logging |
-| ⚡ **Ballistic ARM64 JIT** | ✅ Complete | Recompiler integration and code cache |
-| 💾 **Filesystem & Crypto** | ✅ Complete | HFS0 parser, 64-bit file reader, SHA-256, RSA-2048 PKCS#1 v1.5 verification |
-| 🖥️ **Guest CPU & OS** | ✅ Complete | A64 interpreter subset; kernel objects, one-sided event handles and services |
-| 🎨 **Graphics & Audio** | ✅ Complete | SM86→SPIR-V translation, Vulkan scaffolding, SDL audio output and gamepad input |
-| 🎮 **Title Support** | ✅ Complete | Content-based NRO/NSO parsing and boot mapping; encrypted packages are recognised and refused |
+| ⚡ **Ballistic ARM64 JIT** | 🚧 Experimental | In-progress recompiler integration |
+| 💾 **Filesystem & Crypto** | 🚧 Experimental | HFS0 parser, 64-bit file reader, SHA-256, RSA-2048 PKCS#1 v1.5 verification |
+| 🖥️ **Guest CPU & OS** | 🚧 Experimental | A64 interpreter subset; kernel objects, one-sided event handles and services |
+| 🎨 **Graphics & Audio** | 🚧 Experimental | SM86→SPIR-V translation, Vulkan scaffolding, SDL audio output and gamepad input |
+| 🎮 **Title Support** | 🚧 Experimental | Content-based NRO/NSO parsing and boot mapping; encrypted packages are recognised and refused |
 | 🎮 **Switch 2** | ❌ Not implemented | No keys, decryption, or execution layer; compatibility is always reported false |
 
 ---
