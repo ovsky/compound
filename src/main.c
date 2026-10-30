@@ -2,8 +2,11 @@
 #include "log.h"
 #include "memory/memory.h"
 #include "gpu/vulkan/vulkan_backend.h"
+#include "fs/file_reader.h"
+#include "fs/keys.h"
 #include "loader/title_loader.h"
 #include "loader/boot/boot.h"
+#include "loader/package/package.h"
 #include "platform/audio.h"
 #include "platform/input.h"
 #include "platform/services.h"
@@ -121,6 +124,25 @@ static void app_frame_limit(uint64_t frame_start_ms);
 int
 main(int argc, char *argv[])
 {
+    const char *cli_title_path = NULL;
+    const char *cli_keys_path  = NULL;
+
+    for (int i = 1; i < argc; ++i)
+    {
+        if ((0 == strcmp(argv[i], "--keys")) && ((i + 1) < argc))
+        {
+            cli_keys_path = argv[++i];
+        }
+        else if ((0 == strcmp(argv[i], "--selftest-memory")) || (0 == strcmp(argv[i], "--help")))
+        {
+            continue;
+        }
+        else if ((NULL == cli_title_path) && (argv[i][0] != '-'))
+        {
+            cli_title_path = argv[i];
+        }
+    }
+
     mi_option_set(mi_option_arena_reserve, 128 * 1024);
     pound_logger_init_default();
     memory_subsystem_init();
@@ -215,36 +237,141 @@ main(int argc, char *argv[])
     }
 
     POUND_LOG_INFO(&thread_logger, "Starting main loop on %s.", POUND_PLATFORM_NAME);
-    if (argc > 1)
+
+    key_store_t cli_keys;
+    key_store_init(&cli_keys);
+    bool cli_keys_loaded = false;
+
+    if (NULL != cli_keys_path)
+    {
+        size_t key_text_size = 0U;
+        void  *key_text      = SDL_LoadFile(cli_keys_path, &key_text_size);
+
+        if (NULL == key_text)
+        {
+            POUND_LOG_ERROR(&thread_logger, "Reading the key file %s failed: %s.",
+                            cli_keys_path, SDL_GetError());
+        }
+        else
+        {
+            const error_t key_error = key_store_load_text(&cli_keys, (const char *)key_text, key_text_size);
+            SDL_free(key_text);
+
+            if (POUND_SUCCESS != key_error)
+            {
+                POUND_LOG_WARN(&thread_logger,
+                               "The key file %s was read, but some lines were rejected: %s.",
+                               cli_keys_path,
+                               pound_error_to_string(key_error));
+            }
+
+            cli_keys_loaded = true;
+            key_store_log_summary(&cli_keys);
+            POUND_LOG_INFO(&thread_logger, "Loaded %zu keys from %s.",
+                           key_store_count(&cli_keys), cli_keys_path);
+        }
+    }
+
+    if (NULL != cli_title_path)
     {
         pound_title_info_t title_info;
-        const error_t detect_error = pound_title_detect(argv[1], &title_info);
-        if (POUND_SUCCESS == detect_error)
+        const error_t detect_error = pound_title_detect(cli_title_path, &title_info);
+        if (POUND_SUCCESS != detect_error)
         {
-            const error_t load_error = pound_title_load(&title_info);
-            if (POUND_SUCCESS == load_error)
+            POUND_LOG_ERROR(&thread_logger, "Detecting %s failed: %s.", cli_title_path,
+                            pound_error_to_string(detect_error));
+        }
+        else if ((POUND_TITLE_NCA == title_info.type) || (POUND_TITLE_NSP == title_info.type)
+                 || (POUND_TITLE_XCI == title_info.type))
+        {
+            if (!cli_keys_loaded)
             {
-                const error_t boot_error = pound_boot_load_title(&boot_state, &title_info);
-                if (POUND_SUCCESS == boot_error)
-                {
-                    (void)pound_boot_start(&boot_state);
-                }
-                else
-                {
-                    POUND_LOG_ERROR(&thread_logger, "Boot refused the title: %s.",
-                                    pound_error_to_string(boot_error));
-                }
+                POUND_LOG_ERROR(&thread_logger,
+                                "%s is a package. Pass --keys <file>; Compound never supplies "
+                                "Nintendo keys.",
+                                cli_title_path);
             }
             else
             {
-                POUND_LOG_ERROR(&thread_logger, "Loading the title failed: %s.",
-                                pound_error_to_string(load_error));
+                fs_file_t package_file;
+                error_t   package_error = fs_file_open(&package_file, cli_title_path);
+
+                if (POUND_SUCCESS != package_error)
+                {
+                    POUND_LOG_ERROR(&thread_logger, "Opening %s failed: %s.", cli_title_path,
+                                    pound_error_to_string(package_error));
+                }
+                else
+                {
+                    fs_reader_t package_reader;
+                    package_error = fs_file_reader(&package_file, &package_reader);
+
+                    pound_package_t package;
+                    if (POUND_SUCCESS == package_error)
+                    {
+                        package_error = pound_package_load(&package_reader, &cli_keys, &package);
+                    }
+
+                    fs_file_close(&package_file);
+
+                    if (POUND_SUCCESS != package_error)
+                    {
+                        POUND_LOG_ERROR(&thread_logger, "Loading the package failed: %s.",
+                                        pound_error_to_string(package_error));
+                    }
+                    else
+                    {
+                        const error_t boot_error
+                            = pound_boot_load_memory(&boot_state, cli_title_path, package.main_data,
+                                                     package.main_size);
+
+                        if (POUND_SUCCESS != boot_error)
+                        {
+                            POUND_LOG_ERROR(&thread_logger, "Boot refused the executable: %s.",
+                                            pound_error_to_string(boot_error));
+                        }
+                        else
+                        {
+                            pound_package_log_summary(&package);
+                            const error_t start_error = pound_boot_start(&boot_state);
+                            if (POUND_SUCCESS != start_error)
+                            {
+                                POUND_LOG_ERROR(&thread_logger, "Starting the title failed: %s.",
+                                                pound_error_to_string(start_error));
+                            }
+                        }
+
+                        pound_package_close(&package);
+                    }
+                }
             }
         }
         else
         {
-            POUND_LOG_ERROR(&thread_logger, "Detecting %s failed: %s.", argv[1],
-                            pound_error_to_string(detect_error));
+            const error_t load_error = pound_title_load(&title_info);
+            if (POUND_SUCCESS != load_error)
+            {
+                POUND_LOG_ERROR(&thread_logger, "Loading the title failed: %s.",
+                                pound_error_to_string(load_error));
+            }
+            else
+            {
+                const error_t boot_error = pound_boot_load_title(&boot_state, &title_info);
+                if (POUND_SUCCESS != boot_error)
+                {
+                    POUND_LOG_ERROR(&thread_logger, "Boot refused the title: %s.",
+                                    pound_error_to_string(boot_error));
+                }
+                else
+                {
+                    const error_t start_error = pound_boot_start(&boot_state);
+                    if (POUND_SUCCESS != start_error)
+                    {
+                        POUND_LOG_ERROR(&thread_logger, "Starting the title failed: %s.",
+                                        pound_error_to_string(start_error));
+                    }
+                }
+            }
         }
     }
 
@@ -273,6 +400,7 @@ main(int argc, char *argv[])
     }
 
     app_runtime_shutdown(&runtime);
+    key_store_destroy(&cli_keys);
     pound_boot_shutdown(&boot_state);
     app_gui_shutdown(&app);
     app_video_shutdown(&app);
